@@ -1,0 +1,1211 @@
+---
+title: "Predict on Known Anomalies"
+format:
+    html:
+        code-fold: true
+        embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+jupyter: python3
+---
+
+## Setup
+
+```{python}
+#| label: setup
+#| include: false
+
+import sys
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import plotly.io as pio
+
+# Add src to path
+project_root = Path.cwd()
+sys.path.insert(0, str(project_root))
+
+# Import project modules
+from src.application.config import load_default_config
+from src.infrastructure.storage import load_panel_parquet, find_latest_timestamped_dir
+from src.domain.anomaly_detector import AnomalyDetector
+from src.infrastructure import logging
+
+# Set plotly template
+pio.templates.default = "plotly_white"
+
+print("Setup complete!")
+```
+
+## Configuration Loading
+
+```{python}
+#| label: load-config
+
+# Load configuration
+config = load_default_config()
+
+# Extract known anomalies (handle None case)
+known_anomalies = config.get("known_anomalies") or []
+known_anomaly_buffer = config.get("train", {}).get("known_anomaly_buffer", "1d")
+panel_ids = config.get("panels", {}).get("panel_ids", ["1", "2"])
+processed_dir = Path(config["paths"]["processed_dir"])
+models_dir = Path(config["paths"]["models_dir"])
+
+print(f"Loaded configuration:")
+print(f"  Known anomalies: {len(known_anomalies)} period(s)")
+print(f"  Buffer: {known_anomaly_buffer}")
+print(f"  Panels: {panel_ids}")
+print(f"  Processed data directory: {processed_dir}")
+print(f"  Models directory: {models_dir}")
+
+if not known_anomalies:
+    print("\n⚠️  WARNING: No known anomalies defined in config. Please add them to config/default.yaml")
+```
+
+## Data Loading
+
+```{python}
+#| label: load-data
+
+# Load processed data for all panels
+panel_data = {}
+
+for panel_id in panel_ids:
+    panel_file = processed_dir / f"panel_{panel_id}.parquet"
+    if panel_file.exists():
+        df = load_panel_parquet(processed_dir, panel_id)
+        
+        # Ensure timestamp is the index
+        if 'timestamp' in df.columns:
+            df = df.set_index('timestamp')
+        
+        # Ensure DatetimeIndex
+        if not isinstance(df.index, pd.DatetimeIndex):
+            df.index = pd.to_datetime(df.index)
+        
+        panel_data[panel_id] = df
+        print(f"Panel {panel_id}: Loaded {len(df)} rows, {len(df.columns)} columns")
+        print(f"  Date range: {df.index.min()} to {df.index.max()}")
+    else:
+        print(f"⚠️  Panel {panel_id} data file not found: {panel_file}")
+
+print(f"\nLoaded data for {len(panel_data)} panel(s)")
+```
+
+## Filter to Known Anomalies
+
+```{python}
+#| label: filter-anomalies
+
+def filter_to_known_anomalies(
+    df: pd.DataFrame,
+    known_anomalies: list[dict],
+    buffer: str
+) -> tuple[pd.DataFrame, list[dict]]:
+    """Filter DataFrame to only include known anomaly periods (with buffer).
+    
+    Args:
+        df: Input DataFrame with datetime index
+        known_anomalies: List of anomaly dictionaries with 'start' and 'end' keys
+        buffer: Time range string to extend before and after each anomaly
+        
+    Returns:
+        Tuple of (combined DataFrame, list of individual period DataFrames with metadata)
+    """
+    if not known_anomalies:
+        return pd.DataFrame(), []
+    
+    if not isinstance(df.index, pd.DatetimeIndex):
+        raise ValueError("DataFrame index must be a DatetimeIndex")
+    
+    # Convert buffer string to Timedelta
+    try:
+        buffer_timedelta = pd.Timedelta(buffer)
+    except (ValueError, TypeError) as e:
+        raise ValueError(f"Invalid buffer string '{buffer}': {e}")
+    
+    filtered_dfs = []
+    individual_periods = []
+    
+    # Process each known anomaly
+    for i, anomaly in enumerate(known_anomalies):
+        if not isinstance(anomaly, dict):
+            continue
+        
+        start_str = anomaly.get("start")
+        end_str = anomaly.get("end")
+        
+        if not start_str or not end_str:
+            continue
+        
+        try:
+            # Parse timestamps
+            anomaly_start = pd.to_datetime(start_str)
+            anomaly_end = pd.to_datetime(end_str)
+            
+            # Ensure timestamps are timezone-aware if DataFrame index is
+            if df.index.tz is not None:
+                if anomaly_start.tz is None:
+                    anomaly_start = anomaly_start.tz_localize("UTC")
+                if anomaly_end.tz is None:
+                    anomaly_end = anomaly_end.tz_localize("UTC")
+            else:
+                if anomaly_start.tz is not None:
+                    anomaly_start = anomaly_start.tz_localize(None)
+                if anomaly_end.tz is not None:
+                    anomaly_end = anomaly_end.tz_localize(None)
+            
+            # Extend range with buffer
+            period_start = anomaly_start - buffer_timedelta
+            period_end = anomaly_end + buffer_timedelta
+            
+            # Filter data for this period
+            mask = (df.index >= period_start) & (df.index <= period_end)
+            period_df = df.loc[mask].copy()
+            
+            if len(period_df) > 0:
+                filtered_dfs.append(period_df)
+                individual_periods.append({
+                    'index': i + 1,
+                    'anomaly_start': anomaly_start,
+                    'anomaly_end': anomaly_end,
+                    'period_start': period_start,
+                    'period_end': period_end,
+                    'data': period_df
+                })
+                print(f"  Anomaly {i+1}: {anomaly_start} to {anomaly_end}")
+                print(f"    Extended period: {period_start} to {period_end}")
+                print(f"    Data points: {len(period_df)}")
+        
+        except Exception as e:
+            print(f"  ⚠️  Error processing anomaly {i+1}: {e}")
+            continue
+    
+    if not filtered_dfs:
+        return pd.DataFrame(), []
+    
+    # Combine all periods and remove duplicates
+    combined_df = pd.concat(filtered_dfs)
+    combined_df = combined_df[~combined_df.index.duplicated(keep='first')]
+    combined_df = combined_df.sort_index()
+    
+    return combined_df, individual_periods
+
+# Filter data for each panel
+filtered_panel_data = {}
+individual_anomaly_periods = {}  # Store individual periods per panel
+
+for panel_id, df in panel_data.items():
+    print(f"\nFiltering Panel {panel_id} to known anomalies...")
+    filtered_df, periods = filter_to_known_anomalies(df, known_anomalies, known_anomaly_buffer)
+    
+    if len(filtered_df) > 0:
+        filtered_panel_data[panel_id] = filtered_df
+        individual_anomaly_periods[panel_id] = periods
+        print(f"  Total filtered data points: {len(filtered_df)}")
+        print(f"  Date range: {filtered_df.index.min()} to {filtered_df.index.max()}")
+        print(f"  Number of individual anomaly periods: {len(periods)}")
+    else:
+        print(f"  ⚠️  No data found for known anomalies in Panel {panel_id}")
+
+print(f"\nFiltered data available for {len(filtered_panel_data)} panel(s)")
+
+if not filtered_panel_data:
+    print("\n⚠️  ERROR: No data available for known anomalies. Cannot proceed with predictions.")
+```
+
+## Model Loading
+
+```{python}
+#| label: load-models
+
+# Initialize logger
+logger = logging.get_logger("QuartoPredictions")
+
+# Initialize anomaly detector
+detector = AnomalyDetector(config, logger)
+
+# Load models for each panel
+loaded_models = {}
+
+for panel_id in filtered_panel_data.keys():
+    try:
+        print(f"\nLoading model for Panel {panel_id}...")
+        model_data = detector.load_forecasting_model(panel_id)
+        loaded_models[panel_id] = model_data
+        
+        model_type = model_data.get("model_type", "unknown")
+        n_lags = model_data.get("n_lags", "unknown")
+        target_cols = model_data.get("target_cols", [])
+        
+        print(f"  Model type: {model_type}")
+        print(f"  Number of lags: {n_lags}")
+        print(f"  Target columns: {len(target_cols)}")
+        
+    except Exception as e:
+        print(f"  ⚠️  Error loading model for Panel {panel_id}: {e}")
+
+print(f"\nLoaded models for {len(loaded_models)} panel(s)")
+
+if not loaded_models:
+    print("\n⚠️  ERROR: No models loaded. Cannot proceed with predictions.")
+```
+
+## Predictions
+
+```{python}
+#| label: predictions
+
+# Run predictions for each panel
+# Strategy: Run detection on FULL dataset for proper training context,
+# then filter results to only known anomaly periods
+prediction_results = {}
+
+for panel_id in filtered_panel_data.keys():
+    if panel_id not in loaded_models:
+        print(f"⚠️  Skipping Panel {panel_id}: model not loaded")
+        continue
+    
+    print(f"\nRunning predictions for Panel {panel_id}...")
+    
+    try:
+        # Get full panel data (for training context)
+        full_df = panel_data[panel_id]
+        
+        # Get filtered data (known anomaly periods)
+        filtered_df = filtered_panel_data[panel_id]
+        
+        # Find the time range of known anomalies
+        filtered_start = filtered_df.index.min()
+        filtered_end = filtered_df.index.max()
+        
+        print(f"  Full dataset: {len(full_df)} data points")
+        print(f"  Known anomalies period: {filtered_start} to {filtered_end}")
+        print(f"  Known anomalies data points: {len(filtered_df)}")
+        
+        hist_window = config.get("detect", {}).get("hist_window", 4032)
+        original_target_date = config.get("detect", {}).get("target_date")
+        
+        # Calculate default test window (last hist_window samples)
+        default_test_start_idx = max(0, len(full_df) - hist_window)
+        default_test_start = full_df.index[default_test_start_idx] if len(full_df) > default_test_start_idx else full_df.index[0]
+        default_test_end = full_df.index[-1]
+        
+        print(f"  Default test window would be: {default_test_start} to {default_test_end}")
+        
+        # Strategy: Run detection for each individual period that needs it
+        # Store detection results for each period
+        period_detection_results = {}
+        
+        if panel_id in individual_anomaly_periods:
+            for period_info in individual_anomaly_periods[panel_id]:
+                period_start = period_info['period_start']
+                period_end = period_info['period_end']
+                anomaly_num = period_info['index']
+                
+                print(f"\n  Processing Period {anomaly_num}: {period_start} to {period_end}")
+                
+                # Check if this period is within default test window
+                period_in_default = (period_start >= default_test_start) and (period_end <= default_test_end)
+                
+                if period_in_default:
+                    print(f"    ✓ Period is within default test window")
+                    # Will use default detection (run once at the end)
+                    period_detection_results[anomaly_num] = None  # Mark to use default
+                else:
+                    print(f"    Period is outside default test window - running separate detection")
+                    # Run detection with target_date set to include this period
+                    target_date = period_end + pd.Timedelta(minutes=5)  # Small buffer
+                    target_date = min(target_date, full_df.index[-1])
+                    
+                    # Format target_date
+                    if target_date.tz is not None:
+                        target_date_str = target_date.strftime("%Y-%m-%dT%H:%M:%S%z")
+                        if len(target_date_str) > 19 and target_date_str[19] != ':':
+                            target_date_str = target_date_str[:19] + target_date_str[19:22] + ':' + target_date_str[22:]
+                    else:
+                        target_date_str = target_date.strftime("%Y-%m-%dT%H:%M:%S")
+                    
+                    config["detect"]["target_date"] = target_date_str
+                    detector.config = config
+                    
+                    print(f"    Running detection with target_date: {target_date_str}")
+                    period_scores, period_flags, period_forecast = detector.detect_panel(panel_id, full_df)
+                    
+                    period_detection_results[anomaly_num] = {
+                        'scores': period_scores,
+                        'flags': period_flags,
+                        'forecast': period_forecast
+                    }
+                    print(f"    Detection complete. Test window: {period_scores.index.min()} to {period_scores.index.max()}")
+        
+        # Run default detection if any periods need it
+        periods_need_default = any(result is None for result in period_detection_results.values())
+        if periods_need_default or len(period_detection_results) == 0:
+            print(f"\n  Running default detection (for periods in default window or as fallback)...")
+            # Restore original target_date for default detection
+            if original_target_date is None:
+                config["detect"].pop("target_date", None)
+            else:
+                config["detect"]["target_date"] = original_target_date
+            detector.config = config
+            
+            default_scores, default_flags, default_forecast = detector.detect_panel(panel_id, full_df)
+            print(f"  Default detection complete. Test window: {default_scores.index.min()} to {default_scores.index.max()}")
+            
+            # Use default results for periods that need it
+            for period_num, result in period_detection_results.items():
+                if result is None:
+                    period_detection_results[period_num] = {
+                        'scores': default_scores,
+                        'flags': default_flags,
+                        'forecast': default_forecast
+                    }
+        
+        # Restore original target_date
+        if original_target_date is None:
+            config["detect"].pop("target_date", None)
+        else:
+            config["detect"]["target_date"] = original_target_date
+        detector.config = config
+        
+        # Use default results as the main results (for backward compatibility)
+        if periods_need_default or len(period_detection_results) == 0:
+            scores_df = default_scores
+            flags_df = default_flags
+            forecast_df = default_forecast
+        else:
+            # Use the latest detection results
+            latest_result = list(period_detection_results.values())[-1]
+            scores_df = latest_result['scores']
+            flags_df = latest_result['flags']
+            forecast_df = latest_result['forecast']
+        
+        print(f"\n  Using detection results with test window: {scores_df.index.min()} to {scores_df.index.max()}")
+        
+        # Filter results for each individual anomaly period using the appropriate detection results
+        print(f"  Filtering results to known anomaly periods...")
+        
+        # Store results for each individual period
+        period_results = []
+        
+        if panel_id in individual_anomaly_periods:
+            print(f"    Processing {len(individual_anomaly_periods[panel_id])} individual anomaly period(s)...")
+            for period_info in individual_anomaly_periods[panel_id]:
+                period_start = period_info['period_start']
+                period_end = period_info['period_end']
+                anomaly_num = period_info['index']
+                
+                print(f"      Period {anomaly_num}: {period_start} to {period_end}")
+                
+                # Get the appropriate detection results for this period
+                if anomaly_num in period_detection_results:
+                    period_scores_df = period_detection_results[anomaly_num]['scores']
+                    period_flags_df = period_detection_results[anomaly_num]['flags']
+                    period_forecast_df = period_detection_results[anomaly_num]['forecast']
+                else:
+                    # Fallback to default results
+                    period_scores_df = scores_df
+                    period_flags_df = flags_df
+                    period_forecast_df = forecast_df
+                
+                print(f"        Using detection results with range: {period_scores_df.index.min()} to {period_scores_df.index.max()}")
+                
+                # Handle timezone alignment
+                if period_scores_df.index.tz is not None and period_start.tz is None:
+                    period_start = period_start.tz_localize("UTC")
+                    period_end = period_end.tz_localize("UTC")
+                elif period_scores_df.index.tz is None and period_start.tz is not None:
+                    period_start = period_start.tz_localize(None)
+                    period_end = period_end.tz_localize(None)
+                
+                # Filter results for this period
+                print(f"        Searching for data between: {period_start} and {period_end}")
+                
+                # Check if there's any overlap
+                scores_before_period = (period_scores_df.index < period_start).sum()
+                scores_after_period = (period_scores_df.index > period_end).sum()
+                scores_in_period = ((period_scores_df.index >= period_start) & (period_scores_df.index <= period_end)).sum()
+                
+                print(f"        Scores before period: {scores_before_period}")
+                print(f"        Scores after period: {scores_after_period}")
+                print(f"        Scores in period: {scores_in_period}")
+                
+                period_mask = (period_scores_df.index >= period_start) & (period_scores_df.index <= period_end)
+                period_scores = period_scores_df.loc[period_mask]
+                period_flags = period_flags_df.loc[period_mask]
+                period_forecast = period_forecast_df.loc[period_mask]
+                
+                print(f"        Found {len(period_scores)} data points in prediction results")
+                
+                # Also check if we can find data in the original filtered_df for this period
+                if panel_id in filtered_panel_data:
+                    period_data_in_filtered = filtered_panel_data[panel_id]
+                    period_data_mask = (period_data_in_filtered.index >= period_info['anomaly_start']) & (period_data_in_filtered.index <= period_info['anomaly_end'])
+                    period_data_count = period_data_mask.sum()
+                    print(f"        Data points in filtered data for this period: {period_data_count}")
+                
+                if len(period_scores) > 0:
+                    period_actual = full_df.loc[period_scores.index]
+                    
+                    # Ensure all DataFrames have matching indices
+                    common_index = period_scores.index.intersection(period_flags.index).intersection(
+                        period_forecast.index)
+                    if len(period_actual) > 0:
+                        common_index = common_index.intersection(period_actual.index)
+                    
+                    print(f"        Common index: {len(common_index)} data points")
+                    
+                    period_results.append({
+                        'period_info': period_info,
+                        'scores': period_scores.loc[common_index],
+                        'flags': period_flags.loc[common_index],
+                        'forecast': period_forecast.loc[common_index],
+                        'actual': period_actual.loc[common_index]
+                    })
+                else:
+                    print(f"        ⚠️  No prediction data found for this period")
+        else:
+            print(f"    ⚠️  No individual anomaly periods found for Panel {panel_id}")
+        
+        # Also store combined results for backward compatibility
+        filtered_start = filtered_df.index.min()
+        filtered_end = filtered_df.index.max()
+        
+        # Handle timezone alignment
+        if scores_df.index.tz is not None and filtered_start.tz is None:
+            filtered_start = filtered_start.tz_localize("UTC")
+            filtered_end = filtered_end.tz_localize("UTC")
+        elif scores_df.index.tz is None and filtered_start.tz is not None:
+            filtered_start = filtered_start.tz_localize(None)
+            filtered_end = filtered_end.tz_localize(None)
+        
+        anomaly_mask = (scores_df.index >= filtered_start) & (scores_df.index <= filtered_end)
+        filtered_scores = scores_df.loc[anomaly_mask]
+        filtered_flags = flags_df.loc[anomaly_mask]
+        filtered_forecast = forecast_df.loc[anomaly_mask]
+        
+        # Get actual values for the filtered period from full dataset
+        if len(filtered_scores) > 0:
+            filtered_actual = full_df.loc[filtered_scores.index]
+        else:
+            filtered_actual = pd.DataFrame(index=filtered_scores.index)
+        
+        # Ensure all DataFrames have matching indices
+        common_index = filtered_scores.index.intersection(filtered_flags.index).intersection(
+            filtered_forecast.index)
+        if len(filtered_actual) > 0:
+            common_index = common_index.intersection(filtered_actual.index)
+        
+        prediction_results[panel_id] = {
+            'scores': filtered_scores.loc[common_index],
+            'flags': filtered_flags.loc[common_index],
+            'forecast': filtered_forecast.loc[common_index],
+            'actual': filtered_actual.loc[common_index],
+            'period_results': period_results  # Store individual period results
+        }
+        
+        num_anomalies = filtered_flags.loc[common_index].sum().sum()
+        print(f"  ✓ Predictions complete!")
+        print(f"    Data points analyzed: {len(common_index)}")
+        print(f"    Anomalies detected: {num_anomalies}")
+        print(f"    Individual periods processed: {len(period_results)}")
+        
+    except Exception as e:
+        print(f"  ⚠️  Error running predictions for Panel {panel_id}: {e}")
+        import traceback
+        traceback.print_exc()
+
+print(f"\nPredictions completed for {len(prediction_results)} panel(s)")
+```
+
+## Visualization Functions
+
+```{python}
+#| label: viz-functions
+
+def plot_channel_with_predictions_interactive(
+    actual_df: pd.DataFrame,
+    forecast_df: pd.DataFrame,
+    scores_df: pd.DataFrame,
+    flags_df: pd.DataFrame,
+    panel_id: str,
+    channel_col: str,
+    title_suffix: str = ""
+):
+    """Plot actual vs forecasted values for a channel with anomaly flags."""
+    
+    # Get anomaly flags and scores
+    # Flags are per-row (overall anomaly), not per-channel
+    if 'anomaly_flag' in flags_df.columns:
+        has_anomaly = flags_df['anomaly_flag'] == 1
+    else:
+        # Fallback: check if any column has flags
+        has_anomaly = flags_df.sum(axis=1) > 0 if len(flags_df.columns) > 0 else pd.Series([False] * len(scores_df))
+    
+    # Scores are also per-row (overall score)
+    if 'anomaly_score' in scores_df.columns:
+        anomaly_scores = scores_df['anomaly_score']
+    else:
+        # Debug: check what columns are available
+        if len(scores_df.columns) > 0:
+            print(f"  Debug: scores_df columns: {list(scores_df.columns)}")
+        anomaly_scores = None
+    
+    # Get time range
+    time_min = actual_df.index.min()
+    time_max = actual_df.index.max()
+    
+    # Clean up column name for title
+    clean_col_name = channel_col.replace('_actual', '') if channel_col.endswith('_actual') else channel_col
+    
+    # Create subplots
+    fig = make_subplots(
+        rows=2, cols=1,
+        subplot_titles=(f'Panel {panel_id} - {clean_col_name}{title_suffix}', 'Anomaly Scores'),
+        vertical_spacing=0.12,
+        row_heights=[0.6, 0.4]
+    )
+    
+    # Plot 1: Actual vs Forecast
+    # Actual values
+    fig.add_trace(
+        go.Scatter(
+            x=actual_df.index, 
+            y=actual_df[channel_col],
+            mode='lines',
+            name='Actual',
+            line=dict(color='#1f77b4', width=2),
+            hovertemplate='<b>Actual</b><br>Time: %{x}<br>Value: %{y:.4f}<extra></extra>'
+        ),
+        row=1, col=1
+    )
+    
+    # Forecast values
+    if channel_col in forecast_df.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=forecast_df.index, 
+                y=forecast_df[channel_col],
+                mode='lines',
+                name='Forecast',
+                line=dict(color='#ff7f0e', width=2, dash='dash'),
+                hovertemplate='<b>Forecast</b><br>Time: %{x}<br>Value: %{y:.4f}<extra></extra>'
+            ),
+            row=1, col=1
+        )
+    
+    # Highlight anomalies as red dots
+    if has_anomaly.any():
+        # Align indices
+        common_idx = actual_df.index.intersection(has_anomaly.index)
+        anomaly_mask = has_anomaly.loc[common_idx]
+        anomaly_times = actual_df.loc[common_idx].index[anomaly_mask]
+        anomaly_values = actual_df.loc[anomaly_times, channel_col]
+        
+        if len(anomaly_times) > 0:
+            fig.add_trace(
+                go.Scatter(
+                    x=anomaly_times, 
+                    y=anomaly_values,
+                    mode='markers',
+                    name='Anomaly',
+                    marker=dict(color='red', size=10, symbol='circle', opacity=0.8, line=dict(color='darkred', width=1)),
+                    hovertemplate='<b>Anomaly Detected</b><br>Time: %{x}<br>Value: %{y:.4f}<extra></extra>',
+                    legendgroup='anomaly'
+                ),
+                row=1, col=1
+            )
+    
+    # Plot 2: Anomaly Scores
+    # Always show anomaly scores if available (they're overall, not per-channel)
+    if anomaly_scores is not None:
+        # Use scores_df index directly if available, otherwise use anomaly_scores index
+        if len(scores_df) > 0:
+            plot_idx = scores_df.index
+            plot_scores = anomaly_scores.reindex(plot_idx)
+        else:
+            plot_idx = anomaly_scores.index
+            plot_scores = anomaly_scores
+        
+        # Remove NaN values
+        valid_mask = ~plot_scores.isna()
+        if valid_mask.any():
+            plot_idx = plot_idx[valid_mask]
+            plot_scores = plot_scores[valid_mask]
+            
+            fig.add_trace(
+                go.Scatter(
+                    x=plot_idx, 
+                    y=plot_scores,
+                    mode='lines',
+                    name='Anomaly Score',
+                    fill='tozeroy',
+                    line=dict(color='purple', width=2),
+                    fillcolor='rgba(128, 0, 128, 0.3)',
+                    hovertemplate='<b>Anomaly Score</b><br>Time: %{x}<br>Score: %{y:.2f}<extra></extra>'
+                ),
+                row=2, col=1
+            )
+            
+            # Add threshold line if we can infer it
+            if has_anomaly.any():
+                # Align has_anomaly with plot indices
+                aligned_anomaly = has_anomaly.reindex(plot_idx, fill_value=False)
+                if aligned_anomaly.any():
+                    threshold_estimate = plot_scores[aligned_anomaly].min()
+                    if not pd.isna(threshold_estimate) and len(plot_scores[aligned_anomaly]) > 0:
+                        fig.add_hline(
+                            y=threshold_estimate, 
+                            line_dash="dash", 
+                            line_color="red",
+                            opacity=0.5,
+                            annotation_text="Estimated Threshold",
+                            row=2, col=1
+                        )
+    
+    # Update axes labels
+    fig.update_xaxes(title_text="Timestamp", row=2, col=1)
+    fig.update_yaxes(title_text="Value", row=1, col=1)
+    fig.update_yaxes(title_text="Anomaly Score", row=2, col=1)
+    
+    # Update layout
+    fig.update_layout(
+        height=800,
+        showlegend=True,
+        hovermode='x unified',
+        template='plotly_white'
+    )
+    
+    return fig
+
+def plot_all_channels_interactive(
+    actual_df: pd.DataFrame,
+    forecast_df: pd.DataFrame,
+    flags_df: pd.DataFrame,
+    panel_id: str,
+    title_suffix: str = ""
+):
+    """Plot all channels in subplots."""
+    # Get channel columns (exclude timestamp, anomaly_flag, anomaly_score)
+    exclude_cols = ['timestamp']
+    channel_cols = [col for col in actual_df.columns if col not in exclude_cols]
+    
+    n_channels = len(channel_cols)
+    n_cols = 2
+    n_rows = (n_channels + 1) // 2
+    
+    # Create subplot titles
+    subplot_titles = [col.replace('_actual', '') if col.endswith('_actual') else col 
+                      for col in channel_cols]
+    
+    # Create subplots
+    fig = make_subplots(
+        rows=n_rows, cols=n_cols,
+        subplot_titles=subplot_titles,
+        vertical_spacing=0.08,
+        horizontal_spacing=0.08
+    )
+    
+    for idx, col in enumerate(channel_cols):
+        row = idx // n_cols + 1
+        col_num = idx % n_cols + 1
+        
+        # Plot actual
+        fig.add_trace(
+            go.Scatter(
+                x=actual_df.index, 
+                y=actual_df[col],
+                mode='lines',
+                name='Actual',
+                line=dict(color='#1f77b4', width=1.5),
+                showlegend=(idx == 0),
+                hovertemplate='<b>Actual</b><br>Time: %{x}<br>Value: %{y:.4f}<extra></extra>',
+                legendgroup='actual'
+            ),
+            row=row, col=col_num
+        )
+        
+        # Plot forecast if available
+        if col in forecast_df.columns:
+            fig.add_trace(
+                go.Scatter(
+                    x=forecast_df.index, 
+                    y=forecast_df[col],
+                    mode='lines',
+                    name='Forecast',
+                    line=dict(color='#ff7f0e', width=1.5, dash='dash'),
+                    showlegend=(idx == 0),
+                    hovertemplate='<b>Forecast</b><br>Time: %{x}<br>Value: %{y:.4f}<extra></extra>',
+                    legendgroup='forecast'
+                ),
+                row=row, col=col_num
+            )
+        
+        # Highlight anomalies as red dots
+        # Flags are per-row (overall anomaly), not per-channel
+        if 'anomaly_flag' in flags_df.columns:
+            has_anomaly = flags_df['anomaly_flag'] == 1
+        else:
+            # Fallback: check if any column has flags
+            has_anomaly = flags_df.sum(axis=1) > 0 if len(flags_df.columns) > 0 else pd.Series([False] * len(actual_df), index=actual_df.index)
+        
+        if has_anomaly.any():
+            # Align indices
+            common_idx = actual_df.index.intersection(has_anomaly.index)
+            anomaly_mask = has_anomaly.loc[common_idx]
+            anomaly_times = actual_df.loc[common_idx].index[anomaly_mask]
+            anomaly_values = actual_df.loc[anomaly_times, col]
+            
+            if len(anomaly_times) > 0:
+                fig.add_trace(
+                    go.Scatter(
+                        x=anomaly_times, 
+                        y=anomaly_values,
+                        mode='markers',
+                        name='Anomaly',
+                        marker=dict(color='red', size=8, symbol='circle', opacity=0.8, line=dict(color='darkred', width=1)),
+                        showlegend=(idx == 0),
+                        hovertemplate='<b>Anomaly Detected</b><br>Time: %{x}<br>Value: %{y:.4f}<extra></extra>',
+                        legendgroup='anomaly'
+                    ),
+                    row=row, col=col_num
+                )
+        
+        # Update y-axis label
+        fig.update_yaxes(title_text="Value", row=row, col=col_num)
+    
+    # Update layout
+    fig.update_layout(
+        height=400 * n_rows,
+        title_text=f'Panel {panel_id} - All Channels{title_suffix}',
+        title_font_size=16,
+        showlegend=True,
+        hovermode='closest',
+        template='plotly_white'
+    )
+    
+    return fig
+
+print("Visualization functions defined!")
+```
+
+## Visualizations
+
+```{python}
+#| label: visualizations
+
+for panel_id, results in prediction_results.items():
+    print(f"\n{'='*60}")
+    print(f"Panel {panel_id} Visualizations")
+    print(f"{'='*60}")
+    
+    # Check if we have period results
+    period_results = results.get('period_results', [])
+    
+    print(f"\nDebug: period_results length = {len(period_results)}")
+    if panel_id in individual_anomaly_periods:
+        print(f"Debug: individual_anomaly_periods[{panel_id}] length = {len(individual_anomaly_periods[panel_id])}")
+    
+    if not period_results:
+        # Fallback to combined results
+        actual_df = results['actual']
+        forecast_df = results['forecast']
+        scores_df = results['scores']
+        flags_df = results['flags']
+        
+        if len(actual_df) == 0 or len(scores_df) == 0:
+            print(f"\n⚠️  WARNING: No data found for Panel {panel_id} in known anomaly periods.")
+            continue
+        
+        print(f"\nSummary Statistics (All Periods Combined):")
+        print(f"  Data points: {len(actual_df)}")
+        num_anomalies = flags_df.sum().sum()
+        print(f"  Anomalies detected: {num_anomalies}")
+        
+        channel_cols = [col for col in actual_df.columns]
+        if len(channel_cols) > 0:
+            fig_overview = plot_all_channels_interactive(
+                actual_df, forecast_df, flags_df, panel_id, 
+                title_suffix=" - All Known Anomalies"
+            )
+            fig_overview.show()
+    else:
+        # Visualize each period separately in collapsible sections
+        print(f"\nFound {len(period_results)} individual anomaly period(s) with data")
+        
+        # Create a map of period results by index for easy lookup
+        period_results_map = {pr['period_info']['index']: pr for pr in period_results}
+        
+        # Loop through ALL defined periods (from config) to ensure we show them all
+        if panel_id in individual_anomaly_periods:
+            total_periods = len(individual_anomaly_periods[panel_id])
+            print(f"  Total periods defined in config: {total_periods}")
+            
+            for period_info in individual_anomaly_periods[panel_id]:
+                period_idx = period_info['index']
+                
+                # Check if we have results for this period
+                if period_idx in period_results_map:
+                    period_result = period_results_map[period_idx]
+                    actual_df = period_result['actual']
+                    forecast_df = period_result['forecast']
+                    scores_df = period_result['scores']
+                    flags_df = period_result['flags']
+                    
+                    print(f"\n  Processing period {period_idx} (has data)...")
+                    
+                    if len(actual_df) == 0 or len(scores_df) == 0:
+                        print(f"    ⚠️  Skipping - no data")
+                        continue
+                    
+                    # Create collapsible section using raw HTML
+                    anomaly_num = period_info['index']
+                    anomaly_start = period_info['anomaly_start']
+                    anomaly_end = period_info['anomaly_end']
+                    
+                    # Use IPython display to output raw HTML
+                    try:
+                        from IPython.display import HTML, display
+                        summary_text = f"Anomaly Period {anomaly_num}: {anomaly_start.strftime('%Y-%m-%d %H:%M')} to {anomaly_end.strftime('%Y-%m-%d %H:%M')}"
+                        display(HTML(f'<details style="margin: 20px 0;"><summary style="cursor: pointer; font-weight: bold; font-size: 1.2em; padding: 12px; background-color: #e8f4f8; border: 2px solid #4a90a4; border-radius: 5px;">{summary_text}</summary><div style="padding: 15px;">'))
+                    except:
+                        # Fallback if IPython not available
+                        print(f"\n### Anomaly Period {anomaly_num}: {anomaly_start} to {anomaly_end}\n")
+                    
+                    # Summary statistics
+                    num_anomalies = flags_df.sum().sum()
+                    print(f"**Summary Statistics:**")
+                    print(f"- Data points: {len(actual_df)}")
+                    print(f"- Anomalies detected: {num_anomalies}")
+                    if len(scores_df) > 0:
+                        print(f"- Anomaly score range: {scores_df.min().min():.2f} - {scores_df.max().max():.2f}")
+                        print(f"- Anomaly score mean: {scores_df.mean().mean():.2f}")
+                    print(f"\n")
+                    
+                    # Plot all channels
+                    channel_cols = [col for col in actual_df.columns]
+                    
+                    if len(channel_cols) > 0:
+                        # Plot overview of all channels
+                        fig_overview = plot_all_channels_interactive(
+                            actual_df, forecast_df, flags_df, panel_id, 
+                            title_suffix=f" - Anomaly Period {anomaly_num}"
+                        )
+                        fig_overview.show()
+                        
+                        # Plot individual channels in detail
+                        for col in channel_cols[:5]:  # Plot first 5 channels
+                            if col in forecast_df.columns:
+                                fig = plot_channel_with_predictions_interactive(
+                                    actual_df, forecast_df, scores_df, flags_df,
+                                    panel_id, col, title_suffix=f" - Anomaly Period {anomaly_num}"
+                                )
+                                fig.show()
+                    
+                    # Close the details tag
+                    try:
+                        display(HTML('</div></details>'))
+                    except:
+                        pass
+                    print(f"\n")
+                else:
+                    # Period defined but no prediction data
+                    print(f"\n  Processing period {period_idx} (no prediction data)...")
+                    print(f"    ⚠️  This period is defined in config but has no prediction data")
+                    print(f"    Period: {period_info['anomaly_start']} to {period_info['anomaly_end']}")
+                    # Still show it in a collapsible section
+                    try:
+                        from IPython.display import HTML, display
+                        anomaly_num = period_info['index']
+                        anomaly_start = period_info['anomaly_start']
+                        anomaly_end = period_info['anomaly_end']
+                        summary_text = f"Anomaly Period {anomaly_num}: {anomaly_start.strftime('%Y-%m-%d %H:%M')} to {anomaly_end.strftime('%Y-%m-%d %H:%M')} (No Data)"
+                        display(HTML(f'<details style="margin: 20px 0;"><summary style="cursor: pointer; font-weight: bold; font-size: 1.2em; padding: 12px; background-color: #ffe8e8; border: 2px solid #cc0000; border-radius: 5px;">{summary_text}</summary><div style="padding: 15px;"><p>⚠️ No prediction data available for this period.</p></div></details>'))
+                    except:
+                        pass
+                    continue
+```
+
+## Summary
+
+```{python}
+#| label: summary
+
+print("\n" + "="*60)
+print("PREDICTION SUMMARY")
+print("="*60)
+
+for panel_id, results in prediction_results.items():
+    print(f"\nPanel {panel_id}:")
+    print(f"  Data points analyzed: {len(results['actual'])}")
+    print(f"  Anomalies detected: {results['flags'].sum().sum()}")
+    print(f"  Date range: {results['actual'].index.min()} to {results['actual'].index.max()}")
+    
+    # Calculate forecast accuracy if possible
+    actual_df = results['actual']
+    forecast_df = results['forecast']
+    
+    common_cols = set(actual_df.columns) & set(forecast_df.columns)
+    if common_cols:
+        print(f"\n  Forecast Accuracy (RMSE):")
+        for col in list(common_cols)[:5]:  # First 5 columns
+            mse = ((actual_df[col] - forecast_df[col]) ** 2).mean()
+            rmse = np.sqrt(mse)
+            print(f"    {col}: {rmse:.4f}")
+
+print("\n" + "="*60)
+print("Analysis complete!")
+print("="*60)
+```
+
+## Anomaly Contribution Analysis
+
+```{python}
+#| label: anomaly-contributions
+
+import seaborn as sns
+
+# Set style
+sns.set_palette('husl')
+
+def analyze_anomaly_contributions(
+    actual_df: pd.DataFrame,
+    forecast_df: pd.DataFrame,
+    scores_df: pd.DataFrame,
+    flags_df: pd.DataFrame,
+    panel_id: str,
+    period_name: str = ""
+):
+    """Analyze which sensor channels contribute most to anomaly scores."""
+    
+    # Align actual data to forecast timestamps
+    common_idx = actual_df.index.intersection(forecast_df.index)
+    actual_aligned = actual_df.loc[common_idx]
+    forecast_aligned = forecast_df.loc[common_idx]
+    scores_aligned = scores_df.loc[common_idx]
+    
+    # Calculate residuals (actual - predicted)
+    residuals_df = actual_aligned - forecast_aligned
+    
+    # Calculate absolute residuals for contribution analysis
+    abs_residuals_df = residuals_df.abs()
+    
+    # Calculate squared residuals (for variance-based contribution)
+    squared_residuals_df = residuals_df ** 2
+    
+    # 1. Overall Feature Contribution Analysis
+    mean_abs_residuals = abs_residuals_df.mean().sort_values(ascending=False)
+    rmse_per_feature = np.sqrt(squared_residuals_df.mean()).sort_values(ascending=False)
+    
+    # Create figure with subplots
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    
+    # Plot mean absolute residuals
+    mean_abs_residuals.plot(kind='barh', ax=axes[0], color='steelblue')
+    axes[0].set_xlabel('Mean Absolute Residual')
+    axes[0].set_title(f'Panel {panel_id} - Average Prediction Error by Feature{period_name}')
+    axes[0].grid(axis='x', alpha=0.3)
+    
+    # Plot RMSE
+    rmse_per_feature.plot(kind='barh', ax=axes[1], color='coral')
+    axes[1].set_xlabel('RMSE')
+    axes[1].set_title(f'Panel {panel_id} - Root Mean Squared Error by Feature{period_name}')
+    axes[1].grid(axis='x', alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # 2. High-Score Period Analysis
+    if 'anomaly_score' in scores_aligned.columns and len(scores_aligned) > 0:
+        # Define high-score threshold (e.g., 95th percentile)
+        high_score_threshold = scores_aligned['anomaly_score'].quantile(0.95)
+        high_score_mask = scores_aligned['anomaly_score'] > high_score_threshold
+        
+        if high_score_mask.sum() > 0:
+            # Calculate feature contributions during high-score periods
+            high_score_contributions = abs_residuals_df.loc[high_score_mask].mean().sort_values(ascending=False)
+            normal_score_contributions = abs_residuals_df.loc[~high_score_mask].mean().sort_values(ascending=False)
+            
+            # Calculate the difference (what makes high-score periods different)
+            contribution_diff = (high_score_contributions - normal_score_contributions).sort_values(ascending=False)
+            
+            # Visualize
+            fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+            
+            # High score period contributions
+            high_score_contributions.plot(kind='barh', ax=axes[0], color='crimson')
+            axes[0].set_xlabel('Mean Absolute Residual')
+            axes[0].set_title(f'Panel {panel_id} - Feature Contributions During High-Score Periods{period_name}')
+            axes[0].grid(axis='x', alpha=0.3)
+            
+            # Difference from normal periods
+            contribution_diff.plot(kind='barh', ax=axes[1], color='purple')
+            axes[1].set_xlabel('Residual Increase vs Normal Periods')
+            axes[1].set_title(f'Panel {panel_id} - What Makes High-Score Periods Different{period_name}')
+            axes[1].grid(axis='x', alpha=0.3)
+            axes[1].axvline(x=0, color='black', linestyle='--', alpha=0.5)
+            
+            plt.tight_layout()
+            plt.show()
+            
+            print(f"\nHigh score threshold (95th percentile): {high_score_threshold:.3f}")
+            print(f"Number of high-score timestamps: {high_score_mask.sum()}")
+            print("\nTop contributors during high-score periods:")
+            print(high_score_contributions.head())
+            print("\nFeatures with highest increase during high-score periods:")
+            print(contribution_diff.head())
+    
+    # 3. Correlation Between Features and Anomaly Score
+    if 'anomaly_score' in scores_aligned.columns and len(scores_aligned) > 0:
+        # Calculate correlation between absolute residuals and anomaly scores
+        correlations = abs_residuals_df.corrwith(scores_aligned['anomaly_score']).sort_values(ascending=False)
+        
+        # Visualize
+        fig, ax = plt.subplots(figsize=(12, 6))
+        correlations.plot(kind='barh', ax=ax, color='teal')
+        ax.set_xlabel('Correlation with Anomaly Score')
+        ax.set_title(f'Panel {panel_id} - Feature Residual Correlation with Overall Anomaly Score{period_name}')
+        ax.axvline(x=0, color='black', linestyle='-', alpha=0.3)
+        ax.grid(axis='x', alpha=0.3)
+        plt.tight_layout()
+        plt.show()
+        
+        print("\nFeatures most correlated with anomaly scores:")
+        print(correlations.head())
+    
+    # 4. Approximate Per-Feature Score Reconstruction
+    if 'anomaly_score' in scores_aligned.columns and len(scores_aligned) > 0:
+        # Approximate contribution: squared residuals normalized by total squared error
+        total_squared_residuals = squared_residuals_df.sum(axis=1)
+        feature_contributions = squared_residuals_df.div(total_squared_residuals, axis=0)
+        
+        # Weight by anomaly score to get approximate score contributions
+        feature_score_contributions = feature_contributions.mul(scores_aligned['anomaly_score'], axis=0)
+        
+        # Average contribution per feature
+        avg_score_contribution = feature_score_contributions.mean().sort_values(ascending=False)
+        
+        # Visualize
+        fig, ax = plt.subplots(figsize=(12, 6))
+        avg_score_contribution.plot(kind='barh', ax=ax, color='darkgreen')
+        ax.set_xlabel('Average Score Contribution')
+        ax.set_title(f'Panel {panel_id} - Estimated Average Contribution to Anomaly Score by Feature{period_name}')
+        ax.grid(axis='x', alpha=0.3)
+        plt.tight_layout()
+        plt.show()
+        
+        print("\nEstimated average score contributions:")
+        print(avg_score_contribution)
+    
+    # 5. Top Anomaly Instances
+    if 'anomaly_score' in scores_aligned.columns and len(scores_aligned) > 0:
+        # Get top 5 highest anomaly scores
+        top_anomalies = scores_aligned.nlargest(5, 'anomaly_score')
+        
+        print(f"\n{'='*80}")
+        print(f"Top 5 Anomaly Scores{period_name}")
+        print(f"{'='*80}")
+        
+        for idx, (timestamp, row) in enumerate(top_anomalies.iterrows(), 1):
+            score = row['anomaly_score']
+            is_flagged = flags_df.loc[timestamp, 'anomaly_flag'] == 1 if timestamp in flags_df.index else False
+            
+            print(f"\n{idx}. Timestamp: {timestamp}")
+            print(f"   Anomaly Score: {score:.4f}")
+            print(f"   Is Flagged: {'Yes' if is_flagged else 'No'}")
+            print(f"\n   Top 5 Contributing Features:")
+            
+            if timestamp in abs_residuals_df.index:
+                feature_residuals = abs_residuals_df.loc[timestamp].sort_values(ascending=False)
+                for feature, residual in feature_residuals.head(5).items():
+                    actual_val = actual_aligned.loc[timestamp, feature] if timestamp in actual_aligned.index else np.nan
+                    pred_val = forecast_aligned.loc[timestamp, feature] if timestamp in forecast_aligned.index else np.nan
+                    print(f"      - {feature:30s}: residual={residual:8.4f} (actual={actual_val:8.4f}, pred={pred_val:8.4f})")
+            print("-" * 80)
+    
+    return {
+        'mean_abs_residuals': mean_abs_residuals,
+        'rmse_per_feature': rmse_per_feature,
+        'correlations': correlations if 'anomaly_score' in scores_aligned.columns else None,
+        'avg_score_contribution': avg_score_contribution if 'anomaly_score' in scores_aligned.columns else None
+    }
+
+# Run contribution analysis for each panel and period
+print("\n" + "="*60)
+print("ANOMALY CONTRIBUTION ANALYSIS")
+print("="*60)
+
+contribution_results = {}
+
+for panel_id, results in prediction_results.items():
+    print(f"\n{'='*60}")
+    print(f"Panel {panel_id} - Contribution Analysis")
+    print(f"{'='*60}")
+    
+    # Check if we have period results
+    period_results_list = results.get('period_results', [])
+    
+    if period_results_list:
+        # Analyze each period separately
+        for period_result in period_results_list:
+            period_info = period_result['period_info']
+            anomaly_num = period_info['index']
+            anomaly_start = period_info['anomaly_start']
+            anomaly_end = period_info['anomaly_end']
+            
+            period_name = f" - Anomaly Period {anomaly_num}"
+            
+            print(f"\nAnalyzing{period_name}...")
+            print(f"Period: {anomaly_start} to {anomaly_end}")
+            
+            # Create collapsible section
+            try:
+                from IPython.display import HTML, display
+                summary_text = f"Contribution Analysis - Anomaly Period {anomaly_num}: {anomaly_start.strftime('%Y-%m-%d %H:%M')} to {anomaly_end.strftime('%Y-%m-%d %H:%M')}"
+                display(HTML(f'<details style="margin: 20px 0;"><summary style="cursor: pointer; font-weight: bold; font-size: 1.2em; padding: 12px; background-color: #fff4e6; border: 2px solid #ff9800; border-radius: 5px;">{summary_text}</summary><div style="padding: 15px;">'))
+            except:
+                print(f"\n### Contribution Analysis{period_name}\n")
+            
+            analysis_result = analyze_anomaly_contributions(
+                period_result['actual'],
+                period_result['forecast'],
+                period_result['scores'],
+                period_result['flags'],
+                panel_id,
+                period_name
+            )
+            
+            contribution_results[f"{panel_id}_period_{anomaly_num}"] = analysis_result
+            
+            # Close the details tag
+            try:
+                display(HTML('</div></details>'))
+            except:
+                pass
+            print(f"\n")
+    else:
+        # Analyze combined results
+        print(f"\nAnalyzing all periods combined...")
+        
+        analysis_result = analyze_anomaly_contributions(
+            results['actual'],
+            results['forecast'],
+            results['scores'],
+            results['flags'],
+            panel_id,
+            " - All Known Anomalies"
+        )
+        
+        contribution_results[f"{panel_id}_combined"] = analysis_result
+
+print(f"\n{'='*60}")
+print("Contribution analysis complete!")
+print(f"{'='*60}")
+```

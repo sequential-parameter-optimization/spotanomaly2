@@ -1,0 +1,68 @@
+default:
+  model: LightGBM
+  params:
+    n_estimators: 300
+    learning_rate: 0.05
+    num_leaves: 31
+
+channels:
+  channel_0_flow_primary:
+    model: LightGBM
+    params:
+      n_estimators: 400
+      learning_rate: 0.03
+      num_leaves: 63
+
+  channel_0_flow_secondary:
+    model: LightGBM
+    params:
+      n_estimators: 400
+      learning_rate: 0.03
+      num_leaves: 63
+
+  channel_1_orp_mv:
+    model: XGBoost
+    params:
+      n_estimators: 400
+      max_depth: 5
+      learning_rate: 0.05
+
+  channel_1_ph:
+    model: XGBoost
+    params:
+      n_estimators: 350
+      max_depth: 4
+      learning_rate: 0.05
+
+  channel_2_conductivity:
+    model: LightGBM
+    params:
+      n_estimators: 350
+      learning_rate: 0.04
+      num_leaves: 63
+
+  channel_3_turbidity:
+    model: XGBoost
+    params:
+      n_estimators: 500
+      max_depth: 5
+      learning_rate: 0.03
+
+  channel_4_sac:
+    model: XGBoost
+    params:
+      n_estimators: 450
+      max_depth: 5
+      learning_rate: 0.04
+
+  channel_1_temperature:
+    model: LightGBM
+    params:
+      n_estimators: 300
+      learning_rate: 0.05
+
+  exogenous_source_b:
+    model: LightGBM
+    params:
+      n_estimators: 300
+      learning_rate: 0.05

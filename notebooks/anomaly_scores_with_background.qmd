@@ -1,0 +1,543 @@
+---
+title: "Anomaly Scores Visualization - Last 2 Weeks"
+format: 
+  html:
+    code-fold: true
+    theme: darkly
+    toc: true
+    fig-width: 14
+    fig-height: 8
+jupyter: python3
+---
+
+# Anomaly Scores with Red Background Highlighting (Last 2 Weeks)
+
+This document visualizes normalized anomaly scores for the last two weeks with red background shading that intensifies in regions with higher anomaly density.
+
+## Setup & Configuration
+
+```{python}
+#| label: setup
+#| warning: false
+#| message: false
+
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import plotly.io as pio
+from pathlib import Path
+import re
+from scipy.ndimage import gaussian_filter1d
+
+# Plotting configuration
+pio.templates.default = 'plotly_dark'
+
+# Custom Color Palette
+COLORS = {
+    'background': '#090909',        # Very dark background
+    'border': '#A90F12',            # Bright red border
+    'contents': '#2D0A0B',          # Dark burgundy content fill
+    'line': '#5EA6E1',              # Light blue line
+    'anomaly_marker': '#A90F12',    # Red anomaly markers
+    'anomaly_marker_edge': '#5EA6E1',  # Blue edge
+}
+
+# Paths
+DATA_DIR = Path('../data')
+RESULTS_BASE_DIR = DATA_DIR / 'results'
+
+# Configuration
+RESULTS_TIMESTAMP = None  # Use latest
+MODEL_NAME = 'LightGBM'
+
+print('✓ Environment configured successfully!')
+```
+
+## Load Data
+
+```{python}
+#| label: load-data
+#| warning: false
+
+def find_latest_timestamped_dir(base_dir):
+    """Find the most recent timestamped directory."""
+    if not base_dir.exists():
+        raise FileNotFoundError(f'Directory not found: {base_dir}')
+    
+    timestamp_pattern = re.compile(r'^\d{8}_\d{6}$')
+    timestamped_dirs = [
+        d for d in base_dir.iterdir() 
+        if d.is_dir() and timestamp_pattern.match(d.name)
+    ]
+    
+    if not timestamped_dirs:
+        raise FileNotFoundError(f'No timestamped directories found in: {base_dir}')
+    
+    return sorted(timestamped_dirs, key=lambda d: d.name, reverse=True)[0]
+
+# Get results directory
+results_dir = (
+    RESULTS_BASE_DIR / RESULTS_TIMESTAMP if RESULTS_TIMESTAMP 
+    else find_latest_timestamped_dir(RESULTS_BASE_DIR)
+)
+print(f'✓ Using results from: {results_dir.name}')
+
+# Load scores for both panels
+df_scores_p1 = pd.read_csv(results_dir / f'{MODEL_NAME}_panel_1_scores.csv')
+df_scores_p2 = pd.read_csv(results_dir / f'{MODEL_NAME}_panel_2_scores.csv')
+
+# Load flags for both panels
+df_flags_p1 = pd.read_csv(results_dir / f'{MODEL_NAME}_panel_1_flags.csv')
+df_flags_p2 = pd.read_csv(results_dir / f'{MODEL_NAME}_panel_2_flags.csv')
+
+# Convert timestamps
+for df in [df_scores_p1, df_scores_p2, df_flags_p1, df_flags_p2]:
+    if 'timestamp' in df.columns:
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df.set_index('timestamp', inplace=True)
+
+# Convert numeric columns
+for col in df_scores_p1.columns:
+    df_scores_p1[col] = pd.to_numeric(df_scores_p1[col], errors='coerce')
+    
+for col in df_scores_p2.columns:
+    df_scores_p2[col] = pd.to_numeric(df_scores_p2[col], errors='coerce')
+
+# Convert flags to numeric
+for col in df_flags_p1.columns:
+    df_flags_p1[col] = pd.to_numeric(df_flags_p1[col], errors='coerce').fillna(0).astype(int)
+    
+for col in df_flags_p2.columns:
+    df_flags_p2[col] = pd.to_numeric(df_flags_p2[col], errors='coerce').fillna(0).astype(int)
+
+# Merge flags with scores
+df_scores_p1['anomaly_flag'] = df_flags_p1['anomaly_flag'] if 'anomaly_flag' in df_flags_p1.columns else 0
+df_scores_p2['anomaly_flag'] = df_flags_p2['anomaly_flag'] if 'anomaly_flag' in df_flags_p2.columns else 0
+
+# Filter to last two weeks
+end_date = df_scores_p1.index.max()
+start_date = end_date - pd.Timedelta(days=14)
+
+print(f'✓ Filtering data from {start_date} to {end_date}')
+
+df_scores_p1 = df_scores_p1[df_scores_p1.index >= start_date]
+df_scores_p2 = df_scores_p2[df_scores_p2.index >= start_date]
+
+print(f'✓ Panel 1: {len(df_scores_p1)} records, {df_scores_p1["anomaly_flag"].sum()} anomalies (last 2 weeks)')
+print(f'✓ Panel 2: {len(df_scores_p2)} records, {df_scores_p2["anomaly_flag"].sum()} anomalies (last 2 weeks)')
+```
+
+## Helper Function: Detect Anomaly Regions
+
+```{python}
+#| label: helper-functions
+
+def detect_anomaly_regions(df, max_gap_minutes=60):
+    """
+    Detect continuous regions where anomalies occur close together.
+    Anomalies within max_gap_minutes are considered part of the same region.
+    
+    Parameters:
+    -----------
+    df : DataFrame
+        DataFrame with anomaly_flag column (timestamp as index)
+    max_gap_minutes : int
+        Maximum gap in minutes between anomalies to be considered same region
+        
+    Returns:
+    --------
+    list of dicts
+        List of regions with start_time and end_time
+    """
+    if len(df) == 0:
+        return []
+    
+    # Get anomaly timestamps
+    anomaly_times = df[df['anomaly_flag'] == 1].index
+    
+    if len(anomaly_times) == 0:
+        return []
+    
+    regions = []
+    region_start = anomaly_times[0]
+    region_end = anomaly_times[0]
+    
+    max_gap = pd.Timedelta(minutes=max_gap_minutes)
+    
+    for i in range(1, len(anomaly_times)):
+        current_time = anomaly_times[i]
+        gap = current_time - region_end
+        
+        if gap <= max_gap:
+            # Extend current region
+            region_end = current_time
+        else:
+            # Save current region and start new one
+            # Extend region boundaries slightly for visual clarity
+            padding = pd.Timedelta(minutes=10)
+            regions.append({
+                'start': max(df.index[0], region_start - padding),
+                'end': min(df.index[-1], region_end + padding)
+            })
+            region_start = current_time
+            region_end = current_time
+    
+    # Add the last region
+    padding = pd.Timedelta(minutes=10)
+    regions.append({
+        'start': max(df.index[0], region_start - padding),
+        'end': min(df.index[-1], region_end + padding)
+    })
+    
+    return regions
+
+print('✓ Helper functions loaded')
+```
+
+## Panel 1: Normalized Scores with Background
+
+```{python}
+#| label: plot-panel-1
+#| warning: false
+#| fig-cap: "Panel 1 - Normalized anomaly scores with bordered anomaly regions"
+
+# Detect continuous anomaly regions
+regions_p1 = detect_anomaly_regions(df_scores_p1, max_gap_minutes=60)
+
+# Create figure
+fig = go.Figure()
+
+# Add content rectangles (filled regions where anomalies occur)
+for region in regions_p1:
+    # Add filled content rectangle
+    fig.add_shape(
+        type="rect",
+        x0=region['start'],
+        x1=region['end'],
+        y0=0,
+        y1=1,
+        fillcolor=COLORS['contents'],
+        line=dict(color=COLORS['border'], width=3),
+        layer="below"
+    )
+
+# Add normalized score line
+fig.add_trace(
+    go.Scatter(
+        x=df_scores_p1.index,
+        y=df_scores_p1['anomaly_score_normalized'],
+        mode='lines',
+        name='Normalized Score',
+        line=dict(color=COLORS['line'], width=2.5),
+        hovertemplate='<b>Panel 1</b><br>Time: %{x}<br>Normalized Score: %{y:.4f}<extra></extra>'
+    )
+)
+
+# Add anomaly markers
+anomaly_mask_p1 = df_scores_p1['anomaly_flag'] == 1
+if anomaly_mask_p1.any():
+    fig.add_trace(
+        go.Scatter(
+            x=df_scores_p1.index[anomaly_mask_p1],
+            y=df_scores_p1['anomaly_score_normalized'][anomaly_mask_p1],
+            mode='markers',
+            name='Detected Anomaly',
+            marker=dict(
+                color=COLORS['anomaly_marker'],
+                size=10,
+                symbol='circle',
+                line=dict(color=COLORS['anomaly_marker_edge'], width=1.5)
+            ),
+            hovertemplate='<b>⚠️ Anomaly</b><br>Time: %{x}<br>Score: %{y:.4f}<extra></extra>'
+        )
+    )
+
+# Update layout
+fig.update_layout(
+    title={
+        'text': 'Panel 1: Normalized Anomaly Scores<br><sub>Bordered regions show anomaly clusters</sub>',
+        'x': 0.5,
+        'xanchor': 'center',
+        'font': {'size': 20, 'color': COLORS['line']}
+    },
+    xaxis_title='Timestamp',
+    yaxis_title='Normalized Anomaly Score',
+    yaxis=dict(range=[0, 1], gridcolor='rgba(128, 128, 128, 0.15)', linecolor=COLORS['border']),
+    xaxis=dict(gridcolor='rgba(128, 128, 128, 0.15)', linecolor=COLORS['border']),
+    height=600,
+    hovermode='x unified',
+    plot_bgcolor=COLORS['background'],
+    paper_bgcolor=COLORS['background'],
+    font=dict(color='white'),
+    showlegend=True,
+    legend=dict(
+        yanchor="top",
+        y=0.99,
+        xanchor="left",
+        x=0.01,
+        bgcolor='rgba(0, 0, 0, 0.5)',
+        bordercolor=COLORS['border'],
+        borderwidth=1
+    )
+)
+
+fig.show()
+```
+
+## Panel 2: Normalized Scores with Background
+
+```{python}
+#| label: plot-panel-2
+#| warning: false
+#| fig-cap: "Panel 2 - Normalized anomaly scores with bordered anomaly regions"
+
+# Detect continuous anomaly regions
+regions_p2 = detect_anomaly_regions(df_scores_p2, max_gap_minutes=60)
+
+# Create figure
+fig = go.Figure()
+
+# Add content rectangles (filled regions where anomalies occur)
+for region in regions_p2:
+    # Add filled content rectangle with border
+    fig.add_shape(
+        type="rect",
+        x0=region['start'],
+        x1=region['end'],
+        y0=0,
+        y1=1,
+        fillcolor=COLORS['contents'],
+        line=dict(color=COLORS['border'], width=3),
+        layer="below"
+    )
+
+# Add normalized score line
+fig.add_trace(
+    go.Scatter(
+        x=df_scores_p2.index,
+        y=df_scores_p2['anomaly_score_normalized'],
+        mode='lines',
+        name='Normalized Score',
+        line=dict(color=COLORS['line'], width=2.5),
+        hovertemplate='<b>Panel 2</b><br>Time: %{x}<br>Normalized Score: %{y:.4f}<extra></extra>'
+    )
+)
+
+# Add anomaly markers
+anomaly_mask_p2 = df_scores_p2['anomaly_flag'] == 1
+if anomaly_mask_p2.any():
+    fig.add_trace(
+        go.Scatter(
+            x=df_scores_p2.index[anomaly_mask_p2],
+            y=df_scores_p2['anomaly_score_normalized'][anomaly_mask_p2],
+            mode='markers',
+            name='Detected Anomaly',
+            marker=dict(
+                color=COLORS['anomaly_marker'],
+                size=10,
+                symbol='circle',
+                line=dict(color=COLORS['anomaly_marker_edge'], width=1.5)
+            ),
+            hovertemplate='<b>⚠️ Anomaly</b><br>Time: %{x}<br>Score: %{y:.4f}<extra></extra>'
+        )
+    )
+
+# Update layout
+fig.update_layout(
+    title={
+        'text': 'Panel 2: Normalized Anomaly Scores<br><sub>Bordered regions show anomaly clusters</sub>',
+        'x': 0.5,
+        'xanchor': 'center',
+        'font': {'size': 20, 'color': COLORS['line']}
+    },
+    xaxis_title='Timestamp',
+    yaxis_title='Normalized Anomaly Score',
+    yaxis=dict(range=[0, 1], gridcolor='rgba(128, 128, 128, 0.15)', linecolor=COLORS['border']),
+    xaxis=dict(gridcolor='rgba(128, 128, 128, 0.15)', linecolor=COLORS['border']),
+    height=600,
+    hovermode='x unified',
+    plot_bgcolor=COLORS['background'],
+    paper_bgcolor=COLORS['background'],
+    font=dict(color='white'),
+    showlegend=True,
+    legend=dict(
+        yanchor="top",
+        y=0.99,
+        xanchor="left",
+        x=0.01,
+        bgcolor='rgba(0, 0, 0, 0.5)',
+        bordercolor=COLORS['border'],
+        borderwidth=1
+    )
+)
+
+fig.show()
+```
+
+## Combined View: Both Panels
+
+```{python}
+#| label: plot-combined
+#| warning: false
+#| fig-cap: "Combined view of both panels with synchronized x-axis"
+
+# Create subplots
+fig = make_subplots(
+    rows=2, cols=1,
+    subplot_titles=('Panel 1: Normalized Anomaly Scores', 'Panel 2: Normalized Anomaly Scores'),
+    vertical_spacing=0.1,
+    shared_xaxes=True
+)
+
+# Panel 1 - Anomaly regions with borders
+for region in regions_p1:
+    fig.add_shape(
+        type="rect",
+        x0=region['start'],
+        x1=region['end'],
+        y0=0,
+        y1=1,
+        fillcolor=COLORS['contents'],
+        line=dict(color=COLORS['border'], width=3),
+        layer="below",
+        row=1, col=1
+    )
+
+# Panel 1 - Score line
+fig.add_trace(
+    go.Scatter(
+        x=df_scores_p1.index,
+        y=df_scores_p1['anomaly_score_normalized'],
+        mode='lines',
+        name='Panel 1 Score',
+        line=dict(color=COLORS['line'], width=2.5),
+        hovertemplate='<b>Panel 1</b><br>Time: %{x}<br>Score: %{y:.4f}<extra></extra>'
+    ),
+    row=1, col=1
+)
+
+# Panel 1 - Anomalies
+if anomaly_mask_p1.any():
+    fig.add_trace(
+        go.Scatter(
+            x=df_scores_p1.index[anomaly_mask_p1],
+            y=df_scores_p1['anomaly_score_normalized'][anomaly_mask_p1],
+            mode='markers',
+            name='Panel 1 Anomaly',
+            marker=dict(
+                color=COLORS['anomaly_marker'], 
+                size=8, 
+                symbol='circle', 
+                line=dict(color=COLORS['anomaly_marker_edge'], width=1)
+            ),
+            hovertemplate='<b>⚠️ Anomaly</b><br>Time: %{x}<br>Score: %{y:.4f}<extra></extra>',
+            showlegend=False
+        ),
+        row=1, col=1
+    )
+
+# Panel 2 - Anomaly regions with borders
+for region in regions_p2:
+    fig.add_shape(
+        type="rect",
+        x0=region['start'],
+        x1=region['end'],
+        y0=0,
+        y1=1,
+        fillcolor=COLORS['contents'],
+        line=dict(color=COLORS['border'], width=3),
+        layer="below",
+        row=2, col=1
+    )
+
+# Panel 2 - Score line
+fig.add_trace(
+    go.Scatter(
+        x=df_scores_p2.index,
+        y=df_scores_p2['anomaly_score_normalized'],
+        mode='lines',
+        name='Panel 2 Score',
+        line=dict(color=COLORS['line'], width=2.5),
+        hovertemplate='<b>Panel 2</b><br>Time: %{x}<br>Score: %{y:.4f}<extra></extra>'
+    ),
+    row=2, col=1
+)
+
+# Panel 2 - Anomalies
+if anomaly_mask_p2.any():
+    fig.add_trace(
+        go.Scatter(
+            x=df_scores_p2.index[anomaly_mask_p2],
+            y=df_scores_p2['anomaly_score_normalized'][anomaly_mask_p2],
+            mode='markers',
+            name='Panel 2 Anomaly',
+            marker=dict(
+                color=COLORS['anomaly_marker'], 
+                size=8, 
+                symbol='circle', 
+                line=dict(color=COLORS['anomaly_marker_edge'], width=1)
+            ),
+            hovertemplate='<b>⚠️ Anomaly</b><br>Time: %{x}<br>Score: %{y:.4f}<extra></extra>',
+            showlegend=False
+        ),
+        row=2, col=1
+    )
+
+# Update layout
+fig.update_layout(
+    title={
+        'text': 'Anomaly Scores Comparison: Both Panels<br><sub>Bordered regions show anomaly clusters</sub>',
+        'x': 0.5,
+        'xanchor': 'center',
+        'font': {'size': 20, 'color': COLORS['line']}
+    },
+    height=900,
+    hovermode='x unified',
+    plot_bgcolor=COLORS['background'],
+    paper_bgcolor=COLORS['background'],
+    font=dict(color='white'),
+    showlegend=True,
+    legend=dict(
+        bgcolor='rgba(0, 0, 0, 0.5)',
+        bordercolor=COLORS['border'],
+        borderwidth=1
+    )
+)
+
+# Update axes
+fig.update_yaxes(title_text='Normalized Score', range=[0, 1], gridcolor='rgba(128, 128, 128, 0.15)', linecolor=COLORS['border'], row=1, col=1)
+fig.update_yaxes(title_text='Normalized Score', range=[0, 1], gridcolor='rgba(128, 128, 128, 0.15)', linecolor=COLORS['border'], row=2, col=1)
+fig.update_xaxes(title_text='Timestamp', gridcolor='rgba(128, 128, 128, 0.15)', linecolor=COLORS['border'], row=2, col=1)
+
+fig.show()
+```
+
+## Summary Statistics
+
+```{python}
+#| label: summary-stats
+
+print('=' * 80)
+print('ANOMALY SCORES SUMMARY')
+print('=' * 80)
+
+for panel_name, df_scores in [('Panel 1', df_scores_p1), ('Panel 2', df_scores_p2)]:
+    print(f'\n{panel_name}:')
+    print(f'  Total records: {len(df_scores):,}')
+    print(f'  Anomalies detected: {df_scores["anomaly_flag"].sum():,}')
+    print(f'  Anomaly rate: {df_scores["anomaly_flag"].mean()*100:.2f}%')
+    print(f'\n  Normalized Score Statistics:')
+    print(f'    Min:    {df_scores["anomaly_score_normalized"].min():.6f}')
+    print(f'    Max:    {df_scores["anomaly_score_normalized"].max():.6f}')
+    print(f'    Mean:   {df_scores["anomaly_score_normalized"].mean():.6f}')
+    print(f'    Median: {df_scores["anomaly_score_normalized"].median():.6f}')
+    print(f'    95th percentile: {df_scores["anomaly_score_normalized"].quantile(0.95):.6f}')
+    print(f'    99th percentile: {df_scores["anomaly_score_normalized"].quantile(0.99):.6f}')
+
+print('\n' + '=' * 80)
+```
+
+---
+
+**Note:** Anomalies that occur close together (within 60 minutes) are grouped into continuous regions. These regions are filled with the content color (#2D0A0B) and outlined with red borders (#A90F12) for clear visualization of anomaly clusters.

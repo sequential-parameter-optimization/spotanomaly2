@@ -1,0 +1,263 @@
+# Event Detection Configuration
+
+known_anomalies:
+  # List of known anomaly periods to exclude from training
+  # Values within the buffer time range (before and after) will be set to NaN
+  - start: "2025-08-05T00:00:00+00:00"
+    end: "2025-08-05T23:59:59+00:00"
+  - start: "2025-12-05T00:00:00+00:00"
+    end: "2025-12-05T23:59:59+00:00"
+
+panels:
+  panel_ids:
+    - "1"
+    - "2"
+
+  channel_ids:
+    - "0"
+    - "1"
+    - "2"
+    - "3"
+    - "4"
+
+  instrumentation_ids:
+    "1":
+      "0": 1001001
+      "1": 1001002
+      "2": 1001003
+      "3": 1001004
+      "4": 1001005
+    "2":
+      "0": 1002001
+      "1": 1002002
+      "2": 1002003
+      "3": 1002004
+      "4": 1002005
+
+  channel_keys:
+    "0":
+      - "flow_primary"
+      - "flow_secondary"
+      - "maintenance_flag"
+    "1":
+      - "temperature"
+      - "orp_mv"
+      - "ph"
+    "2":
+      - "temperature"
+      - "conductivity"
+    "3":
+      - "temperature"
+      - "turbidity"
+    "4":
+      - "temperature"
+      - "sac"
+
+paths:
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  models_dir: "data/models"
+  results_dir: "data/results"
+  evaluations_dir: "data/evaluations"
+  credentials_file: ".env"
+  raw_data_version: null
+
+fetch:
+  start_date: "2025-07-01T13:00:00+00:00"
+  end_date: null
+  token_request_url: "https://api.example.invalid/oauth/token"
+  api_request_url: "https://api.example.invalid/v1/"
+
+process:
+  resample:
+    freq: "5min"
+    origin: "start_day"
+    label: "right"
+    closed: "right"
+  maintenance_column: "channel_0_maintenance_flag"
+  imputation:
+    method: "linear_interpolation"
+    params: {}
+    add_weights: true
+    weight_suffix: "__weight"
+  manual_outliers:
+    enabled: true
+    panels:
+      "1":
+        columns:
+          channel_3_turbidity:
+            lower: 0.01
+            upper: 10
+          channel_1_ph:
+            lower: 7
+            upper: 8.5
+          channel_1_orp_mv:
+            lower: 200
+            upper: 500
+          channel_2_conductivity:
+            lower: 300
+            upper: 600
+          channel_4_sac:
+            lower: 0.1
+            upper: 3
+          channel_1_temperature:
+            lower: 1
+            upper: 25
+          channel_0_flow_primary:
+            lower: 0.5
+            upper: 100
+          channel_0_flow_secondary:
+            lower: 10
+            upper: 200
+      "2":
+        columns:
+          channel_3_turbidity:
+            lower: 0.01
+            upper: 10
+          channel_1_ph:
+            lower: 7
+            upper: 8.5
+          channel_1_orp_mv:
+            lower: 200
+            upper: 500
+          channel_2_conductivity:
+            lower: 300
+            upper: 600
+          channel_4_sac:
+            lower: 0.1
+            upper: 3
+          channel_1_temperature:
+            lower: 1
+            upper: 25
+          flow_primary:
+            lower: 0.5
+            upper: 100
+          flow_secondary:
+            lower: 10
+            upper: 200
+  flow_columns_pattern: "flow"
+  temperature_columns_pattern: "temperature"
+  median_filter_kernel: 3
+  weather:
+    enabled: true
+    latitude: 0.0
+    longitude: 0.0
+    place: "Anonymous Location"
+    use_forecast: true
+    fallback_on_failure: true
+    lookback_days: 14
+    cache_path: "data/weather/weather_cache.parquet"
+    feature_columns:
+      - snow_depth
+
+train:
+  train_ratio: 0.9
+  random_seed: 42
+  model: "LightGBM"  # "LightGBM" or "XGBoost" (used by spotforecast2 adapter)
+  lags: 6  # Number of autoregressive lags for ForecasterRecursive
+  exclude_imputed_training_samples: true
+  exog_columns:
+    - weather_snow_depth
+  known_anomaly_buffer: "1d"
+  # Optional: panel-specific YAMLs with per-channel model and parameter selection
+  # Each file can define:
+  # default: {model: LightGBM|XGBoost|Ridge, params: {...}}
+  # channels:
+  #   channel_1_ph: {model: Ridge, params: {alpha: 1.0}}
+  channel_config_files:
+    "1": "config/channel_models/panel_1.yaml"
+    "2": "config/channel_models/panel_2.yaml"
+
+detect:
+  hist_window: 2016
+  target_date: null
+  high_quantile: 0.995
+  fail_on_nan_inputs: true
+  fc_model_name: "LightGBM"
+  scorer_name: "KMeansScorer"  # "KMeansScorer", "NormScorer", "IsolationForestScorer", "GMMScorer"
+  scorer_params:
+    window: 1
+    n_clusters: 3
+    auto_select_k: true
+    k_min: 2
+    k_max: 10
+    elbow_method: "silhouette"  # "second_derivative", "silhouette", "kneedle"
+    n_init: 10
+    max_iter: 300
+    component_wise: false
+    # IsolationForest params (used when scorer_name is IsolationForestScorer)
+    contamination: 0.001
+    n_estimators: 1000
+    max_samples: "auto"
+    random_state: 42
+    # GMMScorer params (used when scorer_name is GMMScorer)
+    # n_components: 3
+    # covariance_type: "full"
+    # selection_criterion: "bic"
+  normalize_scores: true
+  normalization_quantile: 0.99
+
+evaluate:
+  results_timestamp: null
+  include_maintenance: true
+  synthetic:
+    enabled: false
+    n_point: 5
+    n_contextual: 3
+    n_collective: 2
+    random_seed: 42
+
+primary:
+  display_name: "Primary"
+
+exogenous:
+  enabled: true
+  cache_dir: "data/exogenous"
+  display_name: "Exogenous"
+  panel_sources:
+    "1":
+      - "source_a"
+    "2":
+      - "source_b"
+
+tune:
+  n_trials: 10
+  n_initial: 5
+  metric: "mean_absolute_error"
+  output_dir: "data/tuning_results"
+  models:
+    - "LightGBM"
+    - "XGBoost"
+    - "CatBoost"
+  search_space:
+    num_leaves: [8, 256]
+    max_depth: [3, 16]
+    learning_rate: [0.0001, 0.1, "log10"]
+    n_estimators: [10, 1000, "log10"]
+    bagging_fraction: [0.5, 1.0]
+    feature_fraction: [0.5, 1.0]
+    reg_alpha: [0.01, 100.0]
+    reg_lambda: [0.01, 100.0]
+    lags:
+      - "[1, 2, 3, 11, 12, 22, 23, 24, 47, 48, 167, 168]"
+      - "48"
+      - "24"
+      - "[1, 2, 24, 48]"
+      - "[1, 2, 23, 24, 47, 48]"
+      - "[1, 2, 11, 12, 23, 24, 167, 168]"
+  # Per-panel, per-channel overrides (optional)
+  # panel_overrides:
+  #   "1":
+  #     default:
+  #       n_trials: 15
+  #     channels:
+  #       channel_1_ph:
+  #         n_trials: 20
+  #         search_space:
+  #           learning_rate: [0.001, 0.05, "log10"]
+
+report:
+  enabled: true
+  lookback_days: 14
+  output_filename: "report.html"
+  refresh_interval: 30

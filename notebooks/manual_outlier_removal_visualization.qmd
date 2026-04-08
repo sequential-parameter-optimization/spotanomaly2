@@ -1,0 +1,762 @@
+---
+title: "Manual Outlier Removal Visualization"
+subtitle: "Before and After Comparison for Water Quality Sensor Data"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    code-fold: true
+    theme: darkly
+jupyter: spotanomaly
+---
+
+# Introduction
+
+This document visualizes the impact of the **manual outlier removal** feature added in commit `c68c0b3026e1c672c3d48318996e4a64c19a76be`.
+
+The manual outlier removal step filters out sensor values that fall outside configured threshold ranges. This is applied after resampling and maintenance period removal, but before imputation.
+
+## Processing Pipeline
+
+The data flows through these steps:
+
+1. **Resample**: Convert to 5-minute intervals
+2. **Remove Maintenance**: Mark maintenance periods as NaN
+3. **Manual Outlier Removal** ← Focus of this visualization
+4. Imputation
+5. Median filtering
+6. Temperature aggregation
+7. Weather adjustment
+
+## Configured Thresholds
+
+The following thresholds are configured in `config/default.yaml` for **both Panel 1 and Panel 2**:
+
+| Column | Lower Threshold | Upper Threshold |
+|--------|----------------|-----------------|
+| `channel_3_turbidity` | 0.01 | 10 |
+| `channel_1_ph` | 5 | 9 |
+| `channel_1_orp_mv` | 200 | 500 |
+| `channel_2_conductivity` | 10 | 1000 |
+
+# Setup
+
+```{python}
+# Standard library
+from pathlib import Path
+from typing import Dict, Optional, Tuple
+
+# Third-party
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import yaml
+
+# SpotAnomaly modules
+from src.infrastructure import storage
+
+print("Libraries loaded")
+```
+
+```{python}
+# Load configuration
+config_path = Path("../config/default.yaml")
+with open(config_path, 'r') as f:
+    config = yaml.safe_load(f)
+
+# Extract configuration
+resample_cfg = config['process']['resample']
+maintenance_col = config['process']['maintenance_column']
+manual_outliers_cfg = config['process']['manual_outliers']
+
+print("Configuration loaded")
+print(f"  - Manual outlier removal enabled: {manual_outliers_cfg['enabled']}")
+print(f"  - Resample frequency: {resample_cfg['freq']}")
+```
+
+# Data Processing Functions
+
+```{python}
+def resample_dataframe(df: pd.DataFrame, config: dict) -> pd.DataFrame:
+    """Resample DataFrame to target frequency."""
+    resample_cfg = config["process"]["resample"]
+    
+    df_resampled = df.resample(
+        rule=resample_cfg["freq"],
+        origin=resample_cfg["origin"],
+        label=resample_cfg["label"],
+        closed=resample_cfg["closed"]
+    ).mean()
+    
+    return df_resampled
+
+
+def remove_maintenance_periods(df: pd.DataFrame, config: dict) -> pd.DataFrame:
+    """Remove maintenance periods from data."""
+    maint_col = config["process"]["maintenance_column"]
+    
+    if maint_col not in df.columns:
+        print(f"⚠️  Maintenance column '{maint_col}' not found in data")
+        return df
+    
+    # Set all values to NaN during maintenance periods
+    maint_flag = df[maint_col].astype(bool)
+    df = df.copy()
+    df.loc[maint_flag] = np.nan
+    
+    # Drop the maintenance flag column
+    df.drop(columns=[maint_col], inplace=True)
+    
+    return df
+
+
+def apply_manual_outlier_removal(
+    df: pd.DataFrame, 
+    panel_id: str, 
+    config: dict
+) -> Tuple[pd.DataFrame, Dict[str, pd.Series]]:
+    """Apply manual outlier removal and track removed points.
+    
+    Returns:
+        Tuple of (processed_df, removed_masks_dict)
+        removed_masks_dict maps column names to boolean masks of removed points
+    """
+    manual_cfg = config.get("process", {}).get("manual_outliers", {})
+    
+    if not manual_cfg.get("enabled", False):
+        return df, {}
+    
+    panels_cfg = manual_cfg.get("panels", {})
+    panel_cfg = panels_cfg.get(str(panel_id), {})
+    columns_cfg = panel_cfg.get("columns", {})
+    
+    if not columns_cfg:
+        return df, {}
+    
+    df = df.copy()
+    removed_masks = {}
+    
+    for col, thresholds in columns_cfg.items():
+        if col not in df.columns:
+            print(f"⚠️  Column '{col}' not found in data")
+            continue
+        
+        lower = thresholds.get("lower")
+        upper = thresholds.get("upper")
+        
+        if lower is None and upper is None:
+            continue
+        
+        # Create mask for outliers
+        if lower is not None and upper is not None:
+            mask = (df[col] > upper) | (df[col] < lower)
+        elif lower is not None:
+            mask = df[col] < lower
+        else:
+            mask = df[col] > upper
+        
+        # Store mask and count
+        removed_masks[col] = mask
+        n_outliers = int(mask.sum())
+        
+        if n_outliers > 0:
+            df.loc[mask, col] = np.nan
+            print(f"✓ {col}: Removed {n_outliers} outliers")
+    
+    return df, removed_masks
+
+
+def create_summary_stats(
+    before_df: pd.DataFrame,
+    after_df: pd.DataFrame,
+    removed_masks: Dict[str, pd.Series],
+    panel_id: str,
+    config: dict
+) -> pd.DataFrame:
+    """Create summary statistics table."""
+    
+    manual_cfg = config.get("process", {}).get("manual_outliers", {})
+    panels_cfg = manual_cfg.get("panels", {})
+    panel_cfg = panels_cfg.get(str(panel_id), {})
+    columns_cfg = panel_cfg.get("columns", {})
+    
+    stats_data = []
+    
+    for col in removed_masks.keys():
+        mask = removed_masks[col]
+        removed_values = before_df[col][mask]
+        
+        thresholds = columns_cfg.get(col, {})
+        
+        stats_data.append({
+            'Column': col,
+            'Total Points': len(before_df[col].dropna()),
+            'Removed': mask.sum(),
+            'Percentage': f"{(mask.sum() / len(before_df[col].dropna()) * 100):.2f}%",
+            'Lower Threshold': thresholds.get('lower', '-'),
+            'Upper Threshold': thresholds.get('upper', '-'),
+            'Min Removed': f"{removed_values.min():.2f}" if len(removed_values) > 0 else '-',
+            'Max Removed': f"{removed_values.max():.2f}" if len(removed_values) > 0 else '-'
+        })
+    
+    return pd.DataFrame(stats_data)
+
+print("✓ Processing functions defined")
+```
+
+# Panel 1: Analysis
+
+```{python}
+# Load raw data
+panel_id = "1"
+raw_dir = Path("../data/raw/20260210_110225")
+raw_df = storage.load_panel_parquet(raw_dir, panel_id)
+
+print(f"✓ Loaded Panel {panel_id} raw data")
+print(f"  - Shape: {raw_df.shape}")
+print(f"  - Date range: {raw_df.index.min()} to {raw_df.index.max()}")
+```
+
+```{python}
+# Process to "before" state
+print("\n=== Processing Panel 1 to 'before' state ===")
+panel1_resampled = resample_dataframe(raw_df, config)
+panel1_before = remove_maintenance_periods(panel1_resampled, config)
+
+print(f"✓ Resampled shape: {panel1_resampled.shape}")
+print(f"✓ After maintenance removal: {panel1_before.shape}")
+```
+
+```{python}
+# Apply manual outlier removal
+print("\n=== Applying Manual Outlier Removal ===")
+panel1_after, panel1_removed_masks = apply_manual_outlier_removal(
+    panel1_before, panel_id, config
+)
+
+print(f"\n✓ Processing complete")
+print(f"  - Columns with outliers removed: {len(panel1_removed_masks)}")
+```
+
+## Summary Statistics - Panel 1
+
+```{python}
+if panel1_removed_masks:
+    stats_p1 = create_summary_stats(panel1_before, panel1_after, panel1_removed_masks, panel_id, config)
+    print(stats_p1.to_string(index=False))
+else:
+    print("No outliers configured for removal")
+```
+
+## Visualization: Before vs After - Panel 1
+
+```{python}
+# Plot Type A: Before vs After Comparison
+if panel1_removed_masks:
+    cols_to_plot = list(panel1_removed_masks.keys())
+    n_cols = len(cols_to_plot)
+    
+    fig = make_subplots(
+        rows=n_cols, 
+        cols=1,
+        subplot_titles=[f'{col}' for col in cols_to_plot],
+        vertical_spacing=0.08,
+        shared_xaxes=True
+    )
+    
+    for idx, col in enumerate(cols_to_plot, 1):
+        # Before data
+        fig.add_trace(
+            go.Scatter(
+                x=panel1_before.index,
+                y=panel1_before[col],
+                mode='lines',
+                name=f'{col} (Before)',
+                line=dict(color='rgba(100, 150, 255, 0.6)', width=1),
+                showlegend=(idx == 1)
+            ),
+            row=idx, col=1
+        )
+        
+        # After data
+        fig.add_trace(
+            go.Scatter(
+                x=panel1_after.index,
+                y=panel1_after[col],
+                mode='lines',
+                name=f'{col} (After)',
+                line=dict(color='rgba(50, 200, 100, 0.8)', width=1.5),
+                showlegend=(idx == 1)
+            ),
+            row=idx, col=1
+        )
+        
+        # Update y-axis label
+        fig.update_yaxes(title_text="Value", row=idx, col=1)
+    
+    # Update layout
+    fig.update_xaxes(title_text="Time", row=n_cols, col=1)
+    fig.update_layout(
+        title_text=f'Panel {panel_id}: Before vs After Manual Outlier Removal',
+        height=350 * n_cols,
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    fig.show()
+else:
+    print("No columns configured for outlier removal")
+```
+
+## Visualization: Removed Points Highlighted - Panel 1
+
+```{python}
+# Plot Type B: After with Removed Points Highlighted
+if panel1_removed_masks:
+    cols_to_plot = list(panel1_removed_masks.keys())
+    n_cols = len(cols_to_plot)
+    
+    fig = make_subplots(
+        rows=n_cols, 
+        cols=1,
+        subplot_titles=[f'{col}' for col in cols_to_plot],
+        vertical_spacing=0.08,
+        shared_xaxes=True
+    )
+    
+    for idx, col in enumerate(cols_to_plot, 1):
+        # After data (clean)
+        fig.add_trace(
+            go.Scatter(
+                x=panel1_after.index,
+                y=panel1_after[col],
+                mode='lines',
+                name='Clean Data',
+                line=dict(color='rgba(50, 200, 100, 0.8)', width=1.5),
+                showlegend=(idx == 1)
+            ),
+            row=idx, col=1
+        )
+        
+        # Removed points
+        mask = panel1_removed_masks[col]
+        if mask.sum() > 0:
+            removed_data = panel1_before[col][mask]
+            fig.add_trace(
+                go.Scatter(
+                    x=removed_data.index,
+                    y=removed_data.values,
+                    mode='markers',
+                    name='Removed Outliers',
+                    marker=dict(
+                        color='red',
+                        size=6,
+                        symbol='x',
+                        line=dict(width=2)
+                    ),
+                    showlegend=(idx == 1)
+                ),
+                row=idx, col=1
+            )
+        
+        # Update y-axis label
+        fig.update_yaxes(title_text="Value", row=idx, col=1)
+    
+    # Update layout
+    fig.update_xaxes(title_text="Time", row=n_cols, col=1)
+    fig.update_layout(
+        title_text=f'Panel {panel_id}: Clean Data with Removed Outliers Highlighted',
+        height=350 * n_cols,
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    fig.show()
+```
+
+## Visualization: Only Removed Data (Diff) - Panel 1
+
+```{python}
+# Plot Type C: Only Removed Data
+if panel1_removed_masks:
+    cols_to_plot = list(panel1_removed_masks.keys())
+    n_cols = len(cols_to_plot)
+    
+    fig = make_subplots(
+        rows=n_cols, 
+        cols=1,
+        subplot_titles=[f'{col} (n={panel1_removed_masks[col].sum()})' for col in cols_to_plot],
+        vertical_spacing=0.08,
+        shared_xaxes=True
+    )
+    
+    for idx, col in enumerate(cols_to_plot, 1):
+        # Only removed points
+        mask = panel1_removed_masks[col]
+        if mask.sum() > 0:
+            removed_data = panel1_before[col][mask]
+            fig.add_trace(
+                go.Scatter(
+                    x=removed_data.index,
+                    y=removed_data.values,
+                    mode='markers',
+                    name=col,
+                    marker=dict(
+                        color='red',
+                        size=8,
+                        symbol='x',
+                        line=dict(width=2)
+                    ),
+                    showlegend=False
+                ),
+                row=idx, col=1
+            )
+            
+            # Add threshold lines if configured
+            manual_cfg = config.get("process", {}).get("manual_outliers", {})
+            panels_cfg = manual_cfg.get("panels", {})
+            panel_cfg = panels_cfg.get(panel_id, {})
+            columns_cfg = panel_cfg.get("columns", {})
+            thresholds = columns_cfg.get(col, {})
+            
+            if thresholds.get('lower') is not None:
+                fig.add_hline(
+                    y=thresholds['lower'], 
+                    line_dash="dash", 
+                    line_color="orange",
+                    annotation_text=f"Lower: {thresholds['lower']}",
+                    row=idx, col=1
+                )
+            if thresholds.get('upper') is not None:
+                fig.add_hline(
+                    y=thresholds['upper'], 
+                    line_dash="dash", 
+                    line_color="orange",
+                    annotation_text=f"Upper: {thresholds['upper']}",
+                    row=idx, col=1
+                )
+        else:
+            # Add empty placeholder
+            fig.add_trace(
+                go.Scatter(
+                    x=[panel1_before.index[0]],
+                    y=[0],
+                    mode='markers',
+                    marker=dict(size=0),
+                    showlegend=False
+                ),
+                row=idx, col=1
+            )
+        
+        # Update y-axis label
+        fig.update_yaxes(title_text="Value", row=idx, col=1)
+    
+    # Update layout
+    fig.update_xaxes(title_text="Time", row=n_cols, col=1)
+    fig.update_layout(
+        title_text=f'Panel {panel_id}: Only Removed Outliers (Diff)',
+        height=350 * n_cols,
+        showlegend=False
+    )
+    fig.show()
+```
+
+# Panel 2: Analysis
+
+```{python}
+# Load raw data for Panel 2
+panel_id = "2"
+raw_df = storage.load_panel_parquet(raw_dir, panel_id)
+
+print(f"✓ Loaded Panel {panel_id} raw data")
+print(f"  - Shape: {raw_df.shape}")
+print(f"  - Date range: {raw_df.index.min()} to {raw_df.index.max()}")
+```
+
+```{python}
+# Process to "before" state
+print("\n=== Processing Panel 2 to 'before' state ===")
+panel2_resampled = resample_dataframe(raw_df, config)
+panel2_before = remove_maintenance_periods(panel2_resampled, config)
+
+print(f"✓ Resampled shape: {panel2_resampled.shape}")
+print(f"✓ After maintenance removal: {panel2_before.shape}")
+```
+
+```{python}
+# Apply manual outlier removal
+print("\n=== Applying Manual Outlier Removal ===")
+panel2_after, panel2_removed_masks = apply_manual_outlier_removal(
+    panel2_before, panel_id, config
+)
+
+print(f"\n✓ Processing complete")
+print(f"  - Columns with outliers removed: {len(panel2_removed_masks)}")
+```
+
+## Summary Statistics - Panel 2
+
+```{python}
+if panel2_removed_masks:
+    stats_p2 = create_summary_stats(panel2_before, panel2_after, panel2_removed_masks, panel_id, config)
+    print(stats_p2.to_string(index=False))
+else:
+    print("No outliers configured for removal")
+```
+
+## Visualization: Before vs After - Panel 2
+
+```{python}
+# Plot Type A: Before vs After Comparison
+if panel2_removed_masks:
+    cols_to_plot = list(panel2_removed_masks.keys())
+    n_cols = len(cols_to_plot)
+    
+    fig = make_subplots(
+        rows=n_cols, 
+        cols=1,
+        subplot_titles=[f'{col}' for col in cols_to_plot],
+        vertical_spacing=0.08,
+        shared_xaxes=True
+    )
+    
+    for idx, col in enumerate(cols_to_plot, 1):
+        # Before data
+        fig.add_trace(
+            go.Scatter(
+                x=panel2_before.index,
+                y=panel2_before[col],
+                mode='lines',
+                name=f'{col} (Before)',
+                line=dict(color='rgba(100, 150, 255, 0.6)', width=1),
+                showlegend=(idx == 1)
+            ),
+            row=idx, col=1
+        )
+        
+        # After data
+        fig.add_trace(
+            go.Scatter(
+                x=panel2_after.index,
+                y=panel2_after[col],
+                mode='lines',
+                name=f'{col} (After)',
+                line=dict(color='rgba(50, 200, 100, 0.8)', width=1.5),
+                showlegend=(idx == 1)
+            ),
+            row=idx, col=1
+        )
+        
+        # Update y-axis label
+        fig.update_yaxes(title_text="Value", row=idx, col=1)
+    
+    # Update layout
+    fig.update_xaxes(title_text="Time", row=n_cols, col=1)
+    fig.update_layout(
+        title_text=f'Panel {panel_id}: Before vs After Manual Outlier Removal',
+        height=350 * n_cols,
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    fig.show()
+else:
+    print("No columns configured for outlier removal")
+```
+
+## Visualization: Removed Points Highlighted - Panel 2
+
+```{python}
+# Plot Type B: After with Removed Points Highlighted
+if panel2_removed_masks:
+    cols_to_plot = list(panel2_removed_masks.keys())
+    n_cols = len(cols_to_plot)
+    
+    fig = make_subplots(
+        rows=n_cols, 
+        cols=1,
+        subplot_titles=[f'{col}' for col in cols_to_plot],
+        vertical_spacing=0.08,
+        shared_xaxes=True
+    )
+    
+    for idx, col in enumerate(cols_to_plot, 1):
+        # After data (clean)
+        fig.add_trace(
+            go.Scatter(
+                x=panel2_after.index,
+                y=panel2_after[col],
+                mode='lines',
+                name='Clean Data',
+                line=dict(color='rgba(50, 200, 100, 0.8)', width=1.5),
+                showlegend=(idx == 1)
+            ),
+            row=idx, col=1
+        )
+        
+        # Removed points
+        mask = panel2_removed_masks[col]
+        if mask.sum() > 0:
+            removed_data = panel2_before[col][mask]
+            fig.add_trace(
+                go.Scatter(
+                    x=removed_data.index,
+                    y=removed_data.values,
+                    mode='markers',
+                    name='Removed Outliers',
+                    marker=dict(
+                        color='red',
+                        size=6,
+                        symbol='x',
+                        line=dict(width=2)
+                    ),
+                    showlegend=(idx == 1)
+                ),
+                row=idx, col=1
+            )
+        
+        # Update y-axis label
+        fig.update_yaxes(title_text="Value", row=idx, col=1)
+    
+    # Update layout
+    fig.update_xaxes(title_text="Time", row=n_cols, col=1)
+    fig.update_layout(
+        title_text=f'Panel {panel_id}: Clean Data with Removed Outliers Highlighted',
+        height=350 * n_cols,
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    fig.show()
+```
+
+## Visualization: Only Removed Data (Diff) - Panel 2
+
+```{python}
+# Plot Type C: Only Removed Data
+if panel2_removed_masks:
+    cols_to_plot = list(panel2_removed_masks.keys())
+    n_cols = len(cols_to_plot)
+    
+    fig = make_subplots(
+        rows=n_cols, 
+        cols=1,
+        subplot_titles=[f'{col} (n={panel2_removed_masks[col].sum()})' for col in cols_to_plot],
+        vertical_spacing=0.08,
+        shared_xaxes=True
+    )
+    
+    for idx, col in enumerate(cols_to_plot, 1):
+        # Only removed points
+        mask = panel2_removed_masks[col]
+        if mask.sum() > 0:
+            removed_data = panel2_before[col][mask]
+            fig.add_trace(
+                go.Scatter(
+                    x=removed_data.index,
+                    y=removed_data.values,
+                    mode='markers',
+                    name=col,
+                    marker=dict(
+                        color='red',
+                        size=8,
+                        symbol='x',
+                        line=dict(width=2)
+                    ),
+                    showlegend=False
+                ),
+                row=idx, col=1
+            )
+            
+            # Add threshold lines if configured
+            manual_cfg = config.get("process", {}).get("manual_outliers", {})
+            panels_cfg = manual_cfg.get("panels", {})
+            panel_cfg = panels_cfg.get(panel_id, {})
+            columns_cfg = panel_cfg.get("columns", {})
+            thresholds = columns_cfg.get(col, {})
+            
+            if thresholds.get('lower') is not None:
+                fig.add_hline(
+                    y=thresholds['lower'], 
+                    line_dash="dash", 
+                    line_color="orange",
+                    annotation_text=f"Lower: {thresholds['lower']}",
+                    row=idx, col=1
+                )
+            if thresholds.get('upper') is not None:
+                fig.add_hline(
+                    y=thresholds['upper'], 
+                    line_dash="dash", 
+                    line_color="orange",
+                    annotation_text=f"Upper: {thresholds['upper']}",
+                    row=idx, col=1
+                )
+        else:
+            # Add empty placeholder
+            fig.add_trace(
+                go.Scatter(
+                    x=[panel2_before.index[0]],
+                    y=[0],
+                    mode='markers',
+                    marker=dict(size=0),
+                    showlegend=False
+                ),
+                row=idx, col=1
+            )
+        
+        # Update y-axis label
+        fig.update_yaxes(title_text="Value", row=idx, col=1)
+    
+    # Update layout
+    fig.update_xaxes(title_text="Time", row=n_cols, col=1)
+    fig.update_layout(
+        title_text=f'Panel {panel_id}: Only Removed Outliers (Diff)',
+        height=350 * n_cols,
+        showlegend=False
+    )
+    fig.show()
+```
+
+# Combined Summary
+
+```{python}
+# Combined statistics for both panels
+print("=" * 80)
+print("COMBINED SUMMARY: MANUAL OUTLIER REMOVAL")
+print("=" * 80)
+
+if panel1_removed_masks:
+    print("\n--- Panel 1 ---")
+    print(stats_p1.to_string(index=False))
+    
+    total_removed_p1 = sum(mask.sum() for mask in panel1_removed_masks.values())
+    print(f"\n✓ Panel 1 Total: {total_removed_p1} outliers removed across {len(panel1_removed_masks)} columns")
+
+if panel2_removed_masks:
+    print("\n--- Panel 2 ---")
+    print(stats_p2.to_string(index=False))
+    
+    total_removed_p2 = sum(mask.sum() for mask in panel2_removed_masks.values())
+    print(f"\n✓ Panel 2 Total: {total_removed_p2} outliers removed across {len(panel2_removed_masks)} columns")
+
+if panel1_removed_masks and panel2_removed_masks:
+    total_removed = total_removed_p1 + total_removed_p2
+    print(f"\n{'=' * 80}")
+    print(f"GRAND TOTAL: {total_removed} outliers removed across both panels")
+    print(f"{'=' * 80}")
+```
+
+# Conclusion
+
+This visualization demonstrates the effectiveness of the manual outlier removal step in filtering extreme values from water quality sensor data. The configured thresholds successfully identify and remove unrealistic sensor readings before they proceed through the rest of the processing pipeline.
+
+**Key Observations:**
+
+1. **Before vs After plots** show that most data remains unchanged, with only extreme values being filtered
+2. **Highlighted removed points** clearly show where outliers were detected in the time series
+3. **Diff-only plots** reveal the distribution and timing of removed outliers
+4. The thresholds appear appropriately set to catch sensor malfunctions and unrealistic readings while preserving normal operating ranges
+
+**Next Steps:**
+
+- These cleaned datasets proceed through imputation to fill the gaps created by outlier removal
+- The thresholds can be adjusted in `config/default.yaml` if needed based on domain expertise
+- Additional columns can be added to the manual outlier removal configuration as needed

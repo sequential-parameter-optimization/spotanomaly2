@@ -1,0 +1,121 @@
+# SPDX-FileCopyrightText: 2026 bartzbeielstein
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "spotanomaly2"
+version = "2.0.0"
+description = "Streamlined anomaly detection system for time series data"
+readme = "README.MD"
+requires-python = ">=3.13"
+license = {text = "AGPL-3.0-or-later"}
+authors = [
+    {name = "bartzbeielstein", email = "32470350+bartzbeielstein@users.noreply.github.com"},
+]
+keywords = ["anomaly-detection", "time-series", "machine-learning", "forecasting"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+dependencies = [
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+    "pandas>=3.0.0",
+    "python-dotenv>=1.0.0",
+    "requests>=2.31.0",
+    "PyYAML>=6.0",
+    "pyarrow>=12.0.0",
+    "plotly>=5.14.0",
+    "scikit-learn>=1.3.0",
+    "joblib>=1.3.0",
+    "typing_extensions>=4.5.0",
+    "matplotlib>=3.7.0",
+    "watchdog>=3.0.0",
+    "spotanomaly2_safe",
+    "spotforecast2",
+    "spotforecast2-safe",
+    "catboost>=1.2.10",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+]
+
+[project.scripts]
+spotanomaly2 = "spotanomaly2.main:main"
+
+[project.urls]
+Homepage = "https://github.com/sequential-parameter-optimization/spotanomaly2"
+Repository = "https://github.com/sequential-parameter-optimization/spotanomaly2"
+Issues = "https://github.com/sequential-parameter-optimization/spotanomaly2/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["spotanomaly2"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = ["notebooks"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+"spotanomaly2/domain/report_generator.py" = ["E501"]
+"spotanomaly2/domain/exceptions.py" = ["N818"]
+
+[tool.black]
+line-length = 120
+target-version = ["py310", "py311", "py312"]
+
+[lint.pydocstyle]
+convention = 'google'
+
+[tool.uv.sources]
+spotanomaly2_safe = { git = "https://github.com/sequential-parameter-optimization/spotanomaly2-safe.git" }
+spotforecast2 = { git = "https://github.com/sequential-parameter-optimization/spotforecast2.git" }
+spotforecast2-safe = { git = "https://github.com/sequential-parameter-optimization/spotforecast2-safe.git" }
+# For local development, uncomment the lines below and comment out the git sources above:
+# spotanomaly2_safe = { path = "../spotanomaly2_safe", editable = true }
+# spotforecast2 = { path = "../spotforecast2", editable = true }
+# spotforecast2-safe = { path = "../spotforecast2-safe", editable = true }
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.1.0",
+    "jupyter>=1.1.1",
+    "reuse>=6.2.0",
+    "ruff>=0.14.10",
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "ty>=0.0.29",
+]
+
+# Type-check application library and tests only (exclude notebooks). Severities are warn-level
+# until annotations are brought in line with ty; CI still runs `ty check` like spotanomaly2_safe.
+[tool.ty.src]
+include = ["spotanomaly2", "tests"]
+
+[tool.ty.rules]
+all = "warn"
+
