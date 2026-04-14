@@ -219,6 +219,10 @@ exogenous:
       - "source_a"
     "2":
       - "source_b"
+  # Weight anomaly residuals by exogenous flow values.
+  # Disabled by default so the repo works without exogenous data.
+  weight_residuals:
+    enabled: false
 
 tune:
   n_trials: 10

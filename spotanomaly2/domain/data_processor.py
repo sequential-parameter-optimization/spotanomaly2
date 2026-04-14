@@ -74,7 +74,9 @@ class DataProcessor:
         """
         # Build complete step list with panel-specific manual outlier removal
         steps = (
-            self._base_steps + [ManualOutlierRemovalStep(self.config, self.logger, panel_id)] + self._post_outlier_steps
+            self._base_steps
+            + [ManualOutlierRemovalStep(self.config, self.logger, panel_id)]
+            + self._post_outlier_steps
         )
 
         step_names = [

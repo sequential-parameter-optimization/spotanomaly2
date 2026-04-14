@@ -20,6 +20,30 @@ from spotanomaly2.infrastructure import logging, storage
 from spotanomaly2.infrastructure.storage import generate_timestamp
 
 
+try:
+    from catboost import CatBoostRegressor as _CatBoostBase
+
+    class _CatBoostRegressor(_CatBoostBase):
+        """Suppress set_params errors on fitted models.
+
+        spotforecast2 calls set_params(task_type='CPU') during prediction
+        on an already-fitted model; CatBoost rejects this via its C++ backend.
+        Defined at module level so joblib/pickle can resolve the class path.
+        """
+        @property
+        def task_type(self):
+            return "CPU"
+
+        def set_params(self, **params):
+            try:
+                return super().set_params(**params)
+            except Exception:
+                return self
+
+except ImportError:
+    _CatBoostRegressor = None  # type: ignore[assignment,misc]
+
+
 def _time_series_train_test_split(df: pd.DataFrame, train_ratio: float = 0.8) -> tuple[pd.DataFrame, pd.DataFrame]:
     split_idx = int(len(df) * train_ratio)
     return df.iloc[:split_idx], df.iloc[split_idx:]
@@ -118,24 +142,8 @@ class SpotforecastTrainer:
             return Ridge(**params)
 
         if name in {"catboost", "catboostregressor"}:
-            from catboost import CatBoostRegressor
-
-            class _CatBoostRegressor(CatBoostRegressor):
-                """Suppress set_params errors on fitted models.
-
-                spotforecast2 calls set_params(task_type='CPU') during prediction
-                on an already-fitted model; CatBoost rejects this via its C++ backend.
-                """
-                @property
-                def task_type(self):
-                    return "CPU"
-
-                def set_params(self, **params):
-                    try:
-                        return super().set_params(**params)
-                    except Exception:
-                        return self
-
+            if _CatBoostRegressor is None:
+                raise ImportError("catboost is not installed")
             params.setdefault("random_seed", random_seed)
             params.setdefault("verbose", 0)
             params = _filter_params(_CatBoostRegressor, params)
@@ -200,6 +208,76 @@ class SpotforecastTrainer:
             mask &= observed_mask.shift(lag).fillna(False).astype(bool)
         return mask
 
+    def _detect_training_anomalies(
+        self,
+        y: pd.Series,
+        n_lags: int,
+        threshold_scale: float = 4.0,
+        buffer: int = 3,
+    ) -> pd.Series:
+        """Detect anomalous regions in training data via a cheap Ridge pre-pass.
+
+        Fits a Ridge AR model, computes one-step-ahead residuals, and flags
+        points where |residual| exceeds ``threshold_scale * MAD`` (median
+        absolute deviation).  Flagged regions are expanded by ``buffer`` steps
+        on each side to catch the shoulders of level-shift anomalies.
+
+        Returns a boolean Series (True = suspected anomaly) aligned to ``y``.
+        """
+        from sklearn.linear_model import Ridge
+
+        clean_mask = pd.Series(False, index=y.index)
+        n = len(y)
+        lag = min(n_lags, 24)
+        if n < lag + 20:
+            return clean_mask
+
+        # Build lag matrix from observed values
+        X_rows = []
+        y_rows = []
+        indices = []
+        vals = y.to_numpy(dtype=float)
+        for t in range(lag, n):
+            if np.any(np.isnan(vals[t - lag:t + 1])):
+                continue
+            X_rows.append(vals[t - lag:t][::-1])
+            y_rows.append(vals[t])
+            indices.append(y.index[t])
+
+        if len(X_rows) < lag + 10:
+            return clean_mask
+
+        X = np.array(X_rows)
+        y_arr = np.array(y_rows)
+        ridge = Ridge(alpha=1.0)
+        ridge.fit(X, y_arr)
+        preds = ridge.predict(X)
+        resid = np.abs(y_arr - preds)
+
+        # Robust threshold: median + k * MAD
+        med = np.median(resid)
+        mad = np.median(np.abs(resid - med)) or 1e-12
+        threshold = med + threshold_scale * mad
+
+        flagged = resid > threshold
+        flagged_indices = {indices[i] for i, f in enumerate(flagged) if f}
+
+        # Expand flagged regions by buffer on each side
+        all_idx = list(y.index)
+        expanded: set = set()
+        for idx in flagged_indices:
+            try:
+                pos = all_idx.index(idx)
+            except ValueError:
+                continue
+            for offset in range(-buffer, buffer + 1):
+                p = pos + offset
+                if 0 <= p < n:
+                    expanded.add(all_idx[p])
+
+        clean_mask.loc[list(expanded)] = True
+        return clean_mask
+
     def _create_multitask(self, panel_id: str, n_lags: int, cache_home: Path | None = None):
         """Create a configured ``MultiTask`` instance for forecaster creation.
 
@@ -254,10 +332,22 @@ class SpotforecastTrainer:
         )
 
         configured_exog_columns = self.config["train"].get("exog_columns", [])
-        prefixed_exog_columns = [
-            col for col in df.columns
-            if col.startswith("exogenous_")
-        ]
+
+        # When weight_residuals is enabled, exogenous columns are used only
+        # for post-prediction residual weighting — not as model features.
+        weight_residuals_enabled = (
+            self.config.get("exogenous", {}).get("weight_residuals", {}).get("enabled", False)
+        )
+        if weight_residuals_enabled:
+            prefixed_exog_columns: list[str] = []
+            self.logger.info(
+                "weight_residuals enabled: exogenous columns excluded from model features"
+            )
+        else:
+            prefixed_exog_columns = [
+                col for col in df.columns
+                if col.startswith("exogenous_")
+            ]
         exog_columns = [
             col
             for col in [*configured_exog_columns, *prefixed_exog_columns]
@@ -268,7 +358,9 @@ class SpotforecastTrainer:
         weight_suffix = self._get_weight_suffix()
         target_cols = [
             col for col in df.columns
-            if not col.endswith(weight_suffix) and col not in exog_columns
+            if not col.endswith(weight_suffix)
+            and col not in exog_columns
+            and not col.startswith("exogenous_")
         ]
 
         known_anomalies = self.config.get("known_anomalies", [])
@@ -325,6 +417,25 @@ class SpotforecastTrainer:
         for i, target_col in enumerate(target_cols):
             self.logger.info(f"  Training forecaster for: {target_col}")
 
+            # Resolve per-channel lag spec from the panel YAML (best_lags).
+            # Falls back to the global train.lags. ``effective_lags`` is what
+            # we'll set on the forecaster; ``effective_n_lags`` is the int
+            # used for sufficiency checks and the strict-observed mask.
+            channel_cfg_for_lags = channel_cfg_map.get(target_col, {})
+            if not isinstance(channel_cfg_for_lags, dict):
+                channel_cfg_for_lags = {}
+            effective_lags: Any = channel_cfg_for_lags.get("best_lags", n_lags)
+            if isinstance(effective_lags, (list, tuple)) and effective_lags:
+                effective_n_lags = int(max(effective_lags))
+                effective_lags = list(effective_lags)
+            else:
+                try:
+                    effective_n_lags = int(effective_lags)
+                    effective_lags = effective_n_lags
+                except (TypeError, ValueError):
+                    effective_n_lags = n_lags
+                    effective_lags = n_lags
+
             y_train_raw = train_df[target_col].copy()
             y_train_raw.name = target_col
 
@@ -336,7 +447,7 @@ class SpotforecastTrainer:
                     y_train = y_train.interpolate(method="time").bfill().ffill()
                 else:
                     y_train = y_train.interpolate(method="linear").bfill().ffill()
-            if len(y_train) < n_lags + 10:
+            if len(y_train) < effective_n_lags + 10:
                 self.logger.warning(f"  Skipping {target_col}: insufficient data ({len(y_train)} rows)")
                 continue
 
@@ -345,10 +456,10 @@ class SpotforecastTrainer:
             if strict_observed_training:
                 sample_mask_for_weights = self._strict_training_sample_mask(
                     observed_mask=observed_mask,
-                    n_lags=n_lags,
+                    n_lags=effective_n_lags,
                 )
-                potential_rows = max(len(y_train) - n_lags, 0)
-                kept_rows = int(sample_mask_for_weights.iloc[n_lags:].sum())
+                potential_rows = max(len(y_train) - effective_n_lags, 0)
+                kept_rows = int(sample_mask_for_weights.iloc[effective_n_lags:].sum())
                 dropped_rows = potential_rows - kept_rows
                 self.logger.info(
                     f"    {target_col}: excluding {dropped_rows} training sample(s) "
@@ -358,6 +469,29 @@ class SpotforecastTrainer:
                     self.logger.warning(f"  Skipping {target_col}: no fully observed training samples left")
                     continue
 
+            # Two-pass anomaly cleaning: detect anomalous training regions
+            # with a cheap Ridge pre-pass and zero-weight them alongside
+            # imputed samples.
+            auto_clean = self.config.get("train", {}).get("auto_clean_anomalies", False)
+            if auto_clean:
+                anomaly_mask = self._detect_training_anomalies(
+                    y_train, n_lags=effective_n_lags,
+                    threshold_scale=self.config.get("train", {}).get(
+                        "auto_clean_threshold", 4.0),
+                    buffer=self.config.get("train", {}).get(
+                        "auto_clean_buffer", 3),
+                )
+                n_flagged = int(anomaly_mask.sum())
+                if n_flagged > 0:
+                    self.logger.info(
+                        f"    {target_col}: auto-cleaning flagged {n_flagged} "
+                        f"suspected anomaly points in training data"
+                    )
+                    if sample_mask_for_weights is not None:
+                        sample_mask_for_weights = sample_mask_for_weights & ~anomaly_mask
+                    else:
+                        sample_mask_for_weights = ~anomaly_mask
+
             exog_train = None
             exog_test = None
             if exog_columns:
@@ -366,9 +500,19 @@ class SpotforecastTrainer:
 
             forecaster = mt.create_forecaster()
 
-            channel_cfg = channel_cfg_map.get(target_col, {})
-            if not isinstance(channel_cfg, dict):
-                channel_cfg = {}
+            # Apply per-channel lag spec resolved above so tuned best_lags
+            # actually drive the live forecaster (previously ignored —
+            # train.lags was the only knob that took effect).
+            if effective_lags != n_lags:
+                try:
+                    forecaster.set_lags(effective_lags)
+                except Exception as exc:
+                    self.logger.warning(
+                        f"  {target_col}: failed to apply best_lags={effective_lags} ({exc}); "
+                        f"falling back to global lags={n_lags}"
+                    )
+
+            channel_cfg = channel_cfg_for_lags
 
             channel_model_name = (
                 channel_cfg.get("model")
@@ -391,7 +535,7 @@ class SpotforecastTrainer:
                 random_seed=random_seed,
             )
 
-            if strict_observed_training and sample_mask_for_weights is not None:
+            if sample_mask_for_weights is not None:
 
                 def _weight_func(index, mask=sample_mask_for_weights):
                     return mask.reindex(index).fillna(False).astype(float).to_numpy()
@@ -402,13 +546,14 @@ class SpotforecastTrainer:
 
             # Weight callback is only needed during fit; keeping a nested
             # function attached breaks model pickling in joblib.
-            if strict_observed_training:
+            if sample_mask_for_weights is not None:
                 forecaster.weight_func = None
                 forecaster.source_code_weight_func = None
 
             channel_model_specs[target_col] = {
                 "model": channel_model_name,
                 "params": channel_model_params,
+                "lags": effective_lags,
             }
 
             steps = len(test_df)
