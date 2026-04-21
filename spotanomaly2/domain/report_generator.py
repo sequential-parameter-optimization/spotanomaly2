@@ -982,8 +982,17 @@ class LiveReportGenerator:
             subplot_titles.append(title)
 
         n_event_rows = len(events)
-        max_spacing = (1.0 / (n_event_rows - 1)) * 0.9 if n_event_rows > 1 else 0.20
-        vertical_spacing = min(0.20, max_spacing)
+        # Pixel-based sizing: Plotly's `vertical_spacing` is a fraction of the
+        # *total* figure height, so for tall figures the gaps otherwise balloon
+        # and compress bars to nothing. Convert a target pixel gap to a fraction.
+        per_row_plot_px = 160
+        # Gap must fit the upper subplot's x-axis ticks + "Contribution" title
+        # plus the next subplot's title annotation — anything less collides.
+        gap_px = 80
+        extras_px = 100  # layout title + bottom axis label
+        total_height = n_event_rows * per_row_plot_px + max(0, n_event_rows - 1) * gap_px + extras_px
+        total_height = max(400, total_height)
+        vertical_spacing = gap_px / total_height if n_event_rows > 1 else 0.0
 
         fig = make_subplots(
             rows=n_event_rows,
@@ -1022,7 +1031,7 @@ class LiveReportGenerator:
                 "xanchor": "center",
                 "font": {"size": 18, "color": COLORS["line"]},
             },
-            height=max(400, len(events) * 280),
+            height=total_height,
             plot_bgcolor=COLORS["background"],
             paper_bgcolor=COLORS["background"],
             font=dict(color="white"),
@@ -1626,9 +1635,23 @@ class LiveReportGenerator:
 
             # Add per-event contributions plot
             if f"{panel_key_prefix}event_contributions" in panel_figures:
+                num_events = len(event_contributions.get(panel_id, []))
+                # ~3 * per-row-height + title, matching sizing in
+                # _create_event_contributions_plot so ~3 events fit before scroll.
+                if num_events > 3:
+                    plot_wrapper_open = '<div class="overflow-y-auto" style="max-height: 740px;">'
+                    plot_wrapper_close = "</div>"
+                    scroll_hint = (
+                        '                    <p class="text-xs text-gray-400 mb-2">'
+                        f"Showing {num_events} events — scroll inside the panel to see all.</p>\n"
+                    )
+                else:
+                    plot_wrapper_open = ""
+                    plot_wrapper_close = ""
+                    scroll_hint = ""
                 html_content += f"""                <div class="bg-gray-900 rounded-lg p-4 border border-gray-800">
                     <h3 class="text-lg font-semibold mb-3 text-custom-line">Per-Event Contributions (Grouped)</h3>
-                    <div id="{panel_key_prefix}event_contributions"></div>
+{scroll_hint}                    {plot_wrapper_open}<div id="{panel_key_prefix}event_contributions"></div>{plot_wrapper_close}
                 </div>
 """
             else:
@@ -2267,12 +2290,21 @@ class LiveReportGenerator:
                             return;
                         }
 
-                        // Use Plotly.react for smooth updates without full rerender
-                        Plotly.react(element, figData.data, figData.layout, {
+                        const plotConfig = {
                             displayModeBar: true,
                             displaylogo: false,
                             responsive: true
-                        });
+                        };
+                        // Event-contribution plots have a variable number of
+                        // subplots (one per detected event). Plotly.react does not
+                        // reliably update when the subplot structure changes, so
+                        // for those we purge and fully re-plot instead.
+                        if (figId.endsWith('_event_contributions')) {
+                            Plotly.purge(element);
+                            Plotly.newPlot(element, figData.data, figData.layout, plotConfig);
+                        } else {
+                            Plotly.react(element, figData.data, figData.layout, plotConfig);
+                        }
 
                         if (figId.endsWith('_normalized')) {
                             setupAnomalyContributionLinking(figId, element);
