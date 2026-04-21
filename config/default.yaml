@@ -165,8 +165,8 @@ train:
   # channels:
   #   channel_1_ph: {model: Ridge, params: {alpha: 1.0}}
   channel_config_files:
-    "1": "config/channel_models/panel_1.yaml"
-    "2": "config/channel_models/panel_2.yaml"
+    "1": "config/channel_models/panel_1_default.yaml"
+    "2": "config/channel_models/panel_2_default.yaml"
 
 detect:
   hist_window: 2016
@@ -229,26 +229,36 @@ tune:
   n_initial: 5
   metric: "mean_absolute_error"
   output_dir: "data/tuning_results"
+  lags:
+    - "[1, 2, 3, 11, 12, 22, 23, 24, 47, 48, 167, 168]"
+    - "48"
+    - "24"
+    - "[1, 2, 24, 48]"
+    - "[1, 2, 23, 24, 47, 48]"
+    - "[1, 2, 11, 12, 23, 24, 167, 168]"
   models:
-    - "LightGBM"
-    - "XGBoost"
-    - "CatBoost"
-  search_space:
-    num_leaves: [8, 256]
-    max_depth: [3, 16]
-    learning_rate: [0.0001, 0.1, "log10"]
-    n_estimators: [10, 1000, "log10"]
-    bagging_fraction: [0.5, 1.0]
-    feature_fraction: [0.5, 1.0]
-    reg_alpha: [0.01, 100.0]
-    reg_lambda: [0.01, 100.0]
-    lags:
-      - "[1, 2, 3, 11, 12, 22, 23, 24, 47, 48, 167, 168]"
-      - "48"
-      - "24"
-      - "[1, 2, 24, 48]"
-      - "[1, 2, 23, 24, 47, 48]"
-      - "[1, 2, 11, 12, 23, 24, 167, 168]"
+    LightGBM:
+      num_leaves: [8, 256]
+      max_depth: [3, 16]
+      learning_rate: [0.0001, 0.1, "log10"]
+      n_estimators: [10, 1000, "log10"]
+      bagging_fraction: [0.5, 1.0]
+      feature_fraction: [0.5, 1.0]
+      reg_alpha: [0.01, 100.0]
+      reg_lambda: [0.01, 100.0]
+    XGBoost:
+      max_depth: [3, 16]
+      learning_rate: [0.0001, 0.1, "log10"]
+      n_estimators: [10, 1000, "log10"]
+      reg_alpha: [0.01, 100.0]
+      reg_lambda: [0.01, 100.0]
+    CatBoost:
+      max_depth: [3, 16]
+      learning_rate: [0.0001, 0.1, "log10"]
+      n_estimators: [10, 1000, "log10"]
+      reg_lambda: [0.01, 100.0]
+    Ridge:
+      alpha: [0.01, 100.0, "log10"]
   # Per-panel, per-channel overrides (optional)
   # panel_overrides:
   #   "1":

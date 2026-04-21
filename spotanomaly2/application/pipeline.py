@@ -302,6 +302,8 @@ class Pipeline:
         self.logger.info(f"Results saved to: {results_dir}")
         self.logger.info("=" * 70)
 
+        tuner.update_channel_configs(all_results)
+
         return all_results
 
     def detect(self) -> None:

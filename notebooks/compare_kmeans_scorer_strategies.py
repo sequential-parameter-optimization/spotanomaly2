@@ -105,7 +105,7 @@ def _get_panel_matrices(
 
     train_true_df, train_keep_mask = detector._exclude_imputed_rows(
         panel_id=panel_id,
-        dataset_name="train",
+        window_name="train",
         source_df=train_df,
         aligned_true_df=train_true_df,
     )
@@ -113,18 +113,18 @@ def _get_panel_matrices(
 
     test_true_df, test_keep_mask = detector._exclude_imputed_rows(
         panel_id=panel_id,
-        dataset_name="test",
+        window_name="test",
         source_df=test_df,
         aligned_true_df=test_true_df,
     )
     test_pred_df = test_pred_df.loc[test_keep_mask]
 
-    train_true_df, train_pred_df, test_true_df, test_pred_df = detector._exclude_invalid_training_rows(
+    train_true_df, train_pred_df, test_true_df, test_pred_df = detector._exclude_invalid_scorer_fit_rows(
         panel_id=panel_id,
-        train_true_df=train_true_df,
-        train_pred_df=train_pred_df,
-        test_true_df=test_true_df,
-        test_pred_df=test_pred_df,
+        fit_true_df=train_true_df,
+        fit_pred_df=train_pred_df,
+        eval_true_df=test_true_df,
+        eval_pred_df=test_pred_df,
     )
 
     detector._validate_scoring_inputs(panel_id, test_true_df, test_pred_df)

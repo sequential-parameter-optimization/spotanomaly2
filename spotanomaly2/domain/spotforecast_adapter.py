@@ -771,44 +771,6 @@ def _yaml_search_space_to_dict(raw: dict) -> dict:
     return result
 
 
-_ESTIMATOR_FACTORIES: dict[str, callable] = {}
-
-
-def _get_estimator_factories() -> dict[str, callable]:
-    """Lazily build and cache the mapping of model name -> estimator factory."""
-    if _ESTIMATOR_FACTORIES:
-        return _ESTIMATOR_FACTORIES
-
-    from lightgbm import LGBMRegressor
-
-    _ESTIMATOR_FACTORIES["LightGBM"] = lambda seed: LGBMRegressor(
-        random_state=seed,
-        verbose=-1,
-    )
-
-    try:
-        from xgboost import XGBRegressor
-
-        _ESTIMATOR_FACTORIES["XGBoost"] = lambda seed: XGBRegressor(
-            random_state=seed,
-            n_jobs=-1,
-            verbosity=0,
-        )
-    except ImportError:
-        pass
-
-    try:
-        from catboost import CatBoostRegressor
-
-        _ESTIMATOR_FACTORIES["CatBoost"] = lambda seed: CatBoostRegressor(
-            random_seed=seed,
-            verbose=0,
-        )
-    except ImportError:
-        pass
-
-    return _ESTIMATOR_FACTORIES
-
 
 class SpotforecastTuner:
     """Tunes spotforecast2 ForecasterRecursive hyperparameters via SpotOptim.
@@ -836,12 +798,9 @@ class SpotforecastTuner:
         from spotforecast2_safe.forecaster.recursive import ForecasterRecursive
         from spotforecast2_safe.preprocessing import RollingFeatures as RollingFeaturesUnified
 
-        factories = _get_estimator_factories()
-        if model_name not in factories:
-            available = list(factories.keys())
-            raise ValueError(f"Unknown model '{model_name}'. Available: {available}")
-
-        estimator = factories[model_name](random_seed)
+        # Reuse the trainer's _build_estimator so all model names are supported.
+        trainer = SpotforecastTrainer(self.config, self.logger)
+        estimator = trainer._build_estimator(model_name, {}, random_seed)
         kwargs: dict[str, Any] = {"estimator": estimator, "lags": n_lags}
         if window_sizes:
             kwargs["window_features"] = RollingFeaturesUnified(
@@ -902,16 +861,21 @@ class SpotforecastTuner:
         n_trials = tune_config.get("n_trials", 10)
         n_initial = tune_config.get("n_initial", 5)
         metric = tune_config.get("metric", "mean_absolute_error")
-        search_space_raw = tune_config.get("search_space", {})
-        search_space = _yaml_search_space_to_dict(search_space_raw)
+        model_search_spaces = tune_config.get("model_search_spaces", {})
 
         models = tune_config.get("models", ["LightGBM"])
         if isinstance(models, str):
             models = [models]
-        available_factories = _get_estimator_factories()
-        models = [m for m in models if m in available_factories]
-        if not models:
-            models = ["LightGBM"]
+        # Validate model names via _build_estimator
+        trainer = SpotforecastTrainer(self.config, self.logger)
+        valid_models = []
+        for m in models:
+            try:
+                trainer._build_estimator(m, {}, 0)
+                valid_models.append(m)
+            except (ValueError, ImportError):
+                self.logger.warning(f"Model '{m}' not available, skipping")
+        models = valid_models or ["LightGBM"]
 
         self.logger.info(
             f"Tuning panel {panel_id}: {len(target_cols)} channels, "
@@ -932,7 +896,6 @@ class SpotforecastTuner:
         for target_col in channel_pbar:
             channel_pbar.set_postfix_str(target_col)
 
-            channel_search_space = dict(search_space)
             channel_n_trials = n_trials
             channel_n_initial = n_initial
 
@@ -944,9 +907,6 @@ class SpotforecastTuner:
             if channel_overrides:
                 channel_n_trials = channel_overrides.get("n_trials", channel_n_trials)
                 channel_n_initial = channel_overrides.get("n_initial", channel_n_initial)
-                if "search_space" in channel_overrides:
-                    override_space = _yaml_search_space_to_dict(channel_overrides["search_space"])
-                    channel_search_space.update(override_space)
 
             y_train = train_df[target_col].copy()
             y_train.name = target_col
@@ -963,6 +923,11 @@ class SpotforecastTuner:
             exog_train = None
             if exog_columns:
                 exog_train = train_df[exog_columns].loc[y_train.index]
+                if exog_train.isna().any().any():
+                    if isinstance(exog_train.index, pd.DatetimeIndex):
+                        exog_train = exog_train.interpolate(method="time").bfill().ffill()
+                    else:
+                        exog_train = exog_train.interpolate(method="linear").bfill().ffill()
 
             best_overall: dict[str, Any] | None = None
 
@@ -977,12 +942,14 @@ class SpotforecastTuner:
 
                 try:
                     forecaster = self._create_forecaster(model_name, n_lags, random_seed)
+                    search_space_raw = model_search_spaces.get(model_name, {})
+                    search_space = _yaml_search_space_to_dict(search_space_raw)
 
                     tuning_results, optimizer = spotoptim_search_forecaster(
                         forecaster=forecaster,
                         y=y_train,
                         cv=cv,
-                        search_space=channel_search_space,
+                        search_space=search_space,
                         metric=metric,
                         exog=exog_train,
                         return_best=True,
