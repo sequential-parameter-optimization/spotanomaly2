@@ -68,6 +68,9 @@ Issues = "https://github.com/sequential-parameter-optimization/spotanomaly2/issu
 [tool.hatch.build.targets.wheel]
 packages = ["spotanomaly2"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"assets" = "assets"
+
 [tool.hatch.metadata]
 allow-direct-references = true
 
