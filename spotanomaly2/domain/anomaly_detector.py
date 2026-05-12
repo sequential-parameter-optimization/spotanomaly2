@@ -257,9 +257,7 @@ class AnomalyDetector:
         eval_true_df = eval_true_df.multiply(eval_flow, axis=0)
         eval_pred_df = eval_pred_df.multiply(eval_flow, axis=0)
 
-        self.logger.info(
-            f"Panel {panel_id}: applied flow weighting using '{flow_col}' to residuals"
-        )
+        self.logger.info(f"Panel {panel_id}: applied flow weighting using '{flow_col}' to residuals")
 
         return fit_true_df, fit_pred_df, eval_true_df, eval_pred_df
 
@@ -372,8 +370,7 @@ class AnomalyDetector:
             first_ts = dropped_index.min()
             last_ts = dropped_index.max()
             self.logger.warning(
-                f"Panel {panel_id}: excluding {dropped_rows} invalid scorer-fit row(s) "
-                f"({first_ts} to {last_ts})"
+                f"Panel {panel_id}: excluding {dropped_rows} invalid scorer-fit row(s) ({first_ts} to {last_ts})"
             )
 
         fit_true_df = fit_true_df.loc[fit_keep_mask]
@@ -403,15 +400,11 @@ class AnomalyDetector:
         target_date = self.config["detect"].get("target_date", None)
 
         if target_date:
-            test_start_idx, test_end_idx = (
-                self._calculate_test_window_with_target_date(
-                    unseen_df, target_date, hist_window
-                )
+            test_start_idx, test_end_idx = self._calculate_test_window_with_target_date(
+                unseen_df, target_date, hist_window
             )
         else:
-            test_start_idx, test_end_idx = self._calculate_test_window_default(
-                unseen_df, hist_window
-            )
+            test_start_idx, test_end_idx = self._calculate_test_window_default(unseen_df, hist_window)
 
         test_start_idx, test_end_idx = self._adjust_window_for_insufficient_data(
             unseen_df, test_start_idx, test_end_idx, hist_window
@@ -428,7 +421,15 @@ class AnomalyDetector:
         self.logger.info(f"Scorer fit window: {len(scorer_fit_df)}, Scorer eval window: {len(scorer_eval_df)}")
 
         # Generate predictions via spotforecast2 adapter
-        self.logger.info(f"Generating predictions using {model_type} model...")
+        channel_models = model_data.get("channel_models") or {}
+        if channel_models:
+            from collections import Counter
+
+            counts = Counter(spec.get("model", "?") for spec in channel_models.values())
+            breakdown = ", ".join(f"{m}×{n}" for m, n in counts.most_common())
+            self.logger.info(f"Generating predictions ({model_type}; channels: {breakdown})...")
+        else:
+            self.logger.info(f"Generating predictions using {model_type} model...")
         adapter = SpotforecastTrainer(self.config, self.logger)
         history_for_fit_pred = history_df if len(history_df) > 0 else None
         fit_pred_df = adapter.predict(

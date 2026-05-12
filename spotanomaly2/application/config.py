@@ -50,6 +50,18 @@ def _resolve_config_paths(config: dict[str, Any], base: Path) -> None:
         if isinstance(od, str):
             tune["output_dir"] = _resolve_path_value(od, base)
 
+    train = config.get("train")
+    if isinstance(train, dict):
+        # Per-panel YAML paths under train.channel_config_files are read at training
+        # time and rewritten by ModelTuner.update_channel_configs after tuning. Both
+        # callers do `Path(value)` and join against cwd if relative — which breaks
+        # when the kernel/CLI starts outside the repo root.
+        channel_files = train.get("channel_config_files")
+        if isinstance(channel_files, dict):
+            for key, val in list(channel_files.items()):
+                if isinstance(val, str):
+                    channel_files[key] = _resolve_path_value(val, base)
+
 
 def load_config(config_path: Path, base_dir: Path | None = None) -> dict[str, Any]:
     """Load configuration from YAML file.

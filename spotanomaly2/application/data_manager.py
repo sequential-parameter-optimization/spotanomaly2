@@ -155,6 +155,17 @@ class DataManager:
                         )
                         existing_df = baseline_df_check
                         bootstrap_source = "baseline_schema_update"
+                    elif baseline_df_check.index.max() > existing_df.index.max() + pd.Timedelta(hours=1):
+                        # Baseline is fresher than live (e.g. user just re-ran the full
+                        # pipeline). Without this swap, merging stale live with the new
+                        # incremental window leaves the intervening period as a gap.
+                        self.logger.warning(
+                            f"Live data for panel {panel_id} is stale: "
+                            f"ends at {existing_df.index.max()}, baseline ends at {baseline_df_check.index.max()}. "
+                            "Re-bootstrapping from baseline to avoid creating a gap."
+                        )
+                        existing_df = baseline_df_check
+                        bootstrap_source = "baseline_stale_live"
                 except FileNotFoundError:
                     pass
 
