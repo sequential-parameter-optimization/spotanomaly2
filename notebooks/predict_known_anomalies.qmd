@@ -26,20 +26,28 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import plotly.io as pio
 
-# Add src to path
-project_root = Path.cwd()
-sys.path.insert(0, str(project_root))
+# Resolve the repo root by walking up looking for pyproject.toml — survives
+# rendering this qmd from either notebooks/ or the repo root.
+_here = Path.cwd().resolve()
+PROJECT_ROOT: Path | None = None
+for _candidate in (_here, *_here.parents):
+    if (_candidate / "pyproject.toml").exists():
+        PROJECT_ROOT = _candidate
+        break
+if PROJECT_ROOT is None:
+    raise RuntimeError(f"Could not find pyproject.toml starting from {_here}")
+sys.path.insert(0, str(PROJECT_ROOT))
 
 # Import project modules
-from src.application.config import load_default_config
-from src.infrastructure.storage import load_panel_parquet, find_latest_timestamped_dir
-from src.domain.anomaly_detector import AnomalyDetector
-from src.infrastructure import logging
+from spotanomaly2.application.config import load_config
+from spotanomaly2.infrastructure.storage import load_panel_parquet, find_latest_timestamped_dir
+from spotanomaly2.domain.anomaly_detector import AnomalyDetector
+from spotanomaly2.infrastructure import logging
 
 # Set plotly template
 pio.templates.default = "plotly_white"
 
-print("Setup complete!")
+print(f"Setup complete! Project root: {PROJECT_ROOT}")
 ```
 
 ## Configuration Loading
@@ -47,8 +55,10 @@ print("Setup complete!")
 ```{python}
 #| label: load-config
 
-# Load configuration
-config = load_default_config()
+# Load configuration. Pin base_dir to the repo root so relative data paths
+# in the config (`data/raw`, `data/models`, …) resolve correctly regardless
+# of where this qmd is rendered from.
+config = load_config(PROJECT_ROOT / "config" / "config.yaml", base_dir=PROJECT_ROOT)
 
 # Extract known anomalies (handle None case)
 known_anomalies = config.get("known_anomalies") or []
@@ -291,29 +301,86 @@ for panel_id in filtered_panel_data.keys():
         
         hist_window = config.get("detect", {}).get("hist_window", 4032)
         original_target_date = config.get("detect", {}).get("target_date")
-        
+
         # Calculate default test window (last hist_window samples)
         default_test_start_idx = max(0, len(full_df) - hist_window)
         default_test_start = full_df.index[default_test_start_idx] if len(full_df) > default_test_start_idx else full_df.index[0]
         default_test_end = full_df.index[-1]
-        
+
         print(f"  Default test window would be: {default_test_start} to {default_test_end}")
-        
+
+        # The leakage guard in detect_panel splits history/unseen at the
+        # model's train_end_timestamp. Known anomalies sitting inside training
+        # are ordinarily dropped from unseen and can't be scored. Read the
+        # saved model's train_end once so we can decide per-period whether to
+        # shift timestamps forward to bypass the guard.
+        _model_data_for_panel = detector.load_forecasting_model(panel_id)
+        _train_end_str = _model_data_for_panel.get("train_end_timestamp")
+        train_end_ts = pd.Timestamp(_train_end_str) if _train_end_str else None
+        if train_end_ts is not None and full_df.index.tz is not None and train_end_ts.tz is None:
+            train_end_ts = train_end_ts.tz_localize(full_df.index.tz)
+
         # Strategy: Run detection for each individual period that needs it
         # Store detection results for each period
         period_detection_results = {}
-        
+
         if panel_id in individual_anomaly_periods:
             for period_info in individual_anomaly_periods[panel_id]:
                 period_start = period_info['period_start']
                 period_end = period_info['period_end']
                 anomaly_num = period_info['index']
-                
+
                 print(f"\n  Processing Period {anomaly_num}: {period_start} to {period_end}")
-                
+
+                # Period sits entirely inside training: shift the whole df
+                # forward so detect_panel's wall-clock leakage guard treats
+                # the window as unseen. The model is invisible to this — lag
+                # features come from relative offsets, not absolute time. We
+                # un-shift the result indexes so downstream plotting sees
+                # the real timestamps.
+                period_in_training = (
+                    train_end_ts is not None and period_end <= train_end_ts
+                )
+                if period_in_training:
+                    # Shift must give detect_panel enough unseen room *before*
+                    # the eval window — it fits the scorer on the hist_window
+                    # rows preceding target_date. Pad by hist_window + 200
+                    # samples (≈ a few extra hours of slack).
+                    shift_pad = pd.Timedelta(minutes=5 * (hist_window + 200))
+                    shift = train_end_ts - period_end + shift_pad
+                    shifted_df = full_df.copy()
+                    shifted_df.index = shifted_df.index + shift
+
+                    shifted_target = period_end + shift
+                    if shifted_target.tz is not None:
+                        target_date_str = shifted_target.strftime("%Y-%m-%dT%H:%M:%S%z")
+                        if len(target_date_str) > 19 and target_date_str[19] != ':':
+                            target_date_str = target_date_str[:19] + target_date_str[19:22] + ':' + target_date_str[22:]
+                    else:
+                        target_date_str = shifted_target.strftime("%Y-%m-%dT%H:%M:%S")
+                    config["detect"]["target_date"] = target_date_str
+                    detector.config = config
+
+                    print(f"    Period inside training — shifting df by +{shift} to bypass leakage guard")
+                    print(f"    Shifted target_date: {target_date_str}")
+                    period_scores, period_flags, period_forecast, _ = detector.detect_panel(panel_id, shifted_df)
+
+                    # Un-shift so downstream code can index against full_df.
+                    period_scores.index = period_scores.index - shift
+                    period_flags.index = period_flags.index - shift
+                    period_forecast.index = period_forecast.index - shift
+
+                    period_detection_results[anomaly_num] = {
+                        'scores': period_scores,
+                        'flags': period_flags,
+                        'forecast': period_forecast,
+                    }
+                    print(f"    Detection complete. Period window: {period_scores.index.min()} to {period_scores.index.max()}")
+                    continue
+
                 # Check if this period is within default test window
                 period_in_default = (period_start >= default_test_start) and (period_end <= default_test_end)
-                
+
                 if period_in_default:
                     print(f"    ✓ Period is within default test window")
                     # Will use default detection (run once at the end)
@@ -323,7 +390,7 @@ for panel_id in filtered_panel_data.keys():
                     # Run detection with target_date set to include this period
                     target_date = period_end + pd.Timedelta(minutes=5)  # Small buffer
                     target_date = min(target_date, full_df.index[-1])
-                    
+
                     # Format target_date
                     if target_date.tz is not None:
                         target_date_str = target_date.strftime("%Y-%m-%dT%H:%M:%S%z")
@@ -331,13 +398,15 @@ for panel_id in filtered_panel_data.keys():
                             target_date_str = target_date_str[:19] + target_date_str[19:22] + ':' + target_date_str[22:]
                     else:
                         target_date_str = target_date.strftime("%Y-%m-%dT%H:%M:%S")
-                    
+
                     config["detect"]["target_date"] = target_date_str
                     detector.config = config
-                    
+
                     print(f"    Running detection with target_date: {target_date_str}")
-                    period_scores, period_flags, period_forecast = detector.detect_panel(panel_id, full_df)
-                    
+                    # detect_panel returns (scores, flags, forecast, contributions);
+                    # this notebook doesn't visualise contributions yet.
+                    period_scores, period_flags, period_forecast, _ = detector.detect_panel(panel_id, full_df)
+
                     period_detection_results[anomaly_num] = {
                         'scores': period_scores,
                         'flags': period_flags,
@@ -356,7 +425,7 @@ for panel_id in filtered_panel_data.keys():
                 config["detect"]["target_date"] = original_target_date
             detector.config = config
             
-            default_scores, default_flags, default_forecast = detector.detect_panel(panel_id, full_df)
+            default_scores, default_flags, default_forecast, _ = detector.detect_panel(panel_id, full_df)
             print(f"  Default detection complete. Test window: {default_scores.index.min()} to {default_scores.index.max()}")
             
             # Use default results for periods that need it
