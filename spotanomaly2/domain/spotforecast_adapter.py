@@ -366,24 +366,17 @@ def _ensure_datetime_freq(obj, fallback_freq: str | None = None):
     return obj
 
 
-def _interpolate_series_for_model(series: pd.Series) -> pd.Series:
-    """Interpolate and fill missing values in a Series for model consumption."""
-    series = series.copy()
-    if series.isna().any():
-        if isinstance(series.index, pd.DatetimeIndex):
-            series = series.interpolate(method="time").bfill().ffill()
-        else:
-            series = series.interpolate(method="linear").bfill().ffill()
-    return series
-
-
-def _interpolate_frame_for_model(df: pd.DataFrame) -> pd.DataFrame:
-    """Interpolate and fill missing values in a DataFrame for model consumption."""
-    if not df.isna().any().any():
-        return df
-    if isinstance(df.index, pd.DatetimeIndex):
-        return df.interpolate(method="time").bfill().ffill()
-    return df.interpolate(method="linear").bfill().ffill()
+def _interpolate_for_model(data: pd.Series | pd.DataFrame) -> pd.Series | pd.DataFrame:
+    """Interpolate and fill missing values in a Series or DataFrame for model consumption."""
+    if isinstance(data, pd.Series):
+        if not data.isna().any():
+            return data.copy()
+    elif not data.isna().any().any():
+        return data
+    data = data.copy()
+    if isinstance(data.index, pd.DatetimeIndex):
+        return data.interpolate(method="time").bfill().ffill()
+    return data.interpolate(method="linear").bfill().ffill()
 
 
 def _difference(y: pd.Series, order: int) -> pd.Series:
@@ -696,6 +689,7 @@ class SpotforecastTrainer:
         if channel_specific_params:
             channel_cfg_map = {**channel_cfg_map, **channel_specific_params}
 
+        weight_suffix = self._get_weight_suffix()
         forecasters: dict[str, Any] = {}
         channel_model_specs: dict[str, dict[str, Any]] = {}
         y_pred_test = np.zeros((len(test_df), len(target_cols)))
@@ -732,11 +726,10 @@ class SpotforecastTrainer:
             y_train_raw = train_df[target_col].copy()
             y_train_raw.name = target_col
 
-            weight_suffix = _get_weight_suffix_from_config(self.config)
             observed_mask = _compute_observed_mask(train_df, target_col, weight_suffix)
             y_train = y_train_raw.copy()
             y_train.loc[~observed_mask] = np.nan
-            y_train = _interpolate_series_for_model(y_train)
+            y_train = _interpolate_for_model(y_train)
             if len(y_train) < effective_n_lags + 10:
                 self.logger.warning(f"  Skipping {target_col}: insufficient data ({len(y_train)} rows)")
                 continue
@@ -815,10 +808,10 @@ class SpotforecastTrainer:
 
             # One-step-ahead test predictions on real observed lags (mirrors
             # what detection / live mode does — see _predict_one_step_integrated).
-            test_observed = _compute_observed_mask(test_df, target_col, _get_weight_suffix_from_config(self.config))
+            test_observed = _compute_observed_mask(test_df, target_col, weight_suffix)
             y_test_for_lags = test_df[target_col].copy()
             y_test_for_lags.loc[~test_observed] = np.nan
-            y_test_for_lags = _interpolate_series_for_model(y_test_for_lags)
+            y_test_for_lags = _interpolate_for_model(y_test_for_lags)
 
             full_y_raw = pd.concat([y_train, y_test_for_lags])
             full_y_raw.name = target_col
@@ -826,7 +819,7 @@ class SpotforecastTrainer:
             full_exog = None
             if exog_columns:
                 full_exog = pd.concat([train_df[exog_columns], test_df[exog_columns]])
-                full_exog = _interpolate_frame_for_model(full_exog)
+                full_exog = _interpolate_for_model(full_exog)
                 full_exog = full_exog.loc[full_y_raw.index]
 
             try:
@@ -949,7 +942,7 @@ class SpotforecastTrainer:
 
             full_y = full_y.copy()
             full_y.loc[~observed_mask] = np.nan
-            full_y = _interpolate_series_for_model(full_y)
+            full_y = _interpolate_for_model(full_y)
             if len(full_y) == 0:
                 predictions[target_col] = np.full(len(df), np.nan)
                 continue
@@ -965,7 +958,7 @@ class SpotforecastTrainer:
                     else:
                         exog_full = df[cols_present].copy()
                     exog_full = exog_full.loc[full_y.index]
-                    exog_full = _interpolate_frame_for_model(exog_full)
+                    exog_full = _interpolate_for_model(exog_full)
 
             try:
                 predictions[target_col] = _predict_one_step_integrated(
@@ -1223,7 +1216,7 @@ class SpotforecastTuner:
         # columns as exog features and exclude them from the tuning targets.
         # Otherwise tune optimizes a different model than train ends up fitting.
         target_cols, exog_columns = _resolve_feature_columns(self.config, df)
-        weight_suffix = _get_weight_suffix_from_config(self.config)
+        weight_suffix = self._get_weight_suffix()
 
         if channels is not None:
             target_cols = [c for c in target_cols if c in channels]
@@ -1299,7 +1292,7 @@ class SpotforecastTuner:
             y_train_raw.name = target_col
             y_train = y_train_raw.copy()
             y_train.loc[~observed_mask] = np.nan
-            y_train = _interpolate_series_for_model(y_train)
+            y_train = _interpolate_for_model(y_train)
             if len(y_train) < n_lags_max + 10:
                 self.logger.warning(f"  Skipping {target_col}: insufficient data ({len(y_train)} rows)")
                 continue
@@ -1331,7 +1324,7 @@ class SpotforecastTuner:
             exog_train = None
             if exog_columns:
                 exog_train = tune_df[exog_columns].loc[y_train.index]
-                exog_train = _interpolate_frame_for_model(exog_train)
+                exog_train = _interpolate_for_model(exog_train)
 
             # Predict Δy[t] just like train_panel will. The tuner must score
             # candidates on the same target the production model will fit
