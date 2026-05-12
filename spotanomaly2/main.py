@@ -293,6 +293,14 @@ def main(argv=None) -> int:
         print(f"Error: {e}", file=sys.stderr)
         return 1
 
+    # Preserve the directory the config file came from so other components
+    # can resolve relative paths consistently.
+    if args.config:
+        config_base_dir = Path(config_path).resolve().parent
+    else:
+        config_base_dir = Path.cwd()
+    config["_config_base_dir"] = str(config_base_dir)
+
     # Add model_timestamp to config if provided via CLI
     if hasattr(args, "model") and args.model:
         if "detect" not in config:

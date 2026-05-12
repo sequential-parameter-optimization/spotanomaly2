@@ -244,19 +244,26 @@ def _mask_known_anomalies(
     return df
 
 
-def _split_panel_columns(
-    df: pd.DataFrame,
-    configured_exog_columns: list[str],
-    weight_suffix: str,
-    weight_residuals_enabled: bool,
-) -> tuple[list[str], list[str]]:
-    """Split DataFrame columns into (target_cols, exog_columns).
+def _get_weight_suffix_from_config(config: dict[str, Any]) -> str:
+    """Return configured imputation weight suffix."""
+    return config.get("process", {}).get("imputation", {}).get("weight_suffix", "__weight")
 
-    Mirrors the logic ``SpotforecastTrainer.train_panel`` uses so the tuner sees
-    the same model topology as the training step: ``exogenous_*`` columns are
-    fed in as exog features (unless ``weight_residuals`` consumes them), and
-    they are NOT scored as targets.
+
+def _resolve_feature_columns(
+    config: dict[str, Any],
+    df: pd.DataFrame,
+) -> tuple[list[str], list[str]]:
+    """Resolve (target_cols, exog_columns) consistently for train/predict/tune.
+
+    Derives exogenous and target columns from config so the tuner sees the same
+    model topology as the training step: ``exogenous_*`` columns are fed as exog
+    features (unless ``weight_residuals`` consumes them), and they are NOT scored
+    as targets.
     """
+    configured_exog_columns = config.get("train", {}).get("exog_columns", [])
+    weight_residuals_enabled = config.get("exogenous", {}).get("weight_residuals", {}).get("enabled", False)
+    weight_suffix = _get_weight_suffix_from_config(config)
+
     if weight_residuals_enabled:
         prefixed_exog_columns: list[str] = []
     else:
@@ -348,7 +355,7 @@ def _detect_anomalies_via_ridge(
     return clean_mask
 
 
-def _ensure_freq(obj, fallback_freq: str | None = None):
+def _ensure_datetime_freq(obj, fallback_freq: str | None = None):
     """Set ``obj.index.freq`` from ``pd.infer_freq``, falling back to
     ``fallback_freq`` when inference fails. Works on Series and DataFrame.
     """
@@ -359,13 +366,24 @@ def _ensure_freq(obj, fallback_freq: str | None = None):
     return obj
 
 
-def _interpolate_inplace(obj):
-    """Time-aware interpolation + bfill/ffill for Series or DataFrame."""
-    if isinstance(obj.index, pd.DatetimeIndex):
-        obj = obj.interpolate(method="time").bfill().ffill()
-    else:
-        obj = obj.interpolate(method="linear").bfill().ffill()
-    return obj
+def _interpolate_series_for_model(series: pd.Series) -> pd.Series:
+    """Interpolate and fill missing values in a Series for model consumption."""
+    series = series.copy()
+    if series.isna().any():
+        if isinstance(series.index, pd.DatetimeIndex):
+            series = series.interpolate(method="time").bfill().ffill()
+        else:
+            series = series.interpolate(method="linear").bfill().ffill()
+    return series
+
+
+def _interpolate_frame_for_model(df: pd.DataFrame) -> pd.DataFrame:
+    """Interpolate and fill missing values in a DataFrame for model consumption."""
+    if not df.isna().any().any():
+        return df
+    if isinstance(df.index, pd.DatetimeIndex):
+        return df.interpolate(method="time").bfill().ffill()
+    return df.interpolate(method="linear").bfill().ffill()
 
 
 def _difference(y: pd.Series, order: int) -> pd.Series:
@@ -413,9 +431,9 @@ def _one_step_ahead_predict(
     """
     from spotforecast2_safe.forecaster.utils import transform_numpy
 
-    full_y = _ensure_freq(full_y)
+    full_y = _ensure_datetime_freq(full_y)
     if full_exog is not None:
-        full_exog = _ensure_freq(full_exog)
+        full_exog = _ensure_datetime_freq(full_exog)
 
     x_features, y_target = forecaster.create_train_X_y(y=full_y, exog=full_exog)
     preds_all = forecaster.estimator.predict(x_features)
@@ -602,7 +620,8 @@ class SpotforecastTrainer:
 
         cfg_path = Path(cfg_path_value)
         if not cfg_path.is_absolute():
-            cfg_path = (Path.cwd() / cfg_path).resolve()
+            base_dir = Path(self.config.get("_config_base_dir", Path.cwd()))
+            cfg_path = (base_dir / cfg_path).resolve()
 
         if not cfg_path.exists():
             raise FileNotFoundError(f"Channel model config for panel {panel_id} not found: {cfg_path}")
@@ -615,7 +634,7 @@ class SpotforecastTrainer:
         return loaded
 
     def _get_weight_suffix(self) -> str:
-        return self.config.get("process", {}).get("imputation", {}).get("weight_suffix", "__weight")
+        return _get_weight_suffix_from_config(self.config)
 
     def train_panel(
         self,
@@ -644,15 +663,10 @@ class SpotforecastTrainer:
 
         self.logger.info(f"Training spotforecast2 models on {len(df)} rows for panel {panel_id}")
 
-        configured_exog_columns = self.config["train"].get("exog_columns", [])
-
-        weight_suffix = self._get_weight_suffix()
+        target_cols, exog_columns = _resolve_feature_columns(self.config, df)
         weight_residuals_enabled = self.config.get("exogenous", {}).get("weight_residuals", {}).get("enabled", False)
         if weight_residuals_enabled:
             self.logger.info("weight_residuals enabled: exogenous columns excluded from model features")
-        target_cols, exog_columns = _split_panel_columns(
-            df, configured_exog_columns, weight_suffix, weight_residuals_enabled
-        )
 
         known_anomalies = self.config.get("known_anomalies", [])
         known_anomaly_buffer = self.config["train"].get("known_anomaly_buffer")
@@ -662,8 +676,8 @@ class SpotforecastTrainer:
         train_df, test_df = _time_series_train_test_split(df, train_ratio=train_ratio)
 
         fallback_freq = self.config.get("process", {}).get("resample", {}).get("freq", "5min")
-        train_df = _ensure_freq(train_df, fallback_freq)
-        test_df = _ensure_freq(test_df, fallback_freq)
+        train_df = _ensure_datetime_freq(train_df, fallback_freq)
+        test_df = _ensure_datetime_freq(test_df, fallback_freq)
 
         self.logger.info(f"Train size: {len(train_df)}, Test size: {len(test_df)}")
 
@@ -718,11 +732,11 @@ class SpotforecastTrainer:
             y_train_raw = train_df[target_col].copy()
             y_train_raw.name = target_col
 
+            weight_suffix = _get_weight_suffix_from_config(self.config)
             observed_mask = _compute_observed_mask(train_df, target_col, weight_suffix)
             y_train = y_train_raw.copy()
             y_train.loc[~observed_mask] = np.nan
-            if y_train.isna().any():
-                y_train = _interpolate_inplace(y_train)
+            y_train = _interpolate_series_for_model(y_train)
             if len(y_train) < effective_n_lags + 10:
                 self.logger.warning(f"  Skipping {target_col}: insufficient data ({len(y_train)} rows)")
                 continue
@@ -801,11 +815,10 @@ class SpotforecastTrainer:
 
             # One-step-ahead test predictions on real observed lags (mirrors
             # what detection / live mode does — see _predict_one_step_integrated).
-            test_observed = _compute_observed_mask(test_df, target_col, weight_suffix)
+            test_observed = _compute_observed_mask(test_df, target_col, _get_weight_suffix_from_config(self.config))
             y_test_for_lags = test_df[target_col].copy()
             y_test_for_lags.loc[~test_observed] = np.nan
-            if y_test_for_lags.isna().any():
-                y_test_for_lags = _interpolate_inplace(y_test_for_lags)
+            y_test_for_lags = _interpolate_series_for_model(y_test_for_lags)
 
             full_y_raw = pd.concat([y_train, y_test_for_lags])
             full_y_raw.name = target_col
@@ -813,8 +826,7 @@ class SpotforecastTrainer:
             full_exog = None
             if exog_columns:
                 full_exog = pd.concat([train_df[exog_columns], test_df[exog_columns]])
-                if full_exog.isna().any().any():
-                    full_exog = _interpolate_inplace(full_exog)
+                full_exog = _interpolate_frame_for_model(full_exog)
                 full_exog = full_exog.loc[full_y_raw.index]
 
             try:
@@ -910,9 +922,9 @@ class SpotforecastTrainer:
         diff_order = int(model_data.get("differentiation", 0))
         weight_suffix = self._get_weight_suffix()
 
-        df = _ensure_freq(df)
+        df = _ensure_datetime_freq(df)
         if history_df is not None:
-            history_df = _ensure_freq(history_df)
+            history_df = _ensure_datetime_freq(history_df)
 
         predictions: dict[str, np.ndarray] = {}
 
@@ -937,13 +949,12 @@ class SpotforecastTrainer:
 
             full_y = full_y.copy()
             full_y.loc[~observed_mask] = np.nan
-            if full_y.isna().any():
-                full_y = _interpolate_inplace(full_y)
+            full_y = _interpolate_series_for_model(full_y)
             if len(full_y) == 0:
                 predictions[target_col] = np.full(len(df), np.nan)
                 continue
 
-            full_y = _ensure_freq(full_y)
+            full_y = _ensure_datetime_freq(full_y)
 
             exog_full = None
             if exog_columns:
@@ -954,12 +965,7 @@ class SpotforecastTrainer:
                     else:
                         exog_full = df[cols_present].copy()
                     exog_full = exog_full.loc[full_y.index]
-                    # Interpolate NaN the same way we do for y. With a
-                    # transformer_exog in place, NaN cells would otherwise
-                    # propagate through StandardScaler.transform and crash
-                    # estimator.predict on linear models.
-                    if exog_full.isna().any().any():
-                        exog_full = _interpolate_inplace(exog_full)
+                    exog_full = _interpolate_frame_for_model(exog_full)
 
             try:
                 predictions[target_col] = _predict_one_step_integrated(
@@ -1170,7 +1176,7 @@ class SpotforecastTuner:
         self.logger = logger or logging.get_logger("SpotforecastTuner")
 
     def _get_weight_suffix(self) -> str:
-        return self.config.get("process", {}).get("imputation", {}).get("weight_suffix", "__weight")
+        return _get_weight_suffix_from_config(self.config)
 
     def tune_panel(
         self,
@@ -1216,12 +1222,8 @@ class SpotforecastTuner:
         # Match SpotforecastTrainer.train_panel exactly: include `exogenous_*`
         # columns as exog features and exclude them from the tuning targets.
         # Otherwise tune optimizes a different model than train ends up fitting.
-        configured_exog_columns = self.config["train"].get("exog_columns", [])
-        weight_suffix = self._get_weight_suffix()
-        weight_residuals_enabled = self.config.get("exogenous", {}).get("weight_residuals", {}).get("enabled", False)
-        target_cols, exog_columns = _split_panel_columns(
-            df, configured_exog_columns, weight_suffix, weight_residuals_enabled
-        )
+        target_cols, exog_columns = _resolve_feature_columns(self.config, df)
+        weight_suffix = _get_weight_suffix_from_config(self.config)
 
         if channels is not None:
             target_cols = [c for c in target_cols if c in channels]
@@ -1232,7 +1234,7 @@ class SpotforecastTuner:
         # Use ALL the processed data — the trailing 10–20% carries the
         # strongest distribution drift; chopping it off would make CV blind
         # to live-shift. OneStepAheadFold below provides the train/val split.
-        tune_df = _ensure_freq(df, self.config.get("process", {}).get("resample", {}).get("freq", "5min"))
+        tune_df = _ensure_datetime_freq(df, self.config.get("process", {}).get("resample", {}).get("freq", "5min"))
 
         n_trials = tune_config.get("n_trials", 10)
         n_initial = tune_config.get("n_initial", 5)
@@ -1297,8 +1299,7 @@ class SpotforecastTuner:
             y_train_raw.name = target_col
             y_train = y_train_raw.copy()
             y_train.loc[~observed_mask] = np.nan
-            if y_train.isna().any():
-                y_train = _interpolate_inplace(y_train)
+            y_train = _interpolate_series_for_model(y_train)
             if len(y_train) < n_lags_max + 10:
                 self.logger.warning(f"  Skipping {target_col}: insufficient data ({len(y_train)} rows)")
                 continue
@@ -1330,8 +1331,7 @@ class SpotforecastTuner:
             exog_train = None
             if exog_columns:
                 exog_train = tune_df[exog_columns].loc[y_train.index]
-                if exog_train.isna().any().any():
-                    exog_train = _interpolate_inplace(exog_train)
+                exog_train = _interpolate_frame_for_model(exog_train)
 
             # Predict Δy[t] just like train_panel will. The tuner must score
             # candidates on the same target the production model will fit

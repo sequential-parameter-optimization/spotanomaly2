@@ -60,9 +60,3 @@ channels:
     params:
       n_estimators: 300
       learning_rate: 0.05
-
-  exogenous_source_b:
-    model: LightGBM
-    params:
-      n_estimators: 300
-      learning_rate: 0.05

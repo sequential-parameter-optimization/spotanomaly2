@@ -439,6 +439,7 @@ class TestSpotforecastTuner:
             )
             fc.fit(y=s_diff.iloc[:fit_size])
             x, y_tgt = fc.create_train_X_y(y=s_diff)
+            assert fc.estimator is not None
             preds = fc.estimator.predict(x)
             if fc.transformer_y is not None:
                 preds = transform_numpy(

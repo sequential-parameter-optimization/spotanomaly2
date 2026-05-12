@@ -174,51 +174,39 @@ class AnomalyDetector:
         if len(df) == 0:
             return df.iloc[0:0], df
 
-        # Preferred: explicit timestamp boundary persisted with the model.
+        # Require explicit timestamp boundary persisted with the model.
         train_end_timestamp = model_data.get("train_end_timestamp")
-        if train_end_timestamp and isinstance(df.index, pd.DatetimeIndex):
-            cutoff = pd.Timestamp(train_end_timestamp)
-            if cutoff.tzinfo is None and df.index.tz is not None:
-                cutoff = cutoff.tz_localize(df.index.tz)
-            elif cutoff.tzinfo is not None and df.index.tz is None:
-                cutoff = cutoff.tz_convert("UTC").tz_localize(None)
-
-            history_df = df.loc[df.index <= cutoff]
-            unseen_df = df.loc[df.index > cutoff]
-
-            if len(unseen_df) == 0:
-                raise InsufficientDataException(
-                    f"Panel {panel_id}: no unseen rows after model train end "
-                    f"({cutoff}). Need new data beyond training period for leakage-free scoring."
-                )
-
-            self.logger.info(
-                f"Panel {panel_id}: leakage guard active using train_end={cutoff}. "
-                f"Excluded {len(history_df)} seen row(s); {len(unseen_df)} unseen row(s) remain for scoring."
+        if not train_end_timestamp:
+            raise ValueError(
+                f"Panel {panel_id}: model lacks train_end_timestamp metadata. "
+                f"This is required for leakage-free anomaly scoring. "
+                f"Re-train the model to persist the training boundary."
             )
-            return history_df, unseen_df
 
-        # Fallback for older model files without timestamp metadata.
-        train_size = model_data.get("train_size")
-        if isinstance(train_size, int) and 0 < train_size < len(df):
-            history_df = df.iloc[:train_size]
-            unseen_df = df.iloc[train_size:]
-            self.logger.warning(
-                f"Panel {panel_id}: model has no train_end_timestamp; using train_size={train_size} "
-                "as leakage boundary fallback. Re-train models once to persist precise timestamps."
+        if not isinstance(df.index, pd.DatetimeIndex):
+            raise ValueError(
+                f"Panel {panel_id}: non-DatetimeIndex unsupported for leakage-free scoring. "
+                f"Ensure data uses pd.DatetimeIndex."
             )
-            return history_df, unseen_df
 
-        # Last-resort fallback using current config ratio.
-        train_ratio = self.config.get("train", {}).get("train_ratio", 0.9)
-        cutoff_pos = int(len(df) * float(train_ratio))
-        cutoff_pos = max(1, min(cutoff_pos, len(df) - 1))
-        history_df = df.iloc[:cutoff_pos]
-        unseen_df = df.iloc[cutoff_pos:]
-        self.logger.warning(
-            f"Panel {panel_id}: model lacks training boundary metadata; "
-            f"using ratio-based fallback ({train_ratio:.3f}). "
-            "Re-train models to persist precise leakage boundary."
+        cutoff = pd.Timestamp(train_end_timestamp)
+        if cutoff.tzinfo is None and df.index.tz is not None:
+            cutoff = cutoff.tz_localize(df.index.tz)
+        elif cutoff.tzinfo is not None and df.index.tz is None:
+            cutoff = cutoff.tz_convert("UTC").tz_localize(None)
+
+        history_df = df.loc[df.index <= cutoff]
+        unseen_df = df.loc[df.index > cutoff]
+
+        if len(unseen_df) == 0:
+            raise InsufficientDataException(
+                f"Panel {panel_id}: no unseen rows after model train end "
+                f"({cutoff}). Need new data beyond training period for leakage-free scoring."
+            )
+
+        self.logger.info(
+            f"Panel {panel_id}: leakage-free scoring using train_end={cutoff}. "
+            f"History: {len(history_df)} rows; Unseen: {len(unseen_df)} rows."
         )
         return history_df, unseen_df
 
@@ -536,7 +524,7 @@ class AnomalyDetector:
                 index=eval_true_df.index,
             )
 
-        if scores_df.index.tz is None:
+        if isinstance(scores_df.index, pd.DatetimeIndex) and scores_df.index.tz is None:
             scores_df.index = scores_df.index.tz_localize("UTC")
             flags_df.index = flags_df.index.tz_localize("UTC")
             report_pred_df.index = report_pred_df.index.tz_localize("UTC")
