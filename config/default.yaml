@@ -201,6 +201,30 @@ detect:
     # selection_criterion: "bic"
   normalize_scores: true
   normalization_quantile: 0.99
+  # --- Per-channel anomaly detection ---
+  # Complements the combined scorer by flagging individual channels that
+  # exceed their own quantile threshold.  The combined detector catches
+  # coordinated multi-channel shifts; the per-channel detector isolates
+  # strong single-channel spikes.
+  per_channel:
+    enabled: true
+    # Quantile applied independently to each channel's |residual| distribution.
+    # Stricter than the combined quantile because per-channel scoring is more
+    # sensitive (fewer dimensions to dilute signal).  With ~8 channels a 0.99
+    # quantile would fire on at least one channel ~8% of the time by chance;
+    # 0.995 brings that down to ~4%.
+    high_quantile: 0.995
+    # Minimum number of channels that must individually exceed their threshold
+    # for the timestamp to be flagged as a per-channel anomaly.
+    # 1 = any single strong channel triggers.
+    # 2+ = requires multiple independent channels to be anomalous (stricter).
+    min_channels: 1
+    # Optional per-panel, per-channel quantile overrides.
+    # Channels without an override use high_quantile.
+    # quantile_overrides:
+    #   "1":
+    #     channel_1_orp_mv: 0.9997
+    #     channel_3_turbidity: 0.999
 
 evaluate:
   results_timestamp: null

@@ -28,10 +28,16 @@ if not pipeline.is_ready():
 
 results = pipeline.live()
 
-for panel_id, (scores_df, flags_df, forecast_df) in results.items():
+for panel_id, (scores_df, flags_df, forecast_df, _contrib, per_channel) in results.items():
     status = "anomaly detected" if flags_df.iloc[-1].any() else "all clear"
     print(f"\n── Panel {panel_id} ({status}) ──")
     print(f"  scores:   {scores_df.shape}")
     print(f"  flags:    {flags_df.shape}")
     print(f"  forecast: {forecast_df.shape}")
     print(flags_df.tail(3))
+    if per_channel is not None:
+        pc_flags = per_channel["flags_combined"]
+        n_pc = int(pc_flags["per_channel_anomaly_flag"].sum())
+        print(f"  per-channel anomalies: {n_pc}")
+        if n_pc > 0:
+            print(per_channel["flags"].loc[pc_flags["per_channel_anomaly_flag"] == 1].tail(3))
