@@ -11,13 +11,11 @@ exercised here is small, pure (filesystem-only), and deterministic.
 import json
 import re
 from datetime import datetime
-from pathlib import Path
 
 import pandas as pd
 import pytest
 
 from spotanomaly2.infrastructure import storage
-
 
 # ---------------------------------------------------------------------------
 # generate_timestamp

@@ -1,6 +1,5 @@
 """Domain layer containing business logic."""
 
-from spotanomaly2.domain.exogenous_fetcher import ExogenousFetcher
-from spotanomaly2.domain.weather_fetcher import WeatherFetcher
+from spotanomaly2.domain.exogenous import ExogenousFetcher, ExogenousJoiner
 
-__all__ = ["ExogenousFetcher", "WeatherFetcher"]
+__all__ = ["ExogenousFetcher", "ExogenousJoiner"]

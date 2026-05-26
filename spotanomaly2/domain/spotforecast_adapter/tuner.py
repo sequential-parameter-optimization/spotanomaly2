@@ -98,7 +98,7 @@ class SpotforecastTuner:
         # Otherwise tune optimizes a different model than train ends up fitting.
         configured_exog_columns = self.config["train"].get("exog_columns", [])
         weight_suffix = self._get_weight_suffix()
-        weight_residuals_enabled = self.config.get("exogenous", {}).get("weight_residuals", {}).get("enabled", False)
+        weight_residuals_enabled = self.config.get("residual_weighting", {}).get("enabled", False)
         target_cols, exog_columns = _split_panel_columns(
             df, configured_exog_columns, weight_suffix, weight_residuals_enabled
         )

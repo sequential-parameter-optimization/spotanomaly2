@@ -138,17 +138,6 @@ process:
   flow_columns_pattern: "flow"
   temperature_columns_pattern: "temperature"
   median_filter_kernel: 3
-  weather:
-    enabled: true
-    latitude: 0.0
-    longitude: 0.0
-    place: "Anonymous Location"
-    use_forecast: true
-    fallback_on_failure: true
-    lookback_days: 14
-    cache_path: "data/weather/weather_cache.parquet"
-    feature_columns:
-      - snow_depth
 
 train:
   train_ratio: 0.9
@@ -312,18 +301,37 @@ primary:
   display_name: "Primary"
 
 exogenous:
-  enabled: true
-  cache_dir: "data/exogenous"
-  display_name: "Exogenous"
-  panel_sources:
-    "1":
-      - "source_a"
-    "2":
-      - "source_b"
-  # Weight anomaly residuals by exogenous flow values.
-  # Disabled by default so the repo works without exogenous data.
-  weight_residuals:
-    enabled: false
+  - name: "a"
+    fetcher: "spotanomaly2.domain.exogenous.source_a:ExogenousAFetcher"
+    joiner: "spotanomaly2.domain.exogenous.source_a:ExogenousAJoiner"
+    config:
+      enabled: true
+      cache_dir: "data/exogenous"
+      display_name: "Source A"
+      panel_sources:
+        "1":
+          - "source_a"
+        "2":
+          - "source_b"
+  - name: "weather"
+    fetcher: "spotanomaly2.domain.exogenous.weather:ExogenousWeatherFetcher"
+    joiner: "spotanomaly2.domain.exogenous.weather:ExogenousWeatherJoiner"
+    config:
+      enabled: true
+      latitude: 0.0
+      longitude: 0.0
+      place: "Anonymous Location"
+      use_forecast: true
+      fallback_on_failure: true
+      lookback_days: 14
+      cache_path: "data/weather/weather_cache.parquet"
+      feature_columns:
+        - snow_depth
+
+# Weight anomaly residuals by an exogenous flow column.
+# Disabled by default so the repo works without exogenous data.
+residual_weighting:
+  enabled: false
 
 tune:
   n_trials: 10

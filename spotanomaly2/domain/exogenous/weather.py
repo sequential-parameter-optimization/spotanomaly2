@@ -1,4 +1,4 @@
-"""Weather data fetching service using Open-Meteo API."""
+"""Weather as an exogenous source: fetcher + joiner pair (Open-Meteo API)."""
 
 import time
 from pathlib import Path
@@ -11,11 +11,12 @@ from requests.exceptions import HTTPError, RequestException
 from spotanomaly2.infrastructure import logging as infra_logging
 
 
-class WeatherFetcher:
-    """Service for fetching and caching weather data from Open-Meteo API.
+class ExogenousWeatherFetcher:
+    """Fetcher for the weather exogenous source: pulls Open-Meteo data into a Parquet cache.
 
-    Open-Meteo provides free weather data without requiring an API key.
-    Supports both historical data (Archive API) and future forecasts (Forecast API).
+    Implements the ``ExogenousFetcher`` protocol. Open-Meteo provides free weather
+    data without an API key; supports historical (Archive) and future (Forecast)
+    endpoints with cache-aware range extension.
     """
 
     # API URLs
@@ -44,26 +45,36 @@ class WeatherFetcher:
         "wind_gusts_10m",
     ]
 
-    def __init__(self, config: dict[str, Any], logger=None):
-        """Initialize WeatherFetcher with configuration.
+    @classmethod
+    def is_enabled(cls, source_config: dict[str, Any]) -> bool:
+        if not source_config.get("enabled", True):
+            return False
+        return source_config.get("latitude") is not None and source_config.get("longitude") is not None
 
-        Args:
-            config: Configuration dictionary containing:
-                - latitude: Latitude of the location (-90 to 90)
-                - longitude: Longitude of the location (-180 to 180)
-                - use_forecast: If True, use Forecast API for future dates (default: True)
-            logger: Optional logger instance
+    def __init__(
+        self,
+        source_config: dict[str, Any],
+        parent_config: dict[str, Any],
+        logger=None,
+    ):
+        """Args:
+        source_config: The YAML ``config:`` sub-block for this source
+            (``latitude``, ``longitude``, ``use_forecast``, ``lookback_days``,
+            ``cache_path``, ``feature_columns``, ``fallback_on_failure``).
+        parent_config: The full application config (kept for symmetry with
+            other fetchers; not used at fetch time).
+        logger: Optional logger instance.
         """
-        self.config = config
-        self.logger = logger or infra_logging.get_logger("WeatherFetcher")
+        self.source_config = source_config
+        self.parent_config = parent_config
+        self.logger = logger or infra_logging.get_logger("ExogenousWeatherFetcher")
 
-        # Extract location from config
-        self.latitude = config.get("latitude")
-        self.longitude = config.get("longitude")
-        self.use_forecast = config.get("use_forecast", True)
+        self.latitude = source_config.get("latitude")
+        self.longitude = source_config.get("longitude")
+        self.use_forecast = source_config.get("use_forecast", True)
 
         if self.latitude is None or self.longitude is None:
-            raise ValueError("latitude and longitude must be provided in config")
+            raise ValueError("weather source_config must set latitude and longitude")
 
     def _fetch_from_api(
         self,
@@ -692,3 +703,117 @@ class WeatherFetcher:
         )
         self.logger.info("Weather data fetch completed successfully")
         return df
+
+    # ------------------------------------------------------------------
+    # ExogenousFetcher protocol entry point
+    # ------------------------------------------------------------------
+
+    def fetch_and_cache(self, start: pd.Timestamp, end: pd.Timestamp) -> None:
+        """Fetch weather for ``[start - lookback_days, end]`` and persist to ``cache_path``.
+
+        The lookback expansion lives here (not in the orchestrator) because the
+        baseline column the joiner computes needs ``lookback_days`` of pre-window
+        history.
+        """
+        lookback_days = self.source_config.get("lookback_days", 14)
+        cache_path_str = self.source_config.get("cache_path")
+        cache_path = Path(cache_path_str) if cache_path_str else None
+        fallback_on_failure = self.source_config.get("fallback_on_failure", True)
+
+        fetch_start = start - pd.Timedelta(days=lookback_days)
+        self.logger.info(f"Fetching weather: {fetch_start} to {end} (lookback_days={lookback_days})")
+        self.get_weather_data(
+            start=fetch_start,
+            end=end,
+            cache_path=cache_path,
+            timezone="UTC",
+            fallback_on_failure=fallback_on_failure,
+        )
+
+
+class ExogenousWeatherJoiner:
+    """Joiner for the weather exogenous source: loads cached weather + computes baseline.
+
+    Implements the ``ExogenousJoiner`` protocol. Reads the parquet written by
+    ``ExogenousWeatherFetcher.fetch_and_cache``, computes a rolling
+    ``lookback_days`` baseline over ``temperature_2m`` (since the baseline needs
+    pre-panel history a per-panel index can't carry), and reindexes
+    ``weather_temperature_baseline`` plus configured ``weather_<feature>``
+    columns onto each panel.
+    """
+
+    def __init__(
+        self,
+        source_config: dict[str, Any],
+        parent_config: dict[str, Any],
+        logger=None,
+    ):
+        self.source_config = source_config
+        self.parent_config = parent_config
+        self.logger = logger or infra_logging.get_logger("ExogenousWeatherJoiner")
+
+    def _load_cached_weather(self) -> Optional[pd.DataFrame]:
+        cache_path_str = self.source_config.get("cache_path")
+        if not cache_path_str:
+            self.logger.warning("Weather cache_path not configured; skipping join")
+            return None
+        cache_path = Path(cache_path_str)
+        if not cache_path.exists():
+            self.logger.warning(f"Weather cache {cache_path} not found; skipping join")
+            return None
+        df = pd.read_parquet(cache_path)
+        if not isinstance(df.index, pd.DatetimeIndex):
+            self.logger.warning(f"Weather cache {cache_path} is not datetime-indexed; skipping join")
+            return None
+        return df
+
+    def join_into_panels(
+        self,
+        panel_data: dict[str, pd.DataFrame],
+    ) -> dict[str, pd.DataFrame]:
+        """Read cached weather and join baseline + feature columns onto panels."""
+        if not panel_data:
+            return panel_data
+
+        non_empty = {pid: df for pid, df in panel_data.items() if len(df) > 0}
+        if not non_empty:
+            return panel_data
+
+        weather_df = self._load_cached_weather()
+        if weather_df is None:
+            return panel_data
+
+        lookback_days = self.source_config.get("lookback_days", 14)
+        feature_columns = self.source_config.get("feature_columns", [])
+        panel_freq = self.parent_config.get("process", {}).get("resample", {}).get("freq", "5min")
+
+        baseline_full: Optional[pd.Series] = None
+        if "temperature_2m" in weather_df.columns:
+            temperature_resampled = weather_df["temperature_2m"].resample(panel_freq).ffill()
+            baseline_full = temperature_resampled.rolling(window=f"{lookback_days}D", min_periods=1).mean()
+            if baseline_full.isna().any():
+                baseline_full = baseline_full.fillna(temperature_resampled.mean())
+        else:
+            self.logger.warning("temperature_2m not in cached weather; skipping baseline column")
+
+        resampled_features: dict[str, pd.Series] = {}
+        for col in feature_columns:
+            if col in weather_df.columns:
+                resampled_features[f"weather_{col}"] = weather_df[col].resample(panel_freq).ffill()
+            else:
+                self.logger.warning(f"Configured weather feature_column '{col}' not in cached weather")
+
+        merged: dict[str, pd.DataFrame] = {}
+        for panel_id, df in panel_data.items():
+            if len(df) == 0:
+                merged[panel_id] = df
+                continue
+            out = df.copy()
+            if baseline_full is not None:
+                out["weather_temperature_baseline"] = baseline_full.reindex(df.index, method="ffill")
+            for col_name, series in resampled_features.items():
+                out[col_name] = series.reindex(df.index, method="ffill")
+            merged[panel_id] = out
+
+        self.logger.info(f"Joined weather onto {len(merged)} panel(s) using {panel_freq} grid")
+        return merged

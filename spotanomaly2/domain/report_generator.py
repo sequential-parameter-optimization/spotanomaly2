@@ -152,7 +152,23 @@ class LiveReportGenerator:
 
         # Load provider display names from config
         self.primary_name = config.get("primary", {}).get("display_name", "Primary")
-        self.exogenous_name = config.get("exogenous", {}).get("display_name", "Exogenous")
+        self.exogenous_name = self._first_non_weather_display_name() or "Exogenous"
+
+    def _exogenous_source_config(self, source_name: str) -> dict:
+        """Return the ``config:`` sub-block for a named entry in ``config['exogenous']``."""
+        for entry in self.config.get("exogenous", []) or []:
+            if isinstance(entry, dict) and entry.get("name") == source_name:
+                return entry.get("config", {}) or {}
+        return {}
+
+    def _first_non_weather_display_name(self) -> str | None:
+        for entry in self.config.get("exogenous", []) or []:
+            if not isinstance(entry, dict) or entry.get("name") == "weather":
+                continue
+            src_cfg = entry.get("config", {}) or {}
+            if "display_name" in src_cfg:
+                return src_cfg["display_name"]
+        return None
 
     def _resolve_timezone(self, timezone_name: str):
         """Resolve configured timezone name to a tzinfo object.
@@ -188,7 +204,7 @@ class LiveReportGenerator:
             return "Open-Meteo"
 
         if column_name == "temperature":
-            weather_cfg = self.config.get("process", {}).get("weather", {})
+            weather_cfg = self._exogenous_source_config("weather")
             lat = weather_cfg.get("latitude")
             lon = weather_cfg.get("longitude")
             place = weather_cfg.get("place") or weather_cfg.get("location")
@@ -1352,9 +1368,9 @@ class LiveReportGenerator:
         # the user toggle between the raw values and the flow-weighted view
         # the scorer actually sees.
         flow_col = next((c for c in df_actual.columns if c.startswith("exogenous_")), None)
-        flow_weighting_enabled = flow_col is not None and self.config.get("exogenous", {}).get(
-            "weight_residuals", {}
-        ).get("enabled", False)
+        flow_weighting_enabled = flow_col is not None and self.config.get("residual_weighting", {}).get(
+            "enabled", False
+        )
         if flow_weighting_enabled:
             flow_values_arr = df_actual[flow_col].to_numpy()
         else:
@@ -1808,13 +1824,13 @@ class LiveReportGenerator:
             {
                 "primary": self.primary_name,
                 "exogenous": self.exogenous_name,
-                "openmeteo": "Open-Meteo",
+                "weather": "Open-Meteo",
             }
         )
 
         # Build weather source/place label for header
-        weather_cfg = self.config.get("process", {}).get("weather", {})
-        weather_enabled = weather_cfg.get("enabled", False)
+        weather_cfg = self._exogenous_source_config("weather")
+        weather_enabled = weather_cfg.get("enabled", True) and weather_cfg.get("latitude") is not None
         weather_lat = weather_cfg.get("latitude")
         weather_lon = weather_cfg.get("longitude")
         weather_place = weather_cfg.get("place") or weather_cfg.get("location")
@@ -2360,7 +2376,7 @@ class LiveReportGenerator:
 
         // Data source status rendering
         const SOURCE_LABELS = {source_labels_js};
-        const SOURCE_ORDER = ['primary', 'exogenous', 'openmeteo'];
+        const SOURCE_ORDER = ['primary', 'exogenous', 'weather'];
 
         function renderDataSourceStatus(fetchStatus) {
             const container = document.getElementById('data-source-cards');

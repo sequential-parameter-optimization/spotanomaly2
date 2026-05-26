@@ -53,10 +53,9 @@ def ready_workspace(tmp_path, sample_config):
     sample_config["panels"]["panel_ids"] = ["1"]
     sample_config["train"]["fallback_model"] = "LightGBM"
     sample_config["report"] = {"enabled": False}
-    sample_config["exogenous"] = {"enabled": False, "display_name": "Exogenous"}
+    sample_config["exogenous"] = []
     sample_config["process"] = {
         **sample_config.get("process", {}),
-        "weather": {"enabled": False},
         "imputation": {"weight_suffix": "__weight"},
         "resample": {"freq": "5min"},
     }
@@ -102,16 +101,19 @@ class TestPerStageDelegation:
             mock_fetcher.run.assert_called_once()
             mock_save.assert_called_once()
 
-    def test_process_calls_data_processor_after_merge_exogenous(self, sample_config):
+    def test_process_calls_data_processor_after_exogenous_joiner(self, sample_config):
         pipeline = Pipeline(sample_config)
         with (
             patch.object(pipeline._data_manager, "load_raw_data") as mock_load,
             patch.object(pipeline._data_manager, "save_processed_data") as mock_save,
+            patch.object(pipeline._exogenous_joiner, "join_all") as mock_join,
             patch("spotanomaly2.application.pipeline.DataProcessor") as mock_proc_cls,
         ):
             raw = {"1": _df("2025-01-01", 5)}
+            joined = {"1": _df("2025-01-01", 5, value=7.0)}
             processed = {"1": _df("2025-01-01", 5, value=9.0)}
             mock_load.return_value = raw
+            mock_join.return_value = joined
             mock_proc = MagicMock()
             mock_proc.run.return_value = processed
             mock_proc_cls.return_value = mock_proc
@@ -119,8 +121,10 @@ class TestPerStageDelegation:
             pipeline.process()
 
             mock_load.assert_called_once()
+            mock_join.assert_called_once_with(raw)
             mock_proc_cls.assert_called_once_with(sample_config, pipeline.logger)
-            mock_proc.run.assert_called_once()
+            # DataProcessor.run receives the joined dict, not the raw dict.
+            mock_proc.run.assert_called_once_with(joined)
             mock_save.assert_called_once_with(processed)
 
     def test_train_iterates_panels_and_delegates_to_trainer(self, sample_config, tmp_path):

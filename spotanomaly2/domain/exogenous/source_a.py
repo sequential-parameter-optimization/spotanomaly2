@@ -1,4 +1,4 @@
-"""Exogenous data fetching service with Parquet caching."""
+"""Exogenous source A: fetcher + joiner pair (Parquet-cached)."""
 
 import json
 import os
@@ -32,35 +32,42 @@ _WIRING_TEMPLATE = {
 }
 
 
-class ExogenousFetcher:
-    """Service for fetching and caching timeseries data from Exogenous Adapter.
+class ExogenousAFetcher:
+    """Fetcher for exogenous source A: pulls timeseries data and writes to its Parquet cache.
 
-    Authenticates via Keycloak (OpenID Connect password grant), executes a
-    transformation in Exogenous Adapter's virtual-structure-adapter, and returns
-    the result as a pandas DataFrame.  Supports Parquet-based caching with
-    incremental extension so that only missing time ranges are fetched from the
-    remote API.
+    Implements the ``ExogenousFetcher`` protocol (see ``domain/exogenous/base.py``).
+    Authenticates via Keycloak (OpenID Connect password grant), executes a transformation
+    in the upstream system's virtual-structure-adapter, and persists per-source parquets
+    under ``source_config["cache_dir"]``. Cache-aware: re-running over an overlapping
+    range fetches only the missing slices.
     """
 
-    def __init__(self, config: dict[str, Any], logger=None):
-        """Initialize ExogenousFetcher with configuration.
+    @classmethod
+    def is_enabled(cls, source_config: dict[str, Any]) -> bool:
+        return bool(source_config.get("enabled", True))
 
-        Args:
-            config: Full application configuration dictionary.  The ``exogenous``
-                section is read for ``enabled`` and ``cache_dir`` only.  API
-                URLs, trafo ID, client ID, and sources are read from the env
-                file referenced by ``config["paths"]["credentials_file"]``.
-            logger: Optional logger instance.
+    def __init__(
+        self,
+        source_config: dict[str, Any],
+        parent_config: dict[str, Any],
+        logger=None,
+    ):
+        """Args:
+        source_config: The YAML ``config:`` sub-block for this source
+            (``cache_dir``, ``panel_sources``, etc.).
+        parent_config: The full application config — used to locate the
+            credentials env file via ``paths.credentials_file``.
+        logger: Optional logger instance.
         """
-        self.config = config
-        self.logger = logger or infra_logging.get_logger("ExogenousFetcher")
+        self.source_config = source_config
+        self.parent_config = parent_config
+        self.logger = logger or infra_logging.get_logger("ExogenousAFetcher")
 
-        exogenous_cfg = config.get("exogenous", {})
-        self.cache_dir = Path(exogenous_cfg.get("cache_dir", "data/exogenous"))
+        self.cache_dir = Path(source_config.get("cache_dir", "data/exogenous"))
 
         from dotenv import load_dotenv
 
-        creds_path = config["paths"]["credentials_file"]
+        creds_path = parent_config["paths"]["credentials_file"]
         load_dotenv(creds_path)
         load_dotenv()
 
@@ -113,7 +120,7 @@ class ExogenousFetcher:
 
         from dotenv import load_dotenv
 
-        creds_path = self.config["paths"]["credentials_file"]
+        creds_path = self.parent_config["paths"]["credentials_file"]
         load_dotenv(creds_path)
         load_dotenv()  # fallback: root .env
 
@@ -500,159 +507,118 @@ class ExogenousFetcher:
         return data
 
     # ------------------------------------------------------------------
-    # Panel merge
+    # ExogenousFetcher protocol entry point
     # ------------------------------------------------------------------
 
-    def merge_into_panels(
+    def fetch_and_cache(self, start: pd.Timestamp, end: pd.Timestamp) -> None:
+        """Fetch ``[start, end]`` for every configured source and persist to ``cache_dir``.
+
+        Side effect only: ``get_data`` writes a parquet per source under
+        ``cache_dir``. The downloader doesn't need the returned DataFrames.
+        """
+        self.run(start=start, end=end)
+
+
+class ExogenousAJoiner:
+    """Joiner for exogenous source A: loads cached parquets and merges columns onto panels.
+
+    Implements the ``ExogenousJoiner`` protocol. Never triggers network I/O —
+    if a cache file is missing it logs a warning and skips that source.
+    """
+
+    def __init__(
+        self,
+        source_config: dict[str, Any],
+        parent_config: dict[str, Any],
+        logger=None,
+    ):
+        self.source_config = source_config
+        self.parent_config = parent_config
+        self.logger = logger or infra_logging.get_logger("ExogenousAJoiner")
+
+        self.cache_dir = Path(source_config.get("cache_dir", "data/exogenous"))
+        self.panel_sources: dict[str, list[str]] = source_config.get("panel_sources", {})
+
+    def _load_source_cache(self, source_name: str) -> Optional[pd.DataFrame]:
+        cache_path = self.cache_dir / f"{source_name}.parquet"
+        if not cache_path.exists():
+            self.logger.warning(f"Exogenous cache for '{source_name}' not found at {cache_path}, skipping")
+            return None
+        df = pd.read_parquet(cache_path)
+        if not isinstance(df.index, pd.DatetimeIndex):
+            self.logger.warning(f"Exogenous cache for '{source_name}' is not datetime-indexed; skipping")
+            return None
+        # Drop metric column if present (kept for legacy parity with the old merge path).
+        exclude_cols = {"metric"}
+        keep = [c for c in df.columns if c.lower() not in exclude_cols]
+        if not keep:
+            self.logger.warning(f"Exogenous source '{source_name}' cache has no measurement columns, skipping")
+            return None
+        df_vals = df[keep].copy()
+        if len(keep) == 1:
+            df_vals.columns = [f"exogenous_{source_name}"]
+        else:
+            df_vals.columns = [f"exogenous_{source_name}_{c}" for c in keep]
+        return df_vals
+
+    def join_into_panels(
         self,
         panel_data: dict[str, pd.DataFrame],
     ) -> dict[str, pd.DataFrame]:
-        """Fetch EXOGENOUS timeseries and merge them as columns into every panel DataFrame.
-
-        Exogenous data is merged in raw form (prefixing columns only) so that
-        subsequent panel-level processing steps (resample, imputation,
-        filtering, etc.) are applied identically to primary and exogenous
-        features.
-
-        Args:
-            panel_data: Dict mapping panel_id to DataFrame (raw or processed).
-
-        Returns:
-            The same dict with exogenous columns appended to each DataFrame.
-        """
-        self.logger.info("-" * 40)
-        self.logger.info("Fetching Exogenous data...")
-        self.logger.info("-" * 40)
-
-        all_indices = pd.DatetimeIndex([ts for df in panel_data.values() for ts in df.index])
-        start = (all_indices.min() - pd.Timedelta(hours=1)).isoformat()
-        end = (all_indices.max() + pd.Timedelta(minutes=5)).isoformat()
-
-        exogenous_raw = self.run(start=start, end=end)
-
-        self.logger.info(
-            "Exogenous source-local preprocessing removed: "
-            "exogenous data will be merged raw and processed with panel pipeline"
-        )
-
-        exclude_cols = {"metric"}
-        exogenous_by_source: dict[str, pd.DataFrame] = {}
-        for source_name, df_source in exogenous_raw.items():
-            keep = [c for c in df_source.columns if c.lower() not in exclude_cols]
-            if not keep:
-                self.logger.warning(f"Exogenous source '{source_name}' has no measurement columns, skipping")
-                continue
-
-            self.logger.info(
-                f"[{source_name}] Raw data: {len(df_source)} rows, "
-                f"range {df_source.index.min()} -> {df_source.index.max()}, "
-                f"median interval {df_source.index.to_series().diff().median()}"
-            )
-
-            # Raw merge mode: only rename columns here; panel-level
-            # resampling/imputation will be applied afterwards.
-            df_vals = df_source[keep].copy()
-            if len(keep) == 1:
-                df_vals.columns = [f"exogenous_{source_name}"]
-            else:
-                df_vals.columns = [f"exogenous_{source_name}_{c}" for c in keep]
-
-            exogenous_by_source[source_name] = df_vals
-
-        if not exogenous_by_source:
+        """Load per-source caches and concat their columns onto each panel."""
+        if not panel_data:
             return panel_data
 
-        exogenous_cfg = self.config.get("exogenous", {})
-        panel_sources_cfg: dict[str, list[str]] = exogenous_cfg.get("panel_sources", {})
+        # Discover sources we need across all panels.
+        if self.panel_sources:
+            needed = {s for sources in self.panel_sources.values() for s in sources}
+        else:
+            # No per-panel mapping: load whatever caches exist alongside config.
+            needed = {p.stem for p in self.cache_dir.glob("*.parquet")} if self.cache_dir.exists() else set()
 
+        source_frames: dict[str, pd.DataFrame] = {}
+        for source_name in needed:
+            df_vals = self._load_source_cache(source_name)
+            if df_vals is not None:
+                source_frames[source_name] = df_vals
+
+        if not source_frames:
+            self.logger.warning("No usable exogenous caches loaded; returning panel_data unchanged")
+            return panel_data
+
+        result: dict[str, pd.DataFrame] = {}
         for panel_id, df_panel in panel_data.items():
-            if panel_sources_cfg:
-                source_names = panel_sources_cfg.get(str(panel_id), [])
-                frames = [exogenous_by_source[n] for n in source_names if n in exogenous_by_source]
+            if self.panel_sources:
+                source_names = self.panel_sources.get(str(panel_id), [])
+                frames = [source_frames[n] for n in source_names if n in source_frames]
                 if not frames:
                     self.logger.warning(
-                        f"Panel {panel_id}: no matching Exogenous sources configured "
+                        f"Panel {panel_id}: no matching exogenous sources loaded "
                         f"(panel_sources={source_names}), skipping"
                     )
+                    result[panel_id] = df_panel
                     continue
             else:
-                frames = list(exogenous_by_source.values())
+                frames = list(source_frames.values())
 
             exogenous_combined = pd.concat(frames, axis=1).sort_index()
-
-            self.logger.info(
-                f"Panel {panel_id}: merging {len(exogenous_combined)} Exogenous rows "
-                f"({', '.join(exogenous_combined.columns)})"
-            )
 
             left = df_panel.sort_index()
             right = exogenous_combined
 
-            # Normalise datetime index resolution so merge_asof doesn't
-            # fail with "incompatible merge keys" (us vs ns).
+            # Normalise datetime resolution (us vs ns) so concat aligns.
             target_res = "ns"
             if hasattr(left.index.dtype, "tz"):
                 left.index = left.index.as_unit(target_res)
             if hasattr(right.index.dtype, "tz"):
                 right.index = right.index.as_unit(target_res)
 
-            # Log grid alignment diagnostics before merge
-            panel_grid_sample = left.index[:3].tolist() if len(left) >= 3 else left.index.tolist()
-            exogenous_grid_sample = right.index[:3].tolist() if len(right) >= 3 else right.index.tolist()
-            self.logger.info(
-                f"Panel {panel_id}: merge grid check — "
-                f"panel first 3 ts: {panel_grid_sample}, "
-                f"exogenous first 3 ts: {exogenous_grid_sample}"
-            )
-
-            overlap = left.index.intersection(right.index)
-            self.logger.info(
-                f"Panel {panel_id}: exact timestamp overlap: {len(overlap)} / "
-                f"{len(left)} panel rows ({len(overlap) / max(len(left), 1) * 100:.1f}%)"
-            )
-
-            # Log coverage: how much of the panel timeframe does the exogenous data cover?
-            if len(right) > 0 and len(left) > 0:
-                exogenous_covers_from = right.index.min()
-                exogenous_covers_to = right.index.max()
-                panel_start = left.index.min()
-                left.index.max()
-                panel_within = left.index[(left.index >= exogenous_covers_from) & (left.index <= exogenous_covers_to)]
-                coverage_pct = len(panel_within) / max(len(left), 1) * 100
-                self.logger.info(
-                    f"Panel {panel_id}: exogenous data covers {exogenous_covers_from} -> {exogenous_covers_to}, "
-                    f"panel has {len(panel_within)} / {len(left)} rows within exogenous range "
-                    f"({coverage_pct:.1f}%)"
-                )
-                if coverage_pct < 80:
-                    gap = exogenous_covers_from - panel_start
-                    self.logger.warning(
-                        f"Panel {panel_id}: exogenous coverage is only {coverage_pct:.1f}% of the "
-                        f"panel time range. The first {gap} of panel data has no exogenous values. "
-                        f"Those rows will be NaN after merge (not imputed) to avoid polluting "
-                        f"training data with synthetic values."
-                    )
-
-            # Keep original timestamps from both sources and let the shared
-            # panel resampling step align them to 5-minute bins.
             merged = pd.concat([left, right], axis=1).sort_index()
             merged = merged[~merged.index.duplicated(keep="last")]
-
             merged.index.name = df_panel.index.name
 
             exogenous_cols = [c for c in merged.columns if c not in df_panel.columns]
+            self.logger.info(f"Panel {panel_id}: joined {len(exogenous_cols)} exogenous columns, {len(merged)} rows")
+            result[panel_id] = merged
 
-            # Log post-merge diagnostics including match distance quality
-            for hcol in exogenous_cols:
-                nan_count = int(merged[hcol].isna().sum())
-                matched_count = len(merged) - nan_count
-                self.logger.info(
-                    f"Panel {panel_id}: column '{hcol}' after merge — "
-                    f"{nan_count} NaN ({nan_count / max(len(merged), 1) * 100:.1f}%), "
-                    f"{matched_count} matched"
-                )
-
-            panel_data[panel_id] = merged
-            self.logger.info(f"Panel {panel_id}: added {len(exogenous_cols)} exogenous columns, {len(merged)} rows")
-
-        return panel_data
+        return result

@@ -1,13 +1,13 @@
 # SPDX-FileCopyrightText: 2026 bartzbeielstein
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""HTTP-mocked tests for :mod:`spotanomaly2.domain.weather_fetcher`.
+"""HTTP-mocked tests for :mod:`spotanomaly2.domain.exogenous.weather`.
 
 The production class talks to the Open-Meteo Archive + Forecast APIs, retries
 with exponential backoff, caches to parquet, and has a silent 24-hour cyclic
-fallback for API failures.  Every test here patches ``weather_fetcher.requests.get``
-so no real network call is made, and patches ``weather_fetcher.time.sleep`` so
-retry tests complete in milliseconds.
+fallback for API failures.  Every test here patches ``weather.requests.get``
+so no real network call is made, and patches ``weather.time.sleep`` so retry
+tests complete in milliseconds.
 """
 
 from __future__ import annotations
@@ -20,9 +20,8 @@ import pandas as pd
 import pytest
 import requests
 
-from spotanomaly2.domain import weather_fetcher as wf_module
-from spotanomaly2.domain.weather_fetcher import WeatherFetcher
-
+from spotanomaly2.domain.exogenous import weather as wf_module
+from spotanomaly2.domain.exogenous.weather import ExogenousWeatherFetcher, ExogenousWeatherJoiner
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -77,14 +76,28 @@ def _no_sleep():
 
 
 @pytest.fixture
-def cfg() -> dict[str, Any]:
-    """Minimal location config the WeatherFetcher needs."""
-    return {"latitude": 50.0, "longitude": 7.0, "use_forecast": True}
+def source_cfg() -> dict[str, Any]:
+    """The YAML ``config:`` sub-block for the weather source."""
+    return {
+        "enabled": True,
+        "latitude": 50.0,
+        "longitude": 7.0,
+        "use_forecast": True,
+        "lookback_days": 14,
+        "feature_columns": [],
+        "fallback_on_failure": True,
+    }
 
 
 @pytest.fixture
-def fetcher(cfg) -> WeatherFetcher:
-    return WeatherFetcher(cfg)
+def parent_cfg() -> dict[str, Any]:
+    """Full-app config shape the weather classes read for resample.freq, etc."""
+    return {"process": {"resample": {"freq": "5min"}}}
+
+
+@pytest.fixture
+def fetcher(source_cfg, parent_cfg) -> ExogenousWeatherFetcher:
+    return ExogenousWeatherFetcher(source_cfg, parent_cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -104,7 +117,7 @@ class TestFetchWeatherDataHappyPath:
         assert df.index.tz is not None
         assert str(df.index.tz) == "UTC"
         # Every requested HOURLY_PARAM column should be present
-        for col in WeatherFetcher.HOURLY_PARAMS:
+        for col in ExogenousWeatherFetcher.HOURLY_PARAMS:
             assert col in df.columns, f"missing column: {col}"
 
     def test_archive_endpoint_used_for_past_dates(self, fetcher):
@@ -113,7 +126,7 @@ class TestFetchWeatherDataHappyPath:
             fetcher.fetch_weather_data("2025-01-01", "2025-01-01")
 
         called_url = mock_get.call_args.args[0]
-        assert called_url == WeatherFetcher.ARCHIVE_BASE_URL
+        assert called_url == ExogenousWeatherFetcher.ARCHIVE_BASE_URL
         # Archive uses start_date / end_date params (not forecast_days)
         params = mock_get.call_args.kwargs["params"]
         assert "start_date" in params and "end_date" in params
@@ -177,7 +190,7 @@ class TestForecastVsArchive:
             fetcher.fetch_forecast_data(future_start, future_end)
 
         called_url = mock_get.call_args.args[0]
-        assert called_url == WeatherFetcher.FORECAST_BASE_URL
+        assert called_url == ExogenousWeatherFetcher.FORECAST_BASE_URL
         params = mock_get.call_args.kwargs["params"]
         assert "forecast_days" in params
         assert "start_date" not in params
@@ -223,9 +236,9 @@ class TestHybridMode:
         forecast_payload = _hourly_payload((now - pd.Timedelta(days=5)).strftime("%Y-%m-%dT%H:00"), periods=24 * 11)
 
         def _side_effect(url, params=None, timeout=None):
-            if url == WeatherFetcher.ARCHIVE_BASE_URL:
+            if url == ExogenousWeatherFetcher.ARCHIVE_BASE_URL:
                 return _mk_response(200, archive_payload)
-            if url == WeatherFetcher.FORECAST_BASE_URL:
+            if url == ExogenousWeatherFetcher.FORECAST_BASE_URL:
                 return _mk_response(200, forecast_payload)
             raise AssertionError(f"unexpected URL: {url}")
 
@@ -233,8 +246,8 @@ class TestHybridMode:
             df = fetcher.fetch_weather_data_hybrid(start, end)
 
         urls_called = [c.args[0] for c in mock_get.call_args_list]
-        assert WeatherFetcher.ARCHIVE_BASE_URL in urls_called
-        assert WeatherFetcher.FORECAST_BASE_URL in urls_called
+        assert ExogenousWeatherFetcher.ARCHIVE_BASE_URL in urls_called
+        assert ExogenousWeatherFetcher.FORECAST_BASE_URL in urls_called
         # Exactly two calls (one archive, one forecast).
         assert len(urls_called) == 2
         assert isinstance(df, pd.DataFrame)
@@ -264,11 +277,11 @@ class TestCacheBehaviour:
         # Pre-populate cache covering the entire requested range.
         idx = pd.date_range("2025-01-01", periods=48, freq="h", tz="UTC")
         cached = pd.DataFrame(
-            {col: [1.0] * len(idx) for col in WeatherFetcher.HOURLY_PARAMS},
+            {col: [1.0] * len(idx) for col in ExogenousWeatherFetcher.HOURLY_PARAMS},
             index=idx,
         )
         cache_path = tmp_path / "weather_cache.parquet"
-        WeatherFetcher.save_to_cache(cache_path, cached)
+        ExogenousWeatherFetcher.save_to_cache(cache_path, cached)
 
         with patch.object(wf_module.requests, "get") as mock_get:
             df = fetcher.get_weather_data(
@@ -290,11 +303,11 @@ class TestCacheBehaviour:
         cache_start = pd.Timestamp.now(tz="UTC").normalize() - pd.Timedelta(days=30)
         idx = pd.date_range(cache_start, periods=10, freq="h", tz="UTC")
         cached = pd.DataFrame(
-            {col: [42.0] * len(idx) for col in WeatherFetcher.HOURLY_PARAMS},
+            {col: [42.0] * len(idx) for col in ExogenousWeatherFetcher.HOURLY_PARAMS},
             index=idx,
         )
         cache_path = tmp_path / "weather_cache.parquet"
-        WeatherFetcher.save_to_cache(cache_path, cached)
+        ExogenousWeatherFetcher.save_to_cache(cache_path, cached)
 
         # Request a range that extends 5 hours past the cache end -> gap fetch.
         req_start = cache_start
@@ -326,14 +339,14 @@ class TestCacheBehaviour:
     def test_load_save_round_trip(self, tmp_path: Path):
         idx = pd.date_range("2025-06-01", periods=12, freq="h", tz="UTC")
         original = pd.DataFrame(
-            {col: list(range(12)) for col in WeatherFetcher.HOURLY_PARAMS},
+            {col: list(range(12)) for col in ExogenousWeatherFetcher.HOURLY_PARAMS},
             index=idx,
         )
         original.index.name = "datetime"
 
         cache_path = tmp_path / "rt.parquet"
-        WeatherFetcher.save_to_cache(cache_path, original)
-        loaded = WeatherFetcher.load_from_cache(cache_path)
+        ExogenousWeatherFetcher.save_to_cache(cache_path, original)
+        loaded = ExogenousWeatherFetcher.load_from_cache(cache_path)
 
         assert isinstance(loaded.index, pd.DatetimeIndex)
         assert loaded.index.tz is not None
@@ -346,7 +359,7 @@ class TestCacheBehaviour:
 
     def test_load_from_cache_missing_file(self, tmp_path: Path):
         with pytest.raises(FileNotFoundError):
-            WeatherFetcher.load_from_cache(tmp_path / "does_not_exist.parquet")
+            ExogenousWeatherFetcher.load_from_cache(tmp_path / "does_not_exist.parquet")
 
 
 # ---------------------------------------------------------------------------
@@ -368,11 +381,11 @@ class TestSilentFallback:
         cache_start = pd.Timestamp.now(tz="UTC").normalize() - pd.Timedelta(days=30)
         idx = pd.date_range(cache_start, periods=30, freq="h", tz="UTC")
         cached = pd.DataFrame(
-            {col: [7.0] * len(idx) for col in WeatherFetcher.HOURLY_PARAMS},
+            {col: [7.0] * len(idx) for col in ExogenousWeatherFetcher.HOURLY_PARAMS},
             index=idx,
         )
         cache_path = tmp_path / "weather_cache.parquet"
-        WeatherFetcher.save_to_cache(cache_path, cached)
+        ExogenousWeatherFetcher.save_to_cache(cache_path, cached)
 
         req_start = cache_start
         req_end = cache_start + pd.Timedelta(hours=34)
@@ -427,11 +440,11 @@ class TestSilentFallback:
         cache_start = pd.Timestamp.now(tz="UTC").normalize() - pd.Timedelta(days=30)
         idx = pd.date_range(cache_start, periods=30, freq="h", tz="UTC")
         cached = pd.DataFrame(
-            {col: [7.0] * len(idx) for col in WeatherFetcher.HOURLY_PARAMS},
+            {col: [7.0] * len(idx) for col in ExogenousWeatherFetcher.HOURLY_PARAMS},
             index=idx,
         )
         cache_path = tmp_path / "weather_cache.parquet"
-        WeatherFetcher.save_to_cache(cache_path, cached)
+        ExogenousWeatherFetcher.save_to_cache(cache_path, cached)
 
         req_start = cache_start
         req_end = cache_start + pd.Timedelta(hours=34)
@@ -473,9 +486,9 @@ class TestEdgeCases:
 
     def test_missing_lat_lon_raises(self):
         with pytest.raises(ValueError, match="latitude and longitude"):
-            WeatherFetcher({"latitude": 50.0})  # no longitude
+            ExogenousWeatherFetcher({"latitude": 50.0}, {})  # no longitude
         with pytest.raises(ValueError, match="latitude and longitude"):
-            WeatherFetcher({"longitude": 7.0})  # no latitude
+            ExogenousWeatherFetcher({"longitude": 7.0}, {})  # no latitude
 
     def test_no_cache_path_fetches_from_api(self, fetcher):
         """Cache-less path delegates straight to fetch_weather_data_hybrid."""
@@ -494,11 +507,11 @@ class TestEdgeCases:
     def test_run_is_thin_wrapper(self, fetcher, tmp_path: Path):
         idx = pd.date_range("2025-01-01", periods=24, freq="h", tz="UTC")
         cached = pd.DataFrame(
-            {col: [3.0] * len(idx) for col in WeatherFetcher.HOURLY_PARAMS},
+            {col: [3.0] * len(idx) for col in ExogenousWeatherFetcher.HOURLY_PARAMS},
             index=idx,
         )
         cache_path = tmp_path / "wc.parquet"
-        WeatherFetcher.save_to_cache(cache_path, cached)
+        ExogenousWeatherFetcher.save_to_cache(cache_path, cached)
         # No HTTP needed because cache covers the range.
         with patch.object(wf_module.requests, "get") as mock_get:
             df = fetcher.run(
@@ -508,3 +521,141 @@ class TestEdgeCases:
             )
         assert mock_get.call_count == 0
         assert len(df) == 6
+
+
+# ---------------------------------------------------------------------------
+# is_enabled (classmethod gate used by ExogenousDownloader)
+
+
+class TestIsEnabled:
+    def test_disabled_returns_false(self):
+        assert ExogenousWeatherFetcher.is_enabled({"enabled": False}) is False
+
+    def test_enabled_but_missing_coords_returns_false(self):
+        assert ExogenousWeatherFetcher.is_enabled({"enabled": True}) is False
+        assert ExogenousWeatherFetcher.is_enabled({"enabled": True, "latitude": 50.0}) is False
+        assert ExogenousWeatherFetcher.is_enabled({"enabled": True, "longitude": 7.0}) is False
+
+    def test_enabled_with_coords_returns_true(self):
+        assert ExogenousWeatherFetcher.is_enabled({"enabled": True, "latitude": 50.0, "longitude": 7.0}) is True
+
+    def test_empty_source_config_defaults_to_disabled(self):
+        # No lat/lon means we can't actually fetch — guard against that even when enabled is omitted.
+        assert ExogenousWeatherFetcher.is_enabled({}) is False
+
+
+# ---------------------------------------------------------------------------
+# fetch_and_cache (the ExogenousFetcher contract — download stage)
+
+
+class TestFetchAndCache:
+    def test_expands_window_by_lookback_days_then_delegates_to_get_weather_data(self, source_cfg, parent_cfg, tmp_path):
+        source_cfg["cache_path"] = str(tmp_path / "weather.parquet")
+        source_cfg["lookback_days"] = 14
+        f = ExogenousWeatherFetcher(source_cfg, parent_cfg)
+        start = pd.Timestamp("2025-01-15", tz="UTC")
+        end = pd.Timestamp("2025-01-20", tz="UTC")
+
+        with patch.object(f, "get_weather_data") as mock_get:
+            f.fetch_and_cache(start, end)
+
+        mock_get.assert_called_once()
+        kwargs = mock_get.call_args.kwargs
+        assert kwargs["start"] == start - pd.Timedelta(days=14)
+        assert kwargs["end"] == end
+        assert kwargs["fallback_on_failure"] is True
+        assert kwargs["cache_path"] == Path(source_cfg["cache_path"])
+
+
+# ---------------------------------------------------------------------------
+# join_into_panels (the ExogenousJoiner contract — process stage)
+
+
+def _weather_response(start: str, end: str, freq: str = "1h", temp: float = 5.0) -> pd.DataFrame:
+    idx = pd.date_range(start, end, freq=freq, tz="UTC")
+    return pd.DataFrame(
+        {"temperature_2m": [temp] * len(idx), "snow_depth": [0.1] * len(idx)},
+        index=idx,
+    )
+
+
+def _write_weather_cache(path: Path, weather_df: pd.DataFrame) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    weather_df.to_parquet(path)
+
+
+class TestJoinIntoPanels:
+    def test_empty_panel_dict_returns_empty(self, source_cfg, parent_cfg, tmp_path):
+        source_cfg["cache_path"] = str(tmp_path / "weather.parquet")
+        joiner = ExogenousWeatherJoiner(source_cfg, parent_cfg)
+        result = joiner.join_into_panels({})
+        assert result == {}
+
+    def test_missing_cache_returns_panel_data_unchanged(self, source_cfg, parent_cfg, tmp_path):
+        source_cfg["cache_path"] = str(tmp_path / "does_not_exist.parquet")
+        joiner = ExogenousWeatherJoiner(source_cfg, parent_cfg)
+        idx = pd.date_range("2025-01-01", periods=6, freq="5min", tz="UTC")
+        panel_data = {"1": pd.DataFrame({"temperature": [20.0] * 6}, index=idx)}
+        result = joiner.join_into_panels(panel_data)
+        assert result is panel_data
+
+    def test_single_panel_gets_baseline_and_feature_columns(self, source_cfg, parent_cfg, tmp_path):
+        cache = tmp_path / "weather.parquet"
+        source_cfg["cache_path"] = str(cache)
+        source_cfg["feature_columns"] = ["snow_depth"]
+        _write_weather_cache(cache, _weather_response("2024-12-15", "2025-01-02", temp=5.0))
+
+        joiner = ExogenousWeatherJoiner(source_cfg, parent_cfg)
+        idx = pd.date_range("2025-01-01", periods=12, freq="5min", tz="UTC")
+        panel_data = {"1": pd.DataFrame({"temperature": [20.0] * 12}, index=idx)}
+
+        result = joiner.join_into_panels(panel_data)
+        merged = result["1"]
+        assert "weather_temperature_baseline" in merged.columns
+        assert "weather_snow_depth" in merged.columns
+        # Baseline of a constant 5.0 series stays ~5.0 (rolling mean of constants).
+        assert (merged["weather_temperature_baseline"] - 5.0).abs().max() < 1e-9
+
+    def test_joiner_does_not_hit_network(self, source_cfg, parent_cfg, tmp_path):
+        """Joiner is read-only: no HTTP under any circumstance."""
+        cache = tmp_path / "weather.parquet"
+        source_cfg["cache_path"] = str(cache)
+        _write_weather_cache(cache, _weather_response("2024-12-15", "2025-01-02"))
+
+        joiner = ExogenousWeatherJoiner(source_cfg, parent_cfg)
+        idx = pd.date_range("2025-01-01", periods=6, freq="5min", tz="UTC")
+        panel_data = {"1": pd.DataFrame({"temperature": [20.0] * 6}, index=idx)}
+
+        with patch.object(wf_module.requests, "get") as mock_get:
+            joiner.join_into_panels(panel_data)
+        assert mock_get.call_count == 0
+
+    def test_missing_temperature_2m_skips_baseline_column(self, source_cfg, parent_cfg, tmp_path):
+        cache = tmp_path / "weather.parquet"
+        source_cfg["cache_path"] = str(cache)
+        source_cfg["feature_columns"] = ["snow_depth"]
+        weather_df = pd.DataFrame(
+            {"snow_depth": [0.2] * 100},
+            index=pd.date_range("2024-12-15", periods=100, freq="1h", tz="UTC"),
+        )
+        _write_weather_cache(cache, weather_df)
+
+        joiner = ExogenousWeatherJoiner(source_cfg, parent_cfg)
+        idx = pd.date_range("2025-01-01", periods=6, freq="5min", tz="UTC")
+        panel_data = {"1": pd.DataFrame({"temperature": [20.0] * 6}, index=idx)}
+        result = joiner.join_into_panels(panel_data)
+
+        assert "weather_temperature_baseline" not in result["1"].columns
+        assert "weather_snow_depth" in result["1"].columns
+
+    def test_does_not_mutate_original_panel_data(self, source_cfg, parent_cfg, tmp_path):
+        cache = tmp_path / "weather.parquet"
+        source_cfg["cache_path"] = str(cache)
+        _write_weather_cache(cache, _weather_response("2024-12-15", "2025-01-02"))
+
+        joiner = ExogenousWeatherJoiner(source_cfg, parent_cfg)
+        idx = pd.date_range("2025-01-01", periods=6, freq="5min", tz="UTC")
+        original = pd.DataFrame({"temperature": [20.0] * 6}, index=idx)
+        panel_data = {"1": original.copy()}
+        joiner.join_into_panels(panel_data)
+        pd.testing.assert_frame_equal(panel_data["1"], original)

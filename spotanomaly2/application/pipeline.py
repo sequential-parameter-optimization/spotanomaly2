@@ -7,11 +7,12 @@ from typing import Any
 import pandas as pd
 
 from spotanomaly2.application.data_manager import DataManager
+from spotanomaly2.application.exogenous_downloader import ExogenousDownloader
+from spotanomaly2.application.exogenous_joiner import ExogenousJoiner
 from spotanomaly2.application.readiness_checker import ReadinessChecker
 from spotanomaly2.domain.anomaly_detector import AnomalyDetector
 from spotanomaly2.domain.constants import MIN_ROWS_FOR_DETECTION
 from spotanomaly2.domain.data_processor import DataProcessor
-from spotanomaly2.domain.exogenous_fetcher import ExogenousFetcher
 from spotanomaly2.domain.model_trainer import ModelTrainer
 from spotanomaly2.domain.primary_fetcher import PrimaryDataFetcher
 from spotanomaly2.infrastructure import logging, storage
@@ -26,6 +27,8 @@ class Pipeline:
         self.logger = logger or logging.get_logger("Pipeline")
         self._data_manager = DataManager(config, self.logger)
         self._readiness_checker = ReadinessChecker(config, self.logger)
+        self._exogenous_downloader = ExogenousDownloader(config, self.logger)
+        self._exogenous_joiner = ExogenousJoiner(config, self.logger)
 
     def is_ready(self, max_age_days: float = 7) -> bool:
         """Return True iff baseline processed data and trained models are present and fresh."""
@@ -44,39 +47,36 @@ class Pipeline:
         panel_data = primary_fetcher.run()
         self._data_manager.save_raw_data(panel_data)
 
+        start, end = self._derive_fetch_window(panel_data)
+        self._exogenous_downloader.download_all(start, end)
+
     def process(self) -> None:
         self.logger.info("=" * 60)
         self.logger.info("STEP: Process data")
         self.logger.info("=" * 60)
 
         panel_data = self._data_manager.load_raw_data()
-        panel_data = self._merge_exogenous_data(panel_data)
+        panel_data = self._exogenous_joiner.join_all(panel_data)
+
         processor = DataProcessor(self.config, self.logger)
         processed_data = processor.run(panel_data)
         self._data_manager.save_processed_data(processed_data)
 
-    def train_panel(
-        self,
-        panel_id: str,
-        df: pd.DataFrame,
-        training_timestamp: str | None = None,
-    ) -> tuple[pd.DataFrame, str]:
-        """Train a single panel via spotforecast2."""
-        trainer = ModelTrainer(self.config, self.logger)
+    def _derive_fetch_window(self, panel_data: dict[str, pd.DataFrame]) -> tuple[pd.Timestamp, pd.Timestamp]:
+        """Union [min, max] of timestamps across the just-fetched primary panels.
 
-        if training_timestamp is None:
-            training_timestamp = generate_timestamp()
-
-        eval_df, timestamp = trainer.train_panel(panel_id, df, timestamp=training_timestamp, save_model=True)
-
-        base_models_dir = Path(self.config["paths"]["models_dir"])
-        models_dir = base_models_dir / str(timestamp)
-        eval_filename = f"fc_model_panel_{panel_id}_eval.csv"
-        eval_path = models_dir / eval_filename
-        eval_df.to_csv(eval_path)
-        self.logger.info(f"Saved evaluation results to {eval_path}")
-
-        return eval_df, timestamp
+        Falls back to ``config.fetch.start_date``/``now()`` when no primary data
+        is available (e.g. first ever run, or an empty incremental tick).
+        """
+        non_empty = [df for df in panel_data.values() if len(df) > 0]
+        if non_empty:
+            start = min(df.index.min() for df in non_empty)
+            end = max(df.index.max() for df in non_empty)
+            return pd.Timestamp(start), pd.Timestamp(end)
+        start_iso = self.config.get("fetch", {}).get("start_date")
+        end = pd.Timestamp.now(tz="UTC")
+        start = pd.Timestamp(start_iso) if start_iso else end - pd.Timedelta(days=30)
+        return start, end
 
     def train(self) -> None:
         self.logger.info("=" * 60)
@@ -86,8 +86,10 @@ class Pipeline:
         panel_data = self._data_manager.load_processed_data()
         training_timestamp = generate_timestamp()
 
-        for panel_id, df in panel_data.items():
-            self.train_panel(panel_id=panel_id, df=df, training_timestamp=training_timestamp)
+        trainer = ModelTrainer(self.config, self.logger)
+
+        for panel_id, panel_data in panel_data.items():
+            trainer.train_panel(panel_id, panel_data, timestamp=training_timestamp, save_model=True)
 
     def tune(
         self,
@@ -188,17 +190,19 @@ class Pipeline:
 
     def run_all(self, skip_download: bool = False, predict_only: bool = False) -> None:
         if not predict_only:
-            # Step 1: Download (or load from disk)
+            # Step 1: Download (primary + exogenous), or load from disk
             if not skip_download:
                 fetcher = PrimaryDataFetcher(self.config, self.logger)
                 panel_data = fetcher.run()
                 self._data_manager.save_raw_data(panel_data)
+                start, end = self._derive_fetch_window(panel_data)
+                self._exogenous_downloader.download_all(start, end)
             else:
                 self.logger.info("Skipping download step - loading from disk")
                 panel_data = self._data_manager.load_raw_data()
 
-            # Step 2: Process
-            panel_data = self._merge_exogenous_data(panel_data)
+            # Step 2: Process — join cached exogenous data, then run DataProcessor
+            panel_data = self._exogenous_joiner.join_all(panel_data)
             processor = DataProcessor(self.config, self.logger)
             processed_data = processor.run(panel_data)
             self._data_manager.save_processed_data(processed_data)
@@ -287,35 +291,11 @@ class Pipeline:
             }
             new_panel_data = {pid: pd.DataFrame(index=pd.DatetimeIndex([], name="timestamp")) for pid in panels}
 
-        new_panel_data = self._merge_exogenous_data(new_panel_data, fetch_status)
+        start, end = self._derive_fetch_window(new_panel_data)
+        self._exogenous_downloader.download_all(start, end, fetch_status)
+        new_panel_data = self._exogenous_joiner.join_all(new_panel_data, fetch_status)
         processor = DataProcessor(self.config, self.logger)
         new_processed_data = processor.run(new_panel_data)
-
-        # Infer OpenMeteo status from processed output
-        weather_enabled = self.config.get("process", {}).get("weather", {}).get("enabled", False)
-        if weather_enabled:
-            has_weather = any(
-                any(c.startswith("weather_") for c in df.columns) for df in new_processed_data.values() if not df.empty
-            )
-            has_temperature = any("temperature" in df.columns for df in new_processed_data.values() if not df.empty)
-            if has_weather or has_temperature:
-                fetch_status["openmeteo"] = {
-                    "status": "ok",
-                    "error": None,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                }
-            else:
-                fetch_status["openmeteo"] = {
-                    "status": "error",
-                    "error": "Weather columns missing from processed data",
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                }
-        else:
-            fetch_status["openmeteo"] = {
-                "status": "disabled",
-                "error": None,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
 
         self._data_manager.save_processed_data_live(new_processed_data)
 
@@ -483,38 +463,3 @@ class Pipeline:
             self.logger.info("  All clear - No anomalies detected at current timestamp")
 
         self.logger.info("=" * 70)
-
-    def _merge_exogenous_data(
-        self,
-        panel_data: dict[str, pd.DataFrame],
-        fetch_status: dict | None = None,
-    ) -> dict[str, pd.DataFrame]:
-        """Fetch Exogenous timeseries and merge into every panel DataFrame."""
-        if not self.config.get("exogenous", {}).get("enabled", False):
-            if fetch_status is not None:
-                fetch_status["exogenous"] = {
-                    "status": "disabled",
-                    "error": None,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                }
-            return panel_data
-
-        try:
-            fetcher = ExogenousFetcher(self.config, self.logger)
-            result = fetcher.merge_into_panels(panel_data)
-            if fetch_status is not None:
-                fetch_status["exogenous"] = {
-                    "status": "ok",
-                    "error": None,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                }
-            return result
-        except Exception as exc:
-            self.logger.warning(f"Exogenous fetch failed, continuing without Exogenous data: {exc}")
-            if fetch_status is not None:
-                fetch_status["exogenous"] = {
-                    "status": "error",
-                    "error": str(exc),
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                }
-            return panel_data

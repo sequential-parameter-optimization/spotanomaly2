@@ -19,7 +19,6 @@ import yaml
 from spotanomaly2 import main as main_module
 from spotanomaly2.main import build_parser, main, run_live_monitoring
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

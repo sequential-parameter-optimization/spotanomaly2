@@ -557,7 +557,7 @@ class AnomalyDetector:
         # Flow-weight residuals: multiply both true and pred by exogenous flow
         # so that residual = flow*(actual - predicted). This suppresses anomalies
         # during low-flow periods and amplifies them during high-flow periods.
-        weight_cfg = self.config.get("exogenous", {}).get("weight_residuals", {})
+        weight_cfg = self.config.get("residual_weighting", {})
         if weight_cfg.get("enabled", False):
             fit_true_df, fit_pred_df, eval_true_df, eval_pred_df = self._apply_flow_weights(
                 panel_id=panel_id,

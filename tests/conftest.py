@@ -35,7 +35,6 @@ def sample_config():
             "flow_columns_pattern": "flow",
             "temperature_columns_pattern": "temperature",
             "median_filter_kernel": 3,
-            "weather": {"enabled": False},
         },
         "train": {
             "train_ratio": 0.9,
@@ -56,7 +55,10 @@ def sample_config():
         "known_anomalies": [],
         "fetch": {},
         "primary": {"display_name": "Primary"},
-        "exogenous": {"enabled": False, "display_name": "Exogenous"},
+        # New plugin-shape: empty list means no exogenous sources run.
+        # Tests that need a source instantiate one explicitly.
+        "exogenous": [],
+        "residual_weighting": {"enabled": False},
         "report": {"enabled": False},
     }
 

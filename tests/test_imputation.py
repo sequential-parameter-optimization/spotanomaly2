@@ -10,7 +10,6 @@ import pytest
 
 from spotanomaly2.domain import imputation
 
-
 # ----- identify_missing_data_gaps_with_count ---------------------------------
 
 

@@ -27,7 +27,6 @@ import pytest
 from spotanomaly2.domain.anomaly_detector import AnomalyDetector
 from spotanomaly2.domain.exceptions import InsufficientDataException, ModelNotFoundException
 
-
 # ---------------------------------------------------------------------------
 # load_forecasting_model
 #

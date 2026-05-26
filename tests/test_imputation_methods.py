@@ -6,11 +6,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from spotanomaly2.domain import imputation_methods
 from spotanomaly2.domain.imputation_methods import (
+    IMPUTATION_METHODS,
     BackwardFillImputation,
     ForwardFillImputation,
-    IMPUTATION_METHODS,
     ImputationMethod,
     IterativeImputation,
     KNNSklearnImputation,
