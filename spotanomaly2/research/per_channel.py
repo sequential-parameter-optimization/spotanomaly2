@@ -188,8 +188,7 @@ def compute_residuals(
         trainer = SpotforecastTrainer(cfg, logger=logger)
         _, timestamp = trainer.train_panel(panel_id, df, save_model=True)
 
-        model_label = cfg["train"].get("model", "LightGBM")
-        model_path = Path(tmpdir) / timestamp / f"{model_label}_fc_model_panel_{panel_id}.pkl"
+        model_path = Path(tmpdir) / timestamp / f"fc_model_panel_{panel_id}.pkl"
         if not model_path.exists():
             raise FileNotFoundError(f"Trained model not found at expected path: {model_path}")
         model_data = joblib.load(model_path)

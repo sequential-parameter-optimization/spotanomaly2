@@ -62,7 +62,7 @@ class TestLoadForecastingModel:
         models_dir.mkdir(parents=True)
         sample_config["paths"]["models_dir"] = str(tmp_path / "models")
         # Create the file so find_latest_model succeeds, then mock joblib.load.
-        (models_dir / "LightGBM_fc_model_panel_1.pkl").write_bytes(b"placeholder")
+        (models_dir / "fc_model_panel_1.pkl").write_bytes(b"placeholder")
         detector = AnomalyDetector(sample_config)
         with patch(
             "spotanomaly2.domain.anomaly_detector.joblib.load",
@@ -75,7 +75,7 @@ class TestLoadForecastingModel:
         models_dir = tmp_path / "models" / "20251231_120000"
         models_dir.mkdir(parents=True)
         sample_config["paths"]["models_dir"] = str(tmp_path / "models")
-        (models_dir / "LightGBM_fc_model_panel_1.pkl").write_bytes(b"placeholder")
+        (models_dir / "fc_model_panel_1.pkl").write_bytes(b"placeholder")
         detector = AnomalyDetector(sample_config)
         payload = {"model_type": "LightGBM", "fake_field": 1}
         with patch(
@@ -91,8 +91,8 @@ class TestLoadForecastingModel:
         models_dir_new = tmp_path / "models" / "20251231_120000"
         models_dir_old.mkdir(parents=True)
         models_dir_new.mkdir(parents=True)
-        (models_dir_old / "LightGBM_fc_model_panel_1.pkl").write_bytes(b"old")
-        (models_dir_new / "LightGBM_fc_model_panel_1.pkl").write_bytes(b"new")
+        (models_dir_old / "fc_model_panel_1.pkl").write_bytes(b"old")
+        (models_dir_new / "fc_model_panel_1.pkl").write_bytes(b"new")
         sample_config["paths"]["models_dir"] = str(tmp_path / "models")
         sample_config["detect"]["model_timestamp"] = "20240101_000000"
         detector = AnomalyDetector(sample_config)

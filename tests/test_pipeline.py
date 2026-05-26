@@ -51,8 +51,7 @@ def ready_workspace(tmp_path, sample_config):
     sample_config["paths"]["models_dir"] = str(models_dir)
     sample_config["paths"]["results_dir"] = str(results_dir)
     sample_config["panels"]["panel_ids"] = ["1"]
-    sample_config["detect"]["fc_model_name"] = "LightGBM"
-    sample_config["train"]["model"] = "LightGBM"
+    sample_config["train"]["fallback_model"] = "LightGBM"
     sample_config["report"] = {"enabled": False}
     sample_config["exogenous"] = {"enabled": False, "display_name": "Exogenous"}
     sample_config["process"] = {
@@ -71,7 +70,7 @@ def ready_workspace(tmp_path, sample_config):
 
     model_dir = models_dir / "20251231_120000"
     model_dir.mkdir()
-    (model_dir / "LightGBM_fc_model_panel_1.pkl").write_bytes(b"\x00")
+    (model_dir / "fc_model_panel_1.pkl").write_bytes(b"\x00")
 
     return sample_config, {
         "raw": raw_dir,
@@ -126,7 +125,7 @@ class TestPerStageDelegation:
 
     def test_train_iterates_panels_and_delegates_to_trainer(self, sample_config, tmp_path):
         sample_config["paths"]["models_dir"] = str(tmp_path / "models")
-        sample_config["train"]["model"] = "LightGBM"
+        sample_config["train"]["fallback_model"] = "LightGBM"
         pipeline = Pipeline(sample_config)
 
         with (
@@ -199,7 +198,7 @@ class TestRunAll:
 
     def test_skip_download_uses_load_raw_data(self, sample_config, tmp_path):
         sample_config["paths"]["models_dir"] = str(tmp_path / "models")
-        sample_config["train"]["model"] = "LightGBM"
+        sample_config["train"]["fallback_model"] = "LightGBM"
         pipeline = Pipeline(sample_config)
         with (
             patch("spotanomaly2.application.pipeline.PrimaryDataFetcher") as fetcher_cls,
@@ -231,7 +230,7 @@ class TestRunAll:
 
     def test_full_run_invokes_fetcher_then_processor_then_trainer_then_detector(self, sample_config, tmp_path):
         sample_config["paths"]["models_dir"] = str(tmp_path / "models")
-        sample_config["train"]["model"] = "LightGBM"
+        sample_config["train"]["fallback_model"] = "LightGBM"
         pipeline = Pipeline(sample_config)
         with (
             patch("spotanomaly2.application.pipeline.PrimaryDataFetcher") as fetcher_cls,

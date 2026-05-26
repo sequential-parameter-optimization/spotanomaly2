@@ -367,7 +367,6 @@ class LiveReportGenerator:
         """
         self.logger.info(f"Generating HTML report for panels: {panel_ids}")
 
-        fc_model_name = self.config["detect"]["fc_model_name"]
         timestamp = datetime.now(self._timezone)
 
         # Load results for each panel
@@ -379,9 +378,9 @@ class LiveReportGenerator:
             self.logger.info(f"Processing panel {panel_id}...")
 
             # Load CSVs
-            scores_file = results_dir / f"{fc_model_name}_panel_{panel_id}_scores.csv"
-            flags_file = results_dir / f"{fc_model_name}_panel_{panel_id}_flags.csv"
-            forecast_file = results_dir / f"{fc_model_name}_panel_{panel_id}_forecast.csv"
+            scores_file = results_dir / f"panel_{panel_id}_scores.csv"
+            flags_file = results_dir / f"panel_{panel_id}_flags.csv"
+            forecast_file = results_dir / f"panel_{panel_id}_forecast.csv"
 
             if not all(f.exists() for f in [scores_file, flags_file, forecast_file]):
                 self.logger.warning(f"Missing result files for panel {panel_id}, skipping...")
@@ -489,7 +488,7 @@ class LiveReportGenerator:
                     data_age_seconds=panel_age,
                 )
                 # Load scorer-aligned contributions if available
-                contrib_file = results_dir / f"{fc_model_name}_panel_{panel_id}_contributions.parquet"
+                contrib_file = results_dir / f"panel_{panel_id}_contributions.parquet"
                 df_contributions = None
                 if contrib_file.exists():
                     try:
@@ -528,10 +527,10 @@ class LiveReportGenerator:
                 )
 
                 # --- Per-channel anomaly detection results ---
-                pc_scores_file = results_dir / f"{fc_model_name}_panel_{panel_id}_per_channel_scores.csv"
-                pc_flags_file = results_dir / f"{fc_model_name}_panel_{panel_id}_per_channel_flags.csv"
-                pc_thresholds_file = results_dir / f"{fc_model_name}_panel_{panel_id}_per_channel_thresholds.csv"
-                pc_combined_file = results_dir / f"{fc_model_name}_panel_{panel_id}_per_channel_flags_combined.csv"
+                pc_scores_file = results_dir / f"panel_{panel_id}_per_channel_scores.csv"
+                pc_flags_file = results_dir / f"panel_{panel_id}_per_channel_flags.csv"
+                pc_thresholds_file = results_dir / f"panel_{panel_id}_per_channel_thresholds.csv"
+                pc_combined_file = results_dir / f"panel_{panel_id}_per_channel_flags_combined.csv"
 
                 if all(f.exists() for f in [pc_scores_file, pc_flags_file, pc_thresholds_file, pc_combined_file]):
                     try:

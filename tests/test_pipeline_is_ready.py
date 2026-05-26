@@ -37,7 +37,6 @@ def ready_workspace(tmp_path, sample_config):
     sample_config["paths"]["processed_dir"] = str(processed_dir)
     sample_config["paths"]["models_dir"] = str(models_dir)
     sample_config["panels"]["panel_ids"] = ["1"]
-    sample_config["detect"]["fc_model_name"] = "LightGBM"
 
     # Fresh panel parquet: now-ish timestamp index.
     now = pd.Timestamp.now(tz="UTC").floor("min")
@@ -48,7 +47,7 @@ def ready_workspace(tmp_path, sample_config):
     # Fresh model directory + file.
     model_dir = models_dir / "20251231_120000"
     model_dir.mkdir()
-    model_file = model_dir / "LightGBM_fc_model_panel_1.pkl"
+    model_file = model_dir / "fc_model_panel_1.pkl"
     model_file.write_bytes(b"\x00")  # contents irrelevant; only mtime matters
 
     return sample_config, processed_dir, models_dir, model_file
@@ -121,8 +120,7 @@ class TestIsReadyModelPreconditions:
     def test_returns_false_when_no_matching_model_files(self, ready_workspace):
         config, _, _, model_file = ready_workspace
         # Rename the model so it no longer matches the expected pattern.
-        model_file.rename(model_file.parent / "Other_fc_model_panel_1.pkl")
-        config["detect"]["fc_model_name"] = "LightGBM"
+        model_file.rename(model_file.parent / "stale_model.pkl")
         assert Pipeline(config).is_ready() is False
 
     def test_returns_false_when_model_file_stale(self, ready_workspace):

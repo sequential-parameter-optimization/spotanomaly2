@@ -57,6 +57,19 @@ class DataManager:
                 f"Saved {'live ' if live else ''}panel {panel_id} to {version_dir / f'panel_{panel_id}.parquet'}"
             )
 
+        metadata = self._build_raw_metadata(panel_data, version_dir, row_counts, live)
+        metadata_path = version_dir / "meta.json"
+        storage.save_raw_metadata(metadata, metadata_path)
+        self.logger.info(f"Saved {'live ' if live else ''}metadata to {metadata_path}")
+
+    def _build_raw_metadata(
+        self,
+        panel_data: dict[str, pd.DataFrame],
+        version_dir: Path,
+        row_counts: dict[str, int],
+        live: bool,
+    ) -> dict[str, Any]:
+        """Build the metadata dict written alongside saved raw panel parquets."""
         start_date = self.config["fetch"]["start_date"]
         end_date = self.config["fetch"].get("end_date")
         if end_date is None:
@@ -78,7 +91,7 @@ class DataManager:
         if actual_end is not None and hasattr(actual_end, "isoformat"):
             actual_end = actual_end.isoformat()
 
-        metadata = {
+        metadata: dict[str, Any] = {
             "start_date": start_date,
             "end_date": end_date,
             "panel_ids": list(panel_data.keys()),
@@ -93,9 +106,7 @@ class DataManager:
         if actual_end is not None:
             metadata["actual_end"] = actual_end
 
-        metadata_path = version_dir / "meta.json"
-        storage.save_raw_metadata(metadata, metadata_path)
-        self.logger.info(f"Saved {'live ' if live else ''}metadata to {metadata_path}")
+        return metadata
 
     def load_processed_data(self) -> dict[str, pd.DataFrame]:
         """Load processed data from disk."""
@@ -130,208 +141,222 @@ class DataManager:
         storage.ensure_dir(live_dir)
 
         for panel_id, new_df in processed_data.items():
-            existing_df = None
-            bootstrap_source = None
+            existing_df, bootstrap_source = self._resolve_existing_live_panel(panel_id, processed_dir, live_dir)
+            self._merge_and_save_live_panel(panel_id, existing_df, new_df, bootstrap_source, live_dir)
 
-            try:
-                existing_df = storage.load_panel_parquet(live_dir, panel_id)
-                self.logger.info(f"Found existing live data for panel {panel_id} with {len(existing_df)} rows")
+    def _resolve_existing_live_panel(
+        self,
+        panel_id: str,
+        processed_dir: Path,
+        live_dir: Path,
+    ) -> tuple[pd.DataFrame | None, str | None]:
+        """Decide which dataframe to merge new live data into for a single panel."""
+        try:
+            existing_df = storage.load_panel_parquet(live_dir, panel_id)
+        except FileNotFoundError:
+            return self._bootstrap_live_from_baseline(panel_id, processed_dir)
 
-                # If schema changed (e.g. new EXOGENOUS columns), refresh live history
-                # from baseline to avoid long NaN spans for newly introduced targets.
-                try:
-                    baseline_df_check = storage.load_panel_parquet(processed_dir, panel_id)
-                    weight_suffix = (
-                        self.config.get("process", {}).get("imputation", {}).get("weight_suffix", "__weight")
-                    )
-                    baseline_data_cols = {c for c in baseline_df_check.columns if not c.endswith(weight_suffix)}
-                    existing_data_cols = {c for c in existing_df.columns if not c.endswith(weight_suffix)}
-                    if baseline_data_cols != existing_data_cols:
-                        self.logger.warning(
-                            f"Column schema mismatch for panel {panel_id}: "
-                            f"baseline has {baseline_data_cols - existing_data_cols} extra column(s), "
-                            f"live has {existing_data_cols - baseline_data_cols} extra column(s). "
-                            "Re-bootstrapping live data from baseline to ensure complete history."
-                        )
-                        existing_df = baseline_df_check
-                        bootstrap_source = "baseline_schema_update"
-                    elif baseline_df_check.index.max() > existing_df.index.max() + pd.Timedelta(hours=1):
-                        # Baseline is fresher than live (e.g. user just re-ran the full
-                        # pipeline). Without this swap, merging stale live with the new
-                        # incremental window leaves the intervening period as a gap.
-                        self.logger.warning(
-                            f"Live data for panel {panel_id} is stale: "
-                            f"ends at {existing_df.index.max()}, baseline ends at {baseline_df_check.index.max()}. "
-                            "Re-bootstrapping from baseline to avoid creating a gap."
-                        )
-                        existing_df = baseline_df_check
-                        bootstrap_source = "baseline_stale_live"
-                except FileNotFoundError:
-                    pass
+        self.logger.info(f"Found existing live data for panel {panel_id} with {len(existing_df)} rows")
 
-                time_diff = existing_df.index.to_series().diff()
-                large_gaps = time_diff[time_diff > pd.Timedelta(hours=1)]
+        refreshed_df, bootstrap_source = self._maybe_refresh_from_baseline(existing_df, panel_id, processed_dir)
+        if refreshed_df is not None:
+            existing_df = refreshed_df
 
-                if len(large_gaps) > 0:
-                    self.logger.warning(
-                        f"Detected {len(large_gaps)} gap(s) > 1 hour in existing live data for panel {panel_id}"
-                    )
+        existing_df = self._maybe_fix_gaps_with_full(existing_df, panel_id, processed_dir)
+        return existing_df, bootstrap_source
 
-                    # Check if these gaps are also in full processed data (natural sensor outages)
-                    # or if they're processing artifacts that can be fixed
-                    try:
-                        full_df = storage.load_panel_parquet(processed_dir, panel_id)
-                        full_time_diff = full_df.index.to_series().diff()
-                        full_gaps = full_time_diff[full_time_diff > pd.Timedelta(hours=1)]
+    def _maybe_refresh_from_baseline(
+        self,
+        existing_df: pd.DataFrame,
+        panel_id: str,
+        processed_dir: Path,
+    ) -> tuple[pd.DataFrame | None, str | None]:
+        """Swap live for baseline when schema changed or live trails baseline by >1h."""
+        try:
+            baseline_df = storage.load_panel_parquet(processed_dir, panel_id)
+        except FileNotFoundError:
+            return None, None
 
-                        # Compare gaps: which ones are fixable?
-                        fixable_gaps = []
-                        natural_gaps = []
+        weight_suffix = self.config.get("process", {}).get("imputation", {}).get("weight_suffix", "__weight")
+        baseline_cols = {c for c in baseline_df.columns if not c.endswith(weight_suffix)}
+        existing_cols = {c for c in existing_df.columns if not c.endswith(weight_suffix)}
 
-                        for gap_idx, gap_duration in large_gaps.items():
-                            gap_start = existing_df.index[existing_df.index.get_loc(gap_idx) - 1]
-                            gap_end = gap_idx
+        if baseline_cols != existing_cols:
+            self.logger.warning(
+                f"Column schema mismatch for panel {panel_id}: "
+                f"baseline has {baseline_cols - existing_cols} extra column(s), "
+                f"live has {existing_cols - baseline_cols} extra column(s). "
+                "Re-bootstrapping live data from baseline to ensure complete history."
+            )
+            return baseline_df, "baseline_schema_update"
 
-                            # Check if this gap also exists in full data
-                            # (allowing for small timestamp differences due to resampling)
-                            is_natural_gap = False
-                            for full_gap_idx in full_gaps.index:
-                                full_gap_start = full_df.index[full_df.index.get_loc(full_gap_idx) - 1]
-                                full_gap_end = full_gap_idx
+        if baseline_df.index.max() > existing_df.index.max() + pd.Timedelta(hours=1):
+            # User likely re-ran the full pipeline; merging stale live with the new
+            # incremental window would leave the intervening period as a gap.
+            self.logger.warning(
+                f"Live data for panel {panel_id} is stale: "
+                f"ends at {existing_df.index.max()}, baseline ends at {baseline_df.index.max()}. "
+                "Re-bootstrapping from baseline to avoid creating a gap."
+            )
+            return baseline_df, "baseline_stale_live"
 
-                                # If gaps overlap significantly, consider it a natural gap
-                                if (
-                                    abs((gap_start - full_gap_start).total_seconds()) < 3600
-                                    and abs((gap_end - full_gap_end).total_seconds()) < 3600
-                                ):
-                                    is_natural_gap = True
-                                    break
+        return None, None
 
-                            if is_natural_gap:
-                                natural_gaps.append((gap_start, gap_end, gap_duration))
-                                self.logger.info(
-                                    f"  Natural gap (sensor outage): {gap_start} -> {gap_end} ({gap_duration})"
-                                )
-                            else:
-                                fixable_gaps.append((gap_start, gap_end, gap_duration))
-                                self.logger.warning(
-                                    f"  Fixable gap (processing artifact): {gap_start} -> {gap_end} ({gap_duration})"
-                                )
+    def _maybe_fix_gaps_with_full(
+        self,
+        existing_df: pd.DataFrame,
+        panel_id: str,
+        processed_dir: Path,
+    ) -> pd.DataFrame:
+        """Replace existing data with full processed data if it has fixable gaps."""
+        large_gaps = self._gaps_over_one_hour(existing_df)
+        if large_gaps.empty:
+            return existing_df
 
-                        # Only fix if there are fixable gaps
-                        if len(fixable_gaps) > 0:
-                            self.logger.info(
-                                f"Loading full processed data for panel {panel_id} "
-                                f"({len(full_df)} rows) to fix {len(fixable_gaps)} processing artifact(s)"
-                            )
-                            existing_df = full_df
-                        elif len(natural_gaps) > 0:
-                            self.logger.info(
-                                f"All {len(natural_gaps)} gap(s) are natural sensor outages - keeping existing data"
-                            )
+        self.logger.warning(f"Detected {len(large_gaps)} gap(s) > 1 hour in existing live data for panel {panel_id}")
 
-                    except FileNotFoundError:
-                        error_msg = (
-                            f"CRITICAL: Cannot verify gaps in live data for panel {panel_id}. "
-                            f"Full processed data not found. Run the full pipeline first:\n"
-                            f"  spotanomaly2 --config <your_config.yaml> all --skip-download\n"
-                            f"Or from Python: pipeline.run_all(skip_download=True)"
-                        )
-                        self.logger.error(error_msg)
-                        raise RuntimeError(error_msg)
+        try:
+            full_df = storage.load_panel_parquet(processed_dir, panel_id)
+        except FileNotFoundError:
+            error_msg = (
+                f"CRITICAL: Cannot verify gaps in live data for panel {panel_id}. "
+                f"Full processed data not found. Run the full pipeline first:\n"
+                f"  spotanomaly2 --config <your_config.yaml> all --skip-download\n"
+                f"Or from Python: pipeline.run_all(skip_download=True)"
+            )
+            self.logger.error(error_msg)
+            raise RuntimeError(error_msg)
 
-            except FileNotFoundError:
-                # Live data doesn't exist - try to bootstrap from processed baseline
-                self.logger.warning(f"No live data found for panel {panel_id}. Attempting to bootstrap...")
+        fixable, natural = self._categorize_gaps(existing_df, full_df, large_gaps)
 
-                try:
-                    baseline_df = storage.load_panel_parquet(processed_dir, panel_id)
-                    baseline_end = baseline_df.index.max()
-                    baseline_start = baseline_df.index.min()
+        if fixable:
+            self.logger.info(
+                f"Loading full processed data for panel {panel_id} "
+                f"({len(full_df)} rows) to fix {len(fixable)} processing artifact(s)"
+            )
+            return full_df
+        if natural:
+            self.logger.info(f"All {len(natural)} gap(s) are natural sensor outages - keeping existing data")
+        return existing_df
 
-                    # Check if we have newer raw data available that wasn't processed yet
-                    raw_dir = Path(self.config["paths"]["raw_dir"])
-                    try:
-                        # Find newest raw data version
-                        version_dirs = [d for d in raw_dir.iterdir() if d.is_dir() and d.name != "live"]
-                        if version_dirs:
-                            newest_version = max(version_dirs, key=lambda d: d.name)
-                            newest_raw_df = storage.load_panel_parquet(newest_version, panel_id)
-                            newest_raw_end = newest_raw_df.index.max()
+    def _categorize_gaps(
+        self,
+        existing_df: pd.DataFrame,
+        full_df: pd.DataFrame,
+        large_gaps: pd.Series,
+    ) -> tuple[list, list]:
+        """Split gaps into (fixable_artifacts, natural_outages) using full data as truth."""
+        full_gaps = self._gaps_over_one_hour(full_df)
+        fixable: list = []
+        natural: list = []
 
-                            # If raw data is significantly newer than baseline, we need to process it
-                            time_gap = newest_raw_end - baseline_end
-                            if time_gap > pd.Timedelta(days=1):
-                                error_msg = (
-                                    f"CRITICAL: Live data missing for panel {panel_id}, and baseline is outdated!\n"
-                                    f"  Baseline ends at: {baseline_end}\n"
-                                    f"  Raw data ends at: {newest_raw_end}\n"
-                                    f"  Gap: {time_gap.days} days\n\n"
-                                    f"This would cause data loss. Run the full pipeline first:\n"
-                                    f"  spotanomaly2 --config <your_config.yaml> all --skip-download\n"
-                                    f"Or from Python: pipeline.run_all(skip_download=True)"
-                                )
-                                self.logger.error(error_msg)
-                                raise RuntimeError(error_msg)
-                    except Exception as e:
-                        self.logger.warning(f"Could not check raw data currency: {e}")
+        for gap_idx, gap_duration in large_gaps.items():
+            gap_start = existing_df.index[existing_df.index.get_loc(gap_idx) - 1]
+            gap_end = gap_idx
 
-                    # Bootstrap from baseline (only if it's recent enough)
-                    existing_df = baseline_df
-                    bootstrap_source = "baseline"
-                    self.logger.info(
-                        f"Bootstrapped panel {panel_id} from baseline "
-                        f"({len(existing_df)} rows: {baseline_start} to {baseline_end})"
-                    )
-
-                except FileNotFoundError:
-                    error_msg = (
-                        f"CRITICAL: Cannot bootstrap live data for panel {panel_id}. "
-                        f"No baseline processed data found. Run the full pipeline first:\n"
-                        f"  spotanomaly2 --config <your_config.yaml> all\n"
-                        f"Or from Python: pipeline.run_all()\n"
-                        f"This will fetch, process, train models, and create the initial baseline."
-                    )
-                    self.logger.error(error_msg)
-                    raise RuntimeError(error_msg)
-
-            if existing_df is not None:
-                # Merge incrementally while preserving existing non-null values,
-                # but allowing new data to backfill previously missing cells
-                # (important for late-arriving external series like exogenous sources).
-                #
-                # Why not concat+drop_duplicates(keep="first")?
-                # That strategy freezes first-seen NaNs forever on overlapping
-                # timestamps. If a later incremental run brings valid values for
-                # those same timestamps, they are silently discarded.
-                merged_df = existing_df.combine_first(new_df).sort_index()
-
-                merge_log = (
-                    f"Merged data: {len(existing_df)} existing + {len(new_df)} new = {len(merged_df)} total rows"
-                )
-                if bootstrap_source == "baseline":
-                    merge_log += " (bootstrapped from baseline)"
-                self.logger.info(merge_log)
-
-                # Final gap check on merged data
-                time_diff = merged_df.index.to_series().diff()
-                final_gaps = time_diff[time_diff > pd.Timedelta(hours=1)]
-                if len(final_gaps) > 0:
-                    self.logger.warning(f"Warning: {len(final_gaps)} gap(s) remain in merged data for panel {panel_id}")
-                    for idx, gap in final_gaps.items():
-                        prev = merged_df.index[merged_df.index.get_loc(idx) - 1]
-                        self.logger.warning(f"  Gap: {prev} -> {idx} ({gap})")
-
-                storage.save_panel_parquet(merged_df, live_dir, panel_id)
-                self.logger.info(f"Saved live processed panel {panel_id} with {len(merged_df)} rows")
+            if self._gap_present_in_full(gap_start, gap_end, full_df, full_gaps):
+                natural.append((gap_start, gap_end, gap_duration))
+                self.logger.info(f"  Natural gap (sensor outage): {gap_start} -> {gap_end} ({gap_duration})")
             else:
-                # This should not happen anymore due to prerequisite checks, but keep as safeguard
-                self.logger.warning(
-                    f"No existing data available for panel {panel_id}, saving only new data. "
-                    f"This may result in incomplete baseline."
-                )
-                storage.save_panel_parquet(new_df, live_dir, panel_id)
-                self.logger.info(f"Saved live processed panel {panel_id} with {len(new_df)} rows (new file)")
+                fixable.append((gap_start, gap_end, gap_duration))
+                self.logger.warning(f"  Fixable gap (processing artifact): {gap_start} -> {gap_end} ({gap_duration})")
+
+        return fixable, natural
+
+    @staticmethod
+    def _gap_present_in_full(
+        gap_start: pd.Timestamp,
+        gap_end: pd.Timestamp,
+        full_df: pd.DataFrame,
+        full_gaps: pd.Series,
+    ) -> bool:
+        """True if a gap with the same endpoints (within 1h tolerance) exists in full data."""
+        for full_gap_idx in full_gaps.index:
+            full_gap_start = full_df.index[full_df.index.get_loc(full_gap_idx) - 1]
+            full_gap_end = full_gap_idx
+            if (
+                abs((gap_start - full_gap_start).total_seconds()) < 3600
+                and abs((gap_end - full_gap_end).total_seconds()) < 3600
+            ):
+                return True
+        return False
+
+    def _bootstrap_live_from_baseline(
+        self,
+        panel_id: str,
+        processed_dir: Path,
+    ) -> tuple[pd.DataFrame, str]:
+        """Initial bootstrap when no live data exists yet."""
+        self.logger.warning(f"No live data found for panel {panel_id}. Attempting to bootstrap...")
+
+        try:
+            baseline_df = storage.load_panel_parquet(processed_dir, panel_id)
+        except FileNotFoundError:
+            error_msg = (
+                f"CRITICAL: Cannot bootstrap live data for panel {panel_id}. "
+                f"No baseline processed data found. Run the full pipeline first:\n"
+                f"  spotanomaly2 --config <your_config.yaml> all\n"
+                f"Or from Python: pipeline.run_all()\n"
+                f"This will fetch, process, train models, and create the initial baseline."
+            )
+            self.logger.error(error_msg)
+            raise RuntimeError(error_msg)
+
+        self.logger.info(
+            f"Bootstrapped panel {panel_id} from baseline "
+            f"({len(baseline_df)} rows: {baseline_df.index.min()} to {baseline_df.index.max()})"
+        )
+        return baseline_df, "baseline"
+
+    def _merge_and_save_live_panel(
+        self,
+        panel_id: str,
+        existing_df: pd.DataFrame | None,
+        new_df: pd.DataFrame,
+        bootstrap_source: str | None,
+        live_dir: Path,
+    ) -> None:
+        """Merge new data into existing live data and persist."""
+        if existing_df is None:
+            # Safeguard - prerequisite checks should prevent reaching this branch.
+            self.logger.warning(
+                f"No existing data available for panel {panel_id}, saving only new data. "
+                f"This may result in incomplete baseline."
+            )
+            storage.save_panel_parquet(new_df, live_dir, panel_id)
+            self.logger.info(f"Saved live processed panel {panel_id} with {len(new_df)} rows (new file)")
+            return
+
+        # combine_first preserves existing non-null values but lets new data backfill
+        # previously NaN cells (important for late-arriving exogenous series).
+        # concat+drop_duplicates(keep="first") would freeze first-seen NaNs forever.
+        merged_df = existing_df.combine_first(new_df).sort_index()
+
+        merge_log = f"Merged data: {len(existing_df)} existing + {len(new_df)} new = {len(merged_df)} total rows"
+        if bootstrap_source == "baseline":
+            merge_log += " (bootstrapped from baseline)"
+        self.logger.info(merge_log)
+
+        self._warn_on_remaining_gaps(merged_df, panel_id)
+
+        storage.save_panel_parquet(merged_df, live_dir, panel_id)
+        self.logger.info(f"Saved live processed panel {panel_id} with {len(merged_df)} rows")
+
+    def _warn_on_remaining_gaps(self, merged_df: pd.DataFrame, panel_id: str) -> None:
+        """Log a warning per remaining >1h gap in the merged data."""
+        final_gaps = self._gaps_over_one_hour(merged_df)
+        if final_gaps.empty:
+            return
+        self.logger.warning(f"Warning: {len(final_gaps)} gap(s) remain in merged data for panel {panel_id}")
+        for idx, gap in final_gaps.items():
+            prev = merged_df.index[merged_df.index.get_loc(idx) - 1]
+            self.logger.warning(f"  Gap: {prev} -> {idx} ({gap})")
+
+    @staticmethod
+    def _gaps_over_one_hour(df: pd.DataFrame) -> pd.Series:
+        """Return timestamp diffs > 1h, indexed by the gap's end timestamp."""
+        time_diff = df.index.to_series().diff()
+        return time_diff[time_diff > pd.Timedelta(hours=1)]
 
     def load_processed_data_live(self) -> dict[str, pd.DataFrame]:
         """Load accumulated processed data from live directory."""
@@ -366,7 +391,6 @@ class DataManager:
     ) -> Path:
         """Save detection results to a timestamped or live directory."""
         base_results_dir = Path(self.config["paths"]["results_dir"])
-        fc_model_name = self.config["detect"]["fc_model_name"]
 
         if live_mode:
             results_dir = base_results_dir / "live"
@@ -378,20 +402,20 @@ class DataManager:
         storage.ensure_dir(results_dir)
 
         for panel_id, (scores_df, flags_df, forecast_df, contributions_df, per_channel) in results.items():
-            scores_filename = f"{fc_model_name}_panel_{panel_id}_scores.csv"
-            flags_filename = f"{fc_model_name}_panel_{panel_id}_flags.csv"
-            forecast_filename = f"{fc_model_name}_panel_{panel_id}_forecast.csv"
+            scores_filename = f"panel_{panel_id}_scores.csv"
+            flags_filename = f"panel_{panel_id}_flags.csv"
+            forecast_filename = f"panel_{panel_id}_forecast.csv"
             scores_df.to_csv(results_dir / scores_filename)
             flags_df.to_csv(results_dir / flags_filename)
             forecast_df.to_csv(results_dir / forecast_filename)
             if contributions_df is not None:
-                contrib_filename = f"{fc_model_name}_panel_{panel_id}_contributions.parquet"
+                contrib_filename = f"panel_{panel_id}_contributions.parquet"
                 contributions_df.to_parquet(results_dir / contrib_filename)
             # Per-channel detection results
             if per_channel is not None:
                 for key in ("scores", "flags", "flags_combined", "thresholds"):
                     if key in per_channel:
-                        fname = f"{fc_model_name}_panel_{panel_id}_per_channel_{key}.csv"
+                        fname = f"panel_{panel_id}_per_channel_{key}.csv"
                         per_channel[key].to_csv(results_dir / fname)
             self.logger.info(f"Saved results for panel {panel_id} to {results_dir}")
 

@@ -175,14 +175,14 @@ class TestSaveDetectionResults:
         out_dir = dm.save_detection_results(results, timestamp="20250101_120000")
 
         assert out_dir == paths["results_dir"] / "20250101_120000"
-        assert (out_dir / "LightGBM_panel_1_scores.csv").exists()
-        assert (out_dir / "LightGBM_panel_1_flags.csv").exists()
-        assert (out_dir / "LightGBM_panel_1_forecast.csv").exists()
-        assert (out_dir / "LightGBM_panel_1_contributions.parquet").exists()
-        assert (out_dir / "LightGBM_panel_1_per_channel_scores.csv").exists()
-        assert (out_dir / "LightGBM_panel_1_per_channel_flags.csv").exists()
-        assert (out_dir / "LightGBM_panel_1_per_channel_flags_combined.csv").exists()
-        assert (out_dir / "LightGBM_panel_1_per_channel_thresholds.csv").exists()
+        assert (out_dir / "panel_1_scores.csv").exists()
+        assert (out_dir / "panel_1_flags.csv").exists()
+        assert (out_dir / "panel_1_forecast.csv").exists()
+        assert (out_dir / "panel_1_contributions.parquet").exists()
+        assert (out_dir / "panel_1_per_channel_scores.csv").exists()
+        assert (out_dir / "panel_1_per_channel_flags.csv").exists()
+        assert (out_dir / "panel_1_per_channel_flags_combined.csv").exists()
+        assert (out_dir / "panel_1_per_channel_thresholds.csv").exists()
 
     def test_live_mode_uses_live_subdir(self, dm_workspace):
         config, paths = dm_workspace
@@ -192,7 +192,7 @@ class TestSaveDetectionResults:
         out_dir = dm.save_detection_results(results, live_mode=True)
 
         assert out_dir == paths["results_dir"] / "live"
-        assert (out_dir / "LightGBM_panel_1_scores.csv").exists()
+        assert (out_dir / "panel_1_scores.csv").exists()
 
     def test_omits_contributions_when_none(self, dm_workspace):
         config, paths = dm_workspace
@@ -202,7 +202,7 @@ class TestSaveDetectionResults:
 
         out_dir = dm.save_detection_results(results, timestamp="20250101_120000")
 
-        assert not (out_dir / "LightGBM_panel_1_contributions.parquet").exists()
+        assert not (out_dir / "panel_1_contributions.parquet").exists()
 
     def test_omits_per_channel_when_none(self, dm_workspace):
         config, paths = dm_workspace
@@ -213,8 +213,8 @@ class TestSaveDetectionResults:
         out_dir = dm.save_detection_results(results, timestamp="20250101_120000")
 
         # Scores still present, per_channel sidecars absent.
-        assert (out_dir / "LightGBM_panel_1_scores.csv").exists()
-        assert not (out_dir / "LightGBM_panel_1_per_channel_scores.csv").exists()
+        assert (out_dir / "panel_1_scores.csv").exists()
+        assert not (out_dir / "panel_1_per_channel_scores.csv").exists()
 
 
 # ---------------------------------------------------------------------------

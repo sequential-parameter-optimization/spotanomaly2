@@ -25,9 +25,8 @@ class AnomalyDetector:
     def load_forecasting_model(self, panel_id: str) -> dict[str, Any]:
         """Load trained spotforecast2 model for a panel."""
         models_dir = Path(self.config["paths"]["models_dir"])
-        fc_model_name = self.config["detect"]["fc_model_name"]
 
-        model_filename = f"{fc_model_name}_fc_model_panel_{panel_id}.pkl"
+        model_filename = f"fc_model_panel_{panel_id}.pkl"
 
         try:
             model_file = storage.find_latest_model(

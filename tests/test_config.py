@@ -30,7 +30,7 @@ def test_load_config_train_section():
     config = load_default_config()
     train = config["train"]
     assert "train_ratio" in train
-    assert "model" in train
+    assert "fallback_model" in train
     assert "lags" in train
     assert isinstance(train["train_ratio"], float)
 

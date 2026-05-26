@@ -58,7 +58,7 @@ class TestSpotforecastTrainer:
         adapter.config["paths"]["models_dir"] = str(tmp_path)
         _, timestamp = adapter.train_panel("test", panel_df)
 
-        model_path = Path(tmp_path) / timestamp / "LightGBM_fc_model_panel_test.pkl"
+        model_path = Path(tmp_path) / timestamp / "fc_model_panel_test.pkl"
         model_data = joblib.load(model_path)
 
         test_slice = panel_df.iloc[-30:]
@@ -74,7 +74,7 @@ class TestSpotforecastTrainer:
         adapter.config["paths"]["models_dir"] = str(tmp_path)
         _, timestamp = adapter.train_panel("test", panel_df)
 
-        model_path = Path(tmp_path) / timestamp / "LightGBM_fc_model_panel_test.pkl"
+        model_path = Path(tmp_path) / timestamp / "fc_model_panel_test.pkl"
         model_data = joblib.load(model_path)
 
         for key in ("forecasters", "n_lags", "target_cols", "exog_columns", "model_type"):
@@ -134,7 +134,7 @@ class TestSpotforecastTrainer:
 
         _, timestamp = adapter.train_panel("test", panel_df)
 
-        model_path = Path(tmp_path) / timestamp / "LightGBM_fc_model_panel_test.pkl"
+        model_path = Path(tmp_path) / timestamp / "fc_model_panel_test.pkl"
         model_data = joblib.load(model_path)
 
         assert model_data["model_type"] == "spotforecast2_multi"
@@ -543,7 +543,7 @@ class TestSpotforecastTuner:
             cfg["train"]["lags"] = 6
             trainer = SpotforecastTrainer(cfg)
             _, ts = trainer.train_panel("test", df)
-            model_data = joblib.load(Path(cfg["paths"]["models_dir"]) / ts / "LightGBM_fc_model_panel_test.pkl")
+            model_data = joblib.load(Path(cfg["paths"]["models_dir"]) / ts / "fc_model_panel_test.pkl")
             n_local = len(df)
             test_slice = df.iloc[int(n_local * 0.9) :]
             history = df.iloc[: int(n_local * 0.9)]

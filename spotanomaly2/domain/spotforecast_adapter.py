@@ -629,7 +629,7 @@ class SpotforecastTrainer:
         """Train one ForecasterRecursive per target channel for a panel."""
         base_models_dir = Path(self.config["paths"]["models_dir"])
         train_ratio = self.config["train"]["train_ratio"]
-        model_label = self.config["train"]["model"]
+        model_label = self.config["train"]["fallback_model"]
         n_lags = self.config["train"].get("lags", 24)
         random_seed = self.config["train"].get("random_seed", 42)
         # Predict Δy[t] = y[t] - y[t-1] instead of y[t]. At inference we
@@ -882,7 +882,7 @@ class SpotforecastTrainer:
 
         if save_model:
             storage.ensure_dir(models_dir)
-            model_path = models_dir / f"{model_label}_fc_model_panel_{panel_id}.pkl"
+            model_path = models_dir / f"fc_model_panel_{panel_id}.pkl"
             joblib.dump(model_data, model_path)
             self.logger.info(f"Saved spotforecast2 model to {model_path}")
 

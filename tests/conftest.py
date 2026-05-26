@@ -40,7 +40,7 @@ def sample_config():
         "train": {
             "train_ratio": 0.9,
             "random_seed": 42,
-            "model": "LightGBM",
+            "fallback_model": "LightGBM",
             "lags": 6,
             "exog_columns": [],
         },
@@ -48,7 +48,6 @@ def sample_config():
             "hist_window": 100,
             "target_date": None,
             "high_quantile": 0.99,
-            "fc_model_name": "LightGBM",
             "scorer_name": "KMeansScorer",
             "scorer_params": {"n_clusters": 3, "window": 1},
             "normalize_scores": True,

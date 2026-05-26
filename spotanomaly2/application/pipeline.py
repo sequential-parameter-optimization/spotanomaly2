@@ -4,10 +4,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import pandas as pd
 
 from spotanomaly2.application.data_manager import DataManager
+from spotanomaly2.application.readiness_checker import ReadinessChecker
 from spotanomaly2.domain.anomaly_detector import AnomalyDetector
 from spotanomaly2.domain.constants import MIN_ROWS_FOR_DETECTION
 from spotanomaly2.domain.data_processor import DataProcessor
@@ -15,22 +15,7 @@ from spotanomaly2.domain.exogenous_fetcher import ExogenousFetcher
 from spotanomaly2.domain.model_trainer import ModelTrainer
 from spotanomaly2.domain.primary_fetcher import PrimaryDataFetcher
 from spotanomaly2.infrastructure import logging, storage
-from spotanomaly2.infrastructure.storage import generate_timestamp
-
-
-def _make_yaml_serializable(obj):
-    """Recursively convert numpy types to native Python for YAML serialization."""
-    if isinstance(obj, dict):
-        return {str(k): _make_yaml_serializable(v) for k, v in obj.items()}
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    if isinstance(obj, (np.integer,)):
-        return int(obj)
-    if isinstance(obj, (np.floating,)):
-        return float(obj)
-    if isinstance(obj, (list, tuple)):
-        return [_make_yaml_serializable(x) for x in obj]
-    return obj
+from spotanomaly2.infrastructure.storage import generate_timestamp, make_yaml_serializable
 
 
 class Pipeline:
@@ -40,129 +25,11 @@ class Pipeline:
         self.config = config
         self.logger = logger or logging.get_logger("Pipeline")
         self._data_manager = DataManager(config, self.logger)
+        self._readiness_checker = ReadinessChecker(config, self.logger)
 
     def is_ready(self, max_age_days: float = 7) -> bool:
-        """Check whether baseline data and trained models exist and are fresh.
-
-        Args:
-            max_age_days: Maximum age (in days) of processed data and models
-                before they are considered stale. Defaults to 7.
-
-        Returns True when every configured panel has processed data, at least
-        one trained model exists on disk, and both the data and model are
-        newer than *max_age_days*.
-        """
-        processed_dir = Path(self.config["paths"]["processed_dir"])
-        models_dir = Path(self.config["paths"]["models_dir"])
-        panels = self.config["panels"]["panel_ids"]
-        fc_model_name = self.config["detect"]["fc_model_name"]
-
-        now = pd.Timestamp.now(tz="UTC")
-        max_age = pd.Timedelta(days=max_age_days)
-
-        for panel_id in panels:
-            panel_file = processed_dir / f"panel_{panel_id}.parquet"
-            if not panel_file.exists():
-                return False
-            try:
-                df = storage.load_parquet(panel_file)
-                if df.empty:
-                    return False
-                latest_ts = pd.Timestamp(df.index.max())
-                if latest_ts.tz is None:
-                    latest_ts = latest_ts.tz_localize("UTC")
-                if (now - latest_ts) > max_age:
-                    return False
-            except Exception:
-                return False
-
-        if not models_dir.exists():
-            return False
-
-        model_pattern = f"{fc_model_name}_fc_model_panel_*.pkl"
-        try:
-            latest_dir = storage.find_latest_timestamped_dir(models_dir)
-            model_files = list(latest_dir.glob(model_pattern))
-            if not model_files:
-                return False
-            oldest_model = min(f.stat().st_mtime for f in model_files)
-            model_age = now - pd.Timestamp(oldest_model, unit="s", tz="UTC")
-            if model_age > max_age:
-                return False
-        except FileNotFoundError:
-            return False
-
-        return True
-
-    def _check_current_anomalies(self, results: dict[str, tuple]) -> None:
-        """Check and report anomalies at the current (latest) timestamp."""
-        self.logger.info("")
-        self.logger.info("=" * 70)
-        self.logger.info("CURRENT ANOMALY CHECK")
-        self.logger.info("=" * 70)
-
-        any_anomalies = False
-
-        for panel_id, (scores_df, flags_df, forecast_df, _contrib, *_rest) in results.items():
-            if len(flags_df) == 0:
-                continue
-
-            latest_timestamp = flags_df.index.max()
-            latest_flags = flags_df.loc[latest_timestamp]
-            anomaly_channels = latest_flags[latest_flags > 0].index.tolist()
-
-            if anomaly_channels:
-                any_anomalies = True
-                self.logger.warning(f"   ANOMALY DETECTED - Panel {panel_id} at {latest_timestamp}")
-                self.logger.warning(f"   Affected channels: {', '.join(anomaly_channels)}")
-                latest_scores = scores_df.loc[latest_timestamp]
-                for channel in anomaly_channels:
-                    if channel in latest_scores.index:
-                        score = latest_scores[channel]
-                        self.logger.warning(f"   - {channel}: score = {score:.4f}")
-            else:
-                self.logger.info(f"  Panel {panel_id} at {latest_timestamp}: No anomalies")
-
-        if not any_anomalies:
-            self.logger.info("")
-            self.logger.info("  All clear - No anomalies detected at current timestamp")
-
-        self.logger.info("=" * 70)
-
-    def _merge_exogenous_data(
-        self,
-        panel_data: dict[str, pd.DataFrame],
-        fetch_status: dict | None = None,
-    ) -> dict[str, pd.DataFrame]:
-        """Fetch Exogenous timeseries and merge into every panel DataFrame."""
-        if not self.config.get("exogenous", {}).get("enabled", False):
-            if fetch_status is not None:
-                fetch_status["exogenous"] = {
-                    "status": "disabled",
-                    "error": None,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                }
-            return panel_data
-
-        try:
-            fetcher = ExogenousFetcher(self.config, self.logger)
-            result = fetcher.merge_into_panels(panel_data)
-            if fetch_status is not None:
-                fetch_status["exogenous"] = {
-                    "status": "ok",
-                    "error": None,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                }
-            return result
-        except Exception as exc:
-            self.logger.warning(f"Exogenous fetch failed, continuing without Exogenous data: {exc}")
-            if fetch_status is not None:
-                fetch_status["exogenous"] = {
-                    "status": "error",
-                    "error": str(exc),
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                }
-            return panel_data
+        """Return True iff baseline processed data and trained models are present and fresh."""
+        return self._readiness_checker.is_ready(max_age_days)
 
     # ------------------------------------------------------------------
     # Individual pipeline steps
@@ -203,9 +70,8 @@ class Pipeline:
         eval_df, timestamp = trainer.train_panel(panel_id, df, timestamp=training_timestamp, save_model=True)
 
         base_models_dir = Path(self.config["paths"]["models_dir"])
-        model_name = self.config["train"]["model"]
         models_dir = base_models_dir / str(timestamp)
-        eval_filename = f"{model_name}_fc_model_panel_{panel_id}_eval.csv"
+        eval_filename = f"fc_model_panel_{panel_id}_eval.csv"
         eval_path = models_dir / eval_filename
         eval_df.to_csv(eval_path)
         self.logger.info(f"Saved evaluation results to {eval_path}")
@@ -270,7 +136,7 @@ class Pipeline:
                 "channels": {},
             }
             for ch_name, ch_result in channel_results.items():
-                output_data["channels"][ch_name] = _make_yaml_serializable(ch_result)
+                output_data["channels"][ch_name] = make_yaml_serializable(ch_result)
 
             result_path = results_dir / f"panel_{pid}.yaml"
             with open(result_path, "w") as f:
@@ -347,11 +213,10 @@ class Pipeline:
                 eval_results[panel_id] = (eval_df, timestamp)
 
             base_models_dir = Path(self.config["paths"]["models_dir"])
-            model_name = self.config["train"]["model"]
 
             for panel_id, (eval_df, timestamp) in eval_results.items():
                 models_dir = base_models_dir / str(timestamp)
-                eval_filename = f"{model_name}_fc_model_panel_{panel_id}_eval.csv"
+                eval_filename = f"fc_model_panel_{panel_id}_eval.csv"
                 eval_path = models_dir / eval_filename
                 eval_df.to_csv(eval_path)
                 self.logger.info(f"Saved evaluation results to {eval_path}")
@@ -583,3 +448,73 @@ class Pipeline:
         self.logger.info("=" * 60)
 
         return results
+
+    def _check_current_anomalies(self, results: dict[str, tuple]) -> None:
+        """Check and report anomalies at the current (latest) timestamp."""
+        self.logger.info("")
+        self.logger.info("=" * 70)
+        self.logger.info("CURRENT ANOMALY CHECK")
+        self.logger.info("=" * 70)
+
+        any_anomalies = False
+
+        for panel_id, (scores_df, flags_df, forecast_df, _contrib, *_rest) in results.items():
+            if len(flags_df) == 0:
+                continue
+
+            latest_timestamp = flags_df.index.max()
+            latest_flags = flags_df.loc[latest_timestamp]
+            anomaly_channels = latest_flags[latest_flags > 0].index.tolist()
+
+            if anomaly_channels:
+                any_anomalies = True
+                self.logger.warning(f"   ANOMALY DETECTED - Panel {panel_id} at {latest_timestamp}")
+                self.logger.warning(f"   Affected channels: {', '.join(anomaly_channels)}")
+                latest_scores = scores_df.loc[latest_timestamp]
+                for channel in anomaly_channels:
+                    if channel in latest_scores.index:
+                        score = latest_scores[channel]
+                        self.logger.warning(f"   - {channel}: score = {score:.4f}")
+            else:
+                self.logger.info(f"  Panel {panel_id} at {latest_timestamp}: No anomalies")
+
+        if not any_anomalies:
+            self.logger.info("")
+            self.logger.info("  All clear - No anomalies detected at current timestamp")
+
+        self.logger.info("=" * 70)
+
+    def _merge_exogenous_data(
+        self,
+        panel_data: dict[str, pd.DataFrame],
+        fetch_status: dict | None = None,
+    ) -> dict[str, pd.DataFrame]:
+        """Fetch Exogenous timeseries and merge into every panel DataFrame."""
+        if not self.config.get("exogenous", {}).get("enabled", False):
+            if fetch_status is not None:
+                fetch_status["exogenous"] = {
+                    "status": "disabled",
+                    "error": None,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+            return panel_data
+
+        try:
+            fetcher = ExogenousFetcher(self.config, self.logger)
+            result = fetcher.merge_into_panels(panel_data)
+            if fetch_status is not None:
+                fetch_status["exogenous"] = {
+                    "status": "ok",
+                    "error": None,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+            return result
+        except Exception as exc:
+            self.logger.warning(f"Exogenous fetch failed, continuing without Exogenous data: {exc}")
+            if fetch_status is not None:
+                fetch_status["exogenous"] = {
+                    "status": "error",
+                    "error": str(exc),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+            return panel_data
