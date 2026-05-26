@@ -44,6 +44,7 @@ The following thresholds are configured in `config/default.yaml` for **both Pane
 
 ```{python}
 # Standard library
+import sys
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -54,15 +55,31 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import yaml
 
-# SpotAnomaly modules
-from src.infrastructure import storage
+# Resolve the repo root by walking up looking for pyproject.toml — works
+# whether the qmd is rendered from notebooks/ or the repo root. Push it onto
+# sys.path so the kernel can import spotanomaly2 even when the package
+# isn't installed editable.
+_here = Path.cwd().resolve()
+PROJECT_ROOT: Path | None = None
+for _candidate in (_here, *_here.parents):
+    if (_candidate / "pyproject.toml").exists():
+        PROJECT_ROOT = _candidate
+        break
+if PROJECT_ROOT is None:
+    raise RuntimeError(f"Could not find pyproject.toml starting from {_here}")
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-print("Libraries loaded")
+# SpotAnomaly modules — must come after sys.path is set up
+from spotanomaly2.infrastructure import storage
+from spotanomaly2.infrastructure.storage import find_latest_timestamped_dir
+
+print(f"Libraries loaded — project root: {PROJECT_ROOT}")
 ```
 
 ```{python}
 # Load configuration
-config_path = Path("../config/default.yaml")
+config_path = PROJECT_ROOT / "config" / "default.yaml"
 with open(config_path, 'r') as f:
     config = yaml.safe_load(f)
 
@@ -209,9 +226,10 @@ print("✓ Processing functions defined")
 # Panel 1: Analysis
 
 ```{python}
-# Load raw data
+# Load raw data — pick the most recent versioned raw directory.
 panel_id = "1"
-raw_dir = Path("../data/raw/20260210_110225")
+raw_dir = find_latest_timestamped_dir(PROJECT_ROOT / "data" / "raw")
+print(f"Using raw data version: {raw_dir.name}")
 raw_df = storage.load_panel_parquet(raw_dir, panel_id)
 
 print(f"✓ Loaded Panel {panel_id} raw data")

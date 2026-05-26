@@ -155,6 +155,17 @@ class DataManager:
                         )
                         existing_df = baseline_df_check
                         bootstrap_source = "baseline_schema_update"
+                    elif baseline_df_check.index.max() > existing_df.index.max() + pd.Timedelta(hours=1):
+                        # Baseline is fresher than live (e.g. user just re-ran the full
+                        # pipeline). Without this swap, merging stale live with the new
+                        # incremental window leaves the intervening period as a gap.
+                        self.logger.warning(
+                            f"Live data for panel {panel_id} is stale: "
+                            f"ends at {existing_df.index.max()}, baseline ends at {baseline_df_check.index.max()}. "
+                            "Re-bootstrapping from baseline to avoid creating a gap."
+                        )
+                        existing_df = baseline_df_check
+                        bootstrap_source = "baseline_stale_live"
                 except FileNotFoundError:
                     pass
 
@@ -340,7 +351,16 @@ class DataManager:
 
     def save_detection_results(
         self,
-        results: dict[str, tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame | None]],
+        results: dict[
+            str,
+            tuple[
+                pd.DataFrame,
+                pd.DataFrame,
+                pd.DataFrame,
+                pd.DataFrame | None,
+                dict[str, pd.DataFrame] | None,
+            ],
+        ],
         timestamp: str | None = None,
         live_mode: bool = False,
     ) -> Path:
@@ -357,7 +377,7 @@ class DataManager:
 
         storage.ensure_dir(results_dir)
 
-        for panel_id, (scores_df, flags_df, forecast_df, contributions_df) in results.items():
+        for panel_id, (scores_df, flags_df, forecast_df, contributions_df, per_channel) in results.items():
             scores_filename = f"{fc_model_name}_panel_{panel_id}_scores.csv"
             flags_filename = f"{fc_model_name}_panel_{panel_id}_flags.csv"
             forecast_filename = f"{fc_model_name}_panel_{panel_id}_forecast.csv"
@@ -367,6 +387,12 @@ class DataManager:
             if contributions_df is not None:
                 contrib_filename = f"{fc_model_name}_panel_{panel_id}_contributions.parquet"
                 contributions_df.to_parquet(results_dir / contrib_filename)
+            # Per-channel detection results
+            if per_channel is not None:
+                for key in ("scores", "flags", "flags_combined", "thresholds"):
+                    if key in per_channel:
+                        fname = f"{fc_model_name}_panel_{panel_id}_per_channel_{key}.csv"
+                        per_channel[key].to_csv(results_dir / fname)
             self.logger.info(f"Saved results for panel {panel_id} to {results_dir}")
 
         return results_dir

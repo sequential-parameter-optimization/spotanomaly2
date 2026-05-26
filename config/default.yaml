@@ -156,6 +156,11 @@ train:
   model: "LightGBM"  # "LightGBM" or "XGBoost" (used by spotforecast2 adapter)
   lags: 6  # Number of autoregressive lags for ForecasterRecursive
   exclude_imputed_training_samples: true
+  # Predict Δy = y[t] - y[t-1] instead of y[t]; integrate one-step at
+  # detection time as y_pred[t] = y[t-1] + Δy_pred[t]. Removes the
+  # "predict the training mean" trivial-minimum that kept letting
+  # degenerate tree configs win the tuner. Set 0 to disable.
+  differentiation: 1
   exog_columns:
     - weather_snow_depth
   known_anomaly_buffer: "1d"
@@ -165,8 +170,8 @@ train:
   # channels:
   #   channel_1_ph: {model: Ridge, params: {alpha: 1.0}}
   channel_config_files:
-    "1": "config/channel_models/panel_1.yaml"
-    "2": "config/channel_models/panel_2.yaml"
+    "1": "config/channel_models/panel_1_default.yaml"
+    "2": "config/channel_models/panel_2_default.yaml"
 
 detect:
   hist_window: 2016
@@ -196,6 +201,30 @@ detect:
     # selection_criterion: "bic"
   normalize_scores: true
   normalization_quantile: 0.99
+  # --- Per-channel anomaly detection ---
+  # Complements the combined scorer by flagging individual channels that
+  # exceed their own quantile threshold.  The combined detector catches
+  # coordinated multi-channel shifts; the per-channel detector isolates
+  # strong single-channel spikes.
+  per_channel:
+    enabled: true
+    # Quantile applied independently to each channel's |residual| distribution.
+    # Stricter than the combined quantile because per-channel scoring is more
+    # sensitive (fewer dimensions to dilute signal).  With ~8 channels a 0.99
+    # quantile would fire on at least one channel ~8% of the time by chance;
+    # 0.995 brings that down to ~4%.
+    high_quantile: 0.995
+    # Minimum number of channels that must individually exceed their threshold
+    # for the timestamp to be flagged as a per-channel anomaly.
+    # 1 = any single strong channel triggers.
+    # 2+ = requires multiple independent channels to be anomalous (stricter).
+    min_channels: 1
+    # Optional per-panel, per-channel quantile overrides.
+    # Channels without an override use high_quantile.
+    # quantile_overrides:
+    #   "1":
+    #     channel_1_orp_mv: 0.9997
+    #     channel_3_turbidity: 0.999
 
 evaluate:
   results_timestamp: null
@@ -219,32 +248,79 @@ exogenous:
       - "source_a"
     "2":
       - "source_b"
+  # Weight anomaly residuals by exogenous flow values.
+  # Disabled by default so the repo works without exogenous data.
+  weight_residuals:
+    enabled: false
 
 tune:
   n_trials: 10
   n_initial: 5
-  metric: "mean_absolute_error"
+  # R² compares against the constant-mean baseline (=0). Avoids the
+  # trivial-mean tuning minimum that MAE/MSE fall into for narrow-range
+  # targets (e.g. pH, turbidity). Higher is better; the adapter negates
+  # internally so SpotOptim's minimiser still works.
+  metric: "r2"
   output_dir: "data/tuning_results"
+  lags:
+    - "[1, 2, 3, 11, 12, 22, 23, 24, 47, 48, 167, 168]"
+    - "48"
+    - "24"
+    - "[1, 2, 24, 48]"
+    - "[1, 2, 23, 24, 47, 48]"
+    - "[1, 2, 11, 12, 23, 24, 167, 168]"
   models:
-    - "LightGBM"
-    - "XGBoost"
-    - "CatBoost"
-  search_space:
-    num_leaves: [8, 256]
-    max_depth: [3, 16]
-    learning_rate: [0.0001, 0.1, "log10"]
-    n_estimators: [10, 1000, "log10"]
-    bagging_fraction: [0.5, 1.0]
-    feature_fraction: [0.5, 1.0]
-    reg_alpha: [0.01, 100.0]
-    reg_lambda: [0.01, 100.0]
-    lags:
-      - "[1, 2, 3, 11, 12, 22, 23, 24, 47, 48, 167, 168]"
-      - "48"
-      - "24"
-      - "[1, 2, 24, 48]"
-      - "[1, 2, 23, 24, 47, 48]"
-      - "[1, 2, 11, 12, 23, 24, 167, 168]"
+    LightGBM:
+      num_leaves: [8, 256]
+      max_depth: [3, 16]
+      learning_rate: [0.0001, 0.1, "log10"]
+      n_estimators: [10, 1000, "log10"]
+      bagging_fraction: [0.5, 1.0]
+      feature_fraction: [0.5, 1.0]
+      reg_alpha: [0.01, 100.0]
+      reg_lambda: [0.01, 100.0]
+    XGBoost:
+      max_depth: [3, 16]
+      learning_rate: [0.0001, 0.1, "log10"]
+      n_estimators: [10, 1000, "log10"]
+      reg_alpha: [0.01, 100.0]
+      reg_lambda: [0.01, 100.0]
+    CatBoost:
+      max_depth: [3, 16]
+      learning_rate: [0.0001, 0.1, "log10"]
+      n_estimators: [10, 1000, "log10"]
+      reg_lambda: [0.01, 100.0]
+    Ridge:
+      alpha: [0.01, 100.0, "log10"]
+    ElasticNet:
+      alpha: [0.0001, 10.0, "log10"]
+      l1_ratio: [0.05, 0.95]
+    Lasso:
+      alpha: [0.0001, 10.0, "log10"]
+    BayesianRidge:
+      alpha_1: [0.0000001, 0.001, "log10"]
+      alpha_2: [0.0000001, 0.001, "log10"]
+      lambda_1: [0.0000001, 0.001, "log10"]
+      lambda_2: [0.0000001, 0.001, "log10"]
+    Huber:
+      alpha: [0.00001, 0.1, "log10"]
+      epsilon: [1.1, 3.5]
+    # Nyström(rbf) + Ridge — RBF kernel approximation that scales to the
+    # full dataset (replaces exact KernelRidge, which had to be capped).
+    KernelRidgeApprox:
+      n_components: [256, 2048]
+      alpha: [0.001, 10.0, "log10"]
+      gamma: [0.0001, 1.0, "log10"]
+    # Nyström(rbf) + LinearSVR — RBF kernel approximation of SVR that
+    # scales to the full dataset.
+    SVRApprox:
+      n_components: [256, 2048]
+      C: [0.01, 100.0, "log10"]
+      gamma: [0.0001, 1.0, "log10"]
+      epsilon: [0.001, 1.0, "log10"]
+    MLP:
+      alpha: [0.00001, 0.1, "log10"]
+      learning_rate_init: [0.0001, 0.01, "log10"]
   # Per-panel, per-channel overrides (optional)
   # panel_overrides:
   #   "1":

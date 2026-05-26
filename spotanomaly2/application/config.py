@@ -1,10 +1,14 @@
 """Configuration loading and management."""
 
-from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+# The bundled default config lives at ``<repo>/config/default.yaml`` — that is,
+# alongside the ``spotanomaly2`` package, not inside it. Resolving relative to
+# this source file is robust to ``cwd`` and works for editable installs.
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
 def _resolve_path_value(value: str, base: Path) -> str:
@@ -50,6 +54,18 @@ def _resolve_config_paths(config: dict[str, Any], base: Path) -> None:
         if isinstance(od, str):
             tune["output_dir"] = _resolve_path_value(od, base)
 
+    train = config.get("train")
+    if isinstance(train, dict):
+        # Per-panel YAML paths under train.channel_config_files are read at training
+        # time and rewritten by ModelTuner.update_channel_configs after tuning. Both
+        # callers do `Path(value)` and join against cwd if relative — which breaks
+        # when the kernel/CLI starts outside the repo root.
+        channel_files = train.get("channel_config_files")
+        if isinstance(channel_files, dict):
+            for key, val in list(channel_files.items()):
+                if isinstance(val, str):
+                    channel_files[key] = _resolve_path_value(val, base)
+
 
 def load_config(config_path: Path, base_dir: Path | None = None) -> dict[str, Any]:
     """Load configuration from YAML file.
@@ -74,8 +90,8 @@ def load_config(config_path: Path, base_dir: Path | None = None) -> dict[str, An
 
 
 def get_default_config_path() -> Path:
-    """Get path to the bundled default configuration file."""
-    return Path(str(files("spotanomaly2.config").joinpath("default.yaml")))
+    """Get path to the bundled default configuration file (``config/default.yaml``)."""
+    return _REPO_ROOT / "config" / "default.yaml"
 
 
 def load_default_config(base_dir: Path | None = None) -> dict[str, Any]:

@@ -121,7 +121,7 @@ class AnomalyDetector:
         test_end_idx: int,
         hist_window: int,
     ) -> tuple[int, int]:
-        """Validate and adjust train/test window when data is insufficient."""
+        """Validate and adjust scorer fit/eval window when data is insufficient."""
         n = len(df)
         min_required = hist_window * 2 + 1
         min_train_size = MIN_TRAIN_SIZE
@@ -223,16 +223,55 @@ class AnomalyDetector:
         return history_df, unseen_df
 
     # ------------------------------------------------------------------
+    # Flow weighting
+    # ------------------------------------------------------------------
+
+    def _apply_flow_weights(
+        self,
+        panel_id: str,
+        source_fit_df: pd.DataFrame,
+        source_eval_df: pd.DataFrame,
+        fit_true_df: pd.DataFrame,
+        fit_pred_df: pd.DataFrame,
+        eval_true_df: pd.DataFrame,
+        eval_pred_df: pd.DataFrame,
+    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """Multiply true and pred values by exogenous flow so residuals are flow-weighted."""
+        exog_cols = [c for c in source_fit_df.columns if c.startswith("exogenous_")]
+        if not exog_cols:
+            self.logger.warning(f"Panel {panel_id}: weight_residuals enabled but no exogenous columns found")
+            return fit_true_df, fit_pred_df, eval_true_df, eval_pred_df
+
+        # Use first exogenous column as flow weight (typically one per panel)
+        flow_col = exog_cols[0]
+        if len(exog_cols) > 1:
+            self.logger.info(
+                f"Panel {panel_id}: multiple exogenous columns found, using '{flow_col}' for flow weighting"
+            )
+
+        fit_flow = source_fit_df.loc[fit_true_df.index, flow_col]
+        eval_flow = source_eval_df.loc[eval_true_df.index, flow_col]
+
+        fit_true_df = fit_true_df.multiply(fit_flow, axis=0)
+        fit_pred_df = fit_pred_df.multiply(fit_flow, axis=0)
+        eval_true_df = eval_true_df.multiply(eval_flow, axis=0)
+        eval_pred_df = eval_pred_df.multiply(eval_flow, axis=0)
+
+        self.logger.info(f"Panel {panel_id}: applied flow weighting using '{flow_col}' to residuals")
+
+        return fit_true_df, fit_pred_df, eval_true_df, eval_pred_df
+
+    # ------------------------------------------------------------------
     # Detection
     # ------------------------------------------------------------------
 
     def _validate_scoring_inputs(
         self,
         panel_id: str,
-        test_true_df: pd.DataFrame,
-        test_pred_df: pd.DataFrame,
+        eval_true_df: pd.DataFrame,
+        eval_pred_df: pd.DataFrame,
     ) -> None:
-        """Validate anomaly-window inputs (test set) and fail fast on NaN/Inf."""
+        """Validate scorer eval-window inputs and fail fast on NaN/Inf."""
         fail_on_nan_inputs = self.config.get("detect", {}).get("fail_on_nan_inputs", True)
 
         def _count_bad_values(df: pd.DataFrame) -> tuple[int, int]:
@@ -240,8 +279,8 @@ class AnomalyDetector:
             return int(np.isnan(arr).sum()), int(np.isinf(arr).sum())
 
         input_stats = {
-            "test_true": _count_bad_values(test_true_df),
-            "test_pred": _count_bad_values(test_pred_df),
+            "eval_true": _count_bad_values(eval_true_df),
+            "eval_pred": _count_bad_values(eval_pred_df),
         }
         total_bad = sum(nan + inf for nan, inf in input_stats.values())
         if total_bad == 0:
@@ -256,7 +295,7 @@ class AnomalyDetector:
     def _exclude_imputed_rows(
         self,
         panel_id: str,
-        dataset_name: str,
+        window_name: str,
         source_df: pd.DataFrame,
         aligned_true_df: pd.DataFrame,
     ) -> tuple[pd.DataFrame, pd.Series]:
@@ -289,63 +328,142 @@ class AnomalyDetector:
         dropped = int((~observed_mask).sum())
         if dropped > 0:
             self.logger.info(
-                f"Panel {panel_id}: excluded {dropped} {dataset_name} row(s) with imputed values "
+                f"Panel {panel_id}: excluded {dropped} {window_name} row(s) with imputed values "
                 f"based on {len(weight_cols)} weight column(s) (primary + exogenous)"
             )
 
         return aligned_true_df.loc[observed_mask], observed_mask
 
-    def _exclude_invalid_training_rows(
+    def _exclude_invalid_scorer_fit_rows(
         self,
         panel_id: str,
-        train_true_df: pd.DataFrame,
-        train_pred_df: pd.DataFrame,
-        test_true_df: pd.DataFrame,
-        test_pred_df: pd.DataFrame,
+        fit_true_df: pd.DataFrame,
+        fit_pred_df: pd.DataFrame,
+        eval_true_df: pd.DataFrame,
+        eval_pred_df: pd.DataFrame,
     ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        """Exclude invalid *training rows* while keeping features.
+        """Exclude invalid rows from the scorer-fit window.
 
-        This preserves channels like exogenous sources for the valid part of history and
-        drops only historical periods where train matrices contain NaN/Inf.
+        Drops rows where the scorer-fit matrices contain NaN/Inf while
+        keeping the eval window intact.
         """
         common_cols = [
             c
-            for c in train_true_df.columns
-            if c in train_pred_df.columns and c in test_true_df.columns and c in test_pred_df.columns
+            for c in fit_true_df.columns
+            if c in fit_pred_df.columns and c in eval_true_df.columns and c in eval_pred_df.columns
         ]
         if not common_cols:
             raise ValueError(f"Panel {panel_id}: no common columns for scoring")
 
-        train_true_df = train_true_df[common_cols]
-        train_pred_df = train_pred_df[common_cols]
-        test_true_df = test_true_df[common_cols]
-        test_pred_df = test_pred_df[common_cols]
+        fit_true_df = fit_true_df[common_cols]
+        fit_pred_df = fit_pred_df[common_cols]
+        eval_true_df = eval_true_df[common_cols]
+        eval_pred_df = eval_pred_df[common_cols]
 
-        mask_true = np.isfinite(train_true_df.to_numpy()).all(axis=1)
-        mask_pred = np.isfinite(train_pred_df.to_numpy()).all(axis=1)
-        train_keep_mask = mask_true & mask_pred
+        mask_true = np.isfinite(fit_true_df.to_numpy()).all(axis=1)
+        mask_pred = np.isfinite(fit_pred_df.to_numpy()).all(axis=1)
+        fit_keep_mask = mask_true & mask_pred
 
-        dropped_train_rows = int((~train_keep_mask).sum())
-        if dropped_train_rows > 0:
-            dropped_index = train_true_df.index[~train_keep_mask]
+        dropped_rows = int((~fit_keep_mask).sum())
+        if dropped_rows > 0:
+            dropped_index = fit_true_df.index[~fit_keep_mask]
             first_ts = dropped_index.min()
             last_ts = dropped_index.max()
             self.logger.warning(
-                f"Panel {panel_id}: excluding {dropped_train_rows} invalid training row(s) "
-                f"from scoring window ({first_ts} to {last_ts})"
+                f"Panel {panel_id}: excluding {dropped_rows} invalid scorer-fit row(s) ({first_ts} to {last_ts})"
             )
 
-        train_true_df = train_true_df.loc[train_keep_mask]
-        train_pred_df = train_pred_df.loc[train_keep_mask]
+        fit_true_df = fit_true_df.loc[fit_keep_mask]
+        fit_pred_df = fit_pred_df.loc[fit_keep_mask]
 
-        if len(train_true_df) == 0:
-            raise ValueError(f"Panel {panel_id}: no valid training rows left for scoring after exclusion")
+        if len(fit_true_df) == 0:
+            raise ValueError(f"Panel {panel_id}: no valid rows left in scorer-fit window after exclusion")
 
-        return train_true_df, train_pred_df, test_true_df, test_pred_df
+        return fit_true_df, fit_pred_df, eval_true_df, eval_pred_df
+
+    # ------------------------------------------------------------------
+    # Per-channel detection
+    # ------------------------------------------------------------------
+
+    def _detect_per_channel(
+        self,
+        panel_id: str,
+        fit_true_df: pd.DataFrame,
+        fit_pred_df: pd.DataFrame,
+        eval_true_df: pd.DataFrame,
+        eval_pred_df: pd.DataFrame,
+    ) -> dict[str, pd.DataFrame]:
+        """Run per-channel quantile-based anomaly detection.
+
+        For each channel independently:
+        1. Compute absolute residuals.
+        2. Fit a quantile threshold on the training window.
+        3. Flag eval timestamps where the channel's residual exceeds its own threshold.
+
+        Returns a dict with keys:
+            "scores"  — DataFrame (n_eval, n_channels) of per-channel absolute residuals
+            "flags"   — DataFrame (n_eval, n_channels) of per-channel binary flags (0/1)
+            "thresholds" — DataFrame (1, n_channels) of fitted thresholds
+            "flags_combined" — DataFrame (n_eval, 1) with "per_channel_anomaly_flag"
+                               (1 if >= min_channels individual channels flagged)
+        """
+        pc_cfg = self.config.get("detect", {}).get("per_channel", {})
+        high_quantile = pc_cfg.get("high_quantile", 0.995)
+        min_channels = pc_cfg.get("min_channels", 1)
+        # Per-panel, per-channel quantile overrides (optional, scalar).
+        quantile_overrides = pc_cfg.get("quantile_overrides", {}).get(str(panel_id), {})
+
+        channels = fit_true_df.columns
+
+        # Absolute residuals
+        fit_residuals = (fit_true_df - fit_pred_df).abs()
+        eval_residuals = (eval_true_df - eval_pred_df).abs()
+
+        # Fit per-channel thresholds on the training window
+        thresholds = {}
+        for col in channels:
+            q = float(quantile_overrides.get(col, high_quantile))
+            col_residuals = fit_residuals[col].dropna()
+            col_residuals = col_residuals[np.isfinite(col_residuals)]
+            if len(col_residuals) == 0:
+                thresholds[col] = np.inf
+            else:
+                thresholds[col] = float(np.quantile(col_residuals, q))
+            if col in quantile_overrides:
+                self.logger.info(f"Panel {panel_id}: {col} q={q} → threshold={thresholds[col]:.4f}")
+
+        thresholds_df = pd.DataFrame(thresholds, index=["threshold"])
+
+        # Flag eval window
+        flags_dict = {}
+        for col in channels:
+            flags_dict[col] = (eval_residuals[col] > thresholds[col]).astype(int)
+        flags_df = pd.DataFrame(flags_dict, index=eval_true_df.index)
+
+        # Combined per-channel flag: at least min_channels must be flagged
+        channel_count = flags_df.sum(axis=1)
+        combined_flag = (channel_count >= min_channels).astype(int)
+        flags_combined_df = pd.DataFrame({"per_channel_anomaly_flag": combined_flag}, index=eval_true_df.index)
+
+        n_flagged = int(combined_flag.sum())
+        self.logger.info(
+            f"Panel {panel_id}: per-channel detection (q={high_quantile}, "
+            f"min_channels={min_channels}) flagged {n_flagged} timestamp(s)"
+        )
+        per_channel_flagged = {col: int(flags_df[col].sum()) for col in channels if flags_df[col].sum() > 0}
+        if per_channel_flagged:
+            self.logger.info(f"Panel {panel_id}: per-channel flags: {per_channel_flagged}")
+
+        return {
+            "scores": eval_residuals,
+            "flags": flags_df,
+            "thresholds": thresholds_df,
+            "flags_combined": flags_combined_df,
+        }
 
     def detect_panel(
         self, panel_id: str, df: pd.DataFrame
-    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame | None]:
+    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame | None, dict[str, pd.DataFrame] | None]:
         """Detect anomalies for a single panel."""
         self.logger.info(f"Detecting anomalies for panel {panel_id}...")
 
@@ -362,80 +480,107 @@ class AnomalyDetector:
         target_date = self.config["detect"].get("target_date", None)
 
         if target_date:
-            test_start_idx, test_end_idx = (
-                self._calculate_test_window_with_target_date(
-                    unseen_df, target_date, hist_window
-                )
+            test_start_idx, test_end_idx = self._calculate_test_window_with_target_date(
+                unseen_df, target_date, hist_window
             )
         else:
-            test_start_idx, test_end_idx = self._calculate_test_window_default(
-                unseen_df, hist_window
-            )
+            test_start_idx, test_end_idx = self._calculate_test_window_default(unseen_df, hist_window)
 
         test_start_idx, test_end_idx = self._adjust_window_for_insufficient_data(
             unseen_df, test_start_idx, test_end_idx, hist_window
         )
 
-        train_df = unseen_df.iloc[:test_start_idx]
-        test_df = unseen_df.iloc[test_start_idx:test_end_idx]
+        # Split unseen data into two windows:
+        #   scorer_fit_df  — scorer learns "normal residual" distribution here
+        #   scorer_eval_df — scorer flags anomalies here
+        # Both windows are AFTER the forecaster's training period (leakage guard),
+        # so all predictions are genuine out-of-sample.
+        scorer_fit_df = unseen_df.iloc[:test_start_idx]
+        scorer_eval_df = unseen_df.iloc[test_start_idx:test_end_idx]
 
-        self.logger.info(f"Train size: {len(train_df)}, Test size: {len(test_df)}")
+        self.logger.info(f"Scorer fit window: {len(scorer_fit_df)}, Scorer eval window: {len(scorer_eval_df)}")
 
         # Generate predictions via spotforecast2 adapter
-        self.logger.info(f"Generating predictions using {model_type} model...")
+        channel_models = model_data.get("channel_models") or {}
+        if channel_models:
+            from collections import Counter
+
+            counts = Counter(spec.get("model", "?") for spec in channel_models.values())
+            breakdown = ", ".join(f"{m}×{n}" for m, n in counts.most_common())
+            self.logger.info(f"Generating predictions ({model_type}; channels: {breakdown})...")
+        else:
+            self.logger.info(f"Generating predictions using {model_type} model...")
         adapter = SpotforecastTrainer(self.config, self.logger)
-        history_for_train_pred = history_df if len(history_df) > 0 else None
-        train_pred_df = adapter.predict(
+        history_for_fit_pred = history_df if len(history_df) > 0 else None
+        fit_pred_df = adapter.predict(
             model_data,
-            train_df,
-            history_df=history_for_train_pred,
+            scorer_fit_df,
+            history_df=history_for_fit_pred,
         )
-        test_history_df = pd.concat([history_df, train_df]) if len(history_df) > 0 else train_df
-        test_pred_df = adapter.predict(model_data, test_df, history_df=test_history_df)
+        eval_history_df = pd.concat([history_df, scorer_fit_df]) if len(history_df) > 0 else scorer_fit_df
+        eval_pred_df = adapter.predict(model_data, scorer_eval_df, history_df=eval_history_df)
 
         # Align true values with predictions
-        target_cols = train_pred_df.columns
-        train_true_df = train_df.loc[train_pred_df.index, target_cols]
-        test_true_df = test_df.loc[test_pred_df.index, target_cols]
+        target_cols = fit_pred_df.columns
+        fit_true_df = scorer_fit_df.loc[fit_pred_df.index, target_cols]
+        eval_true_df = scorer_eval_df.loc[eval_pred_df.index, target_cols]
 
-        train_true_df, train_keep_mask = self._exclude_imputed_rows(
+        fit_true_df, fit_keep_mask = self._exclude_imputed_rows(
             panel_id=panel_id,
-            dataset_name="train",
-            source_df=train_df,
-            aligned_true_df=train_true_df,
+            window_name="scorer_fit",
+            source_df=scorer_fit_df,
+            aligned_true_df=fit_true_df,
         )
-        train_pred_df = train_pred_df.loc[train_keep_mask]
+        fit_pred_df = fit_pred_df.loc[fit_keep_mask]
 
-        test_true_df, test_keep_mask = self._exclude_imputed_rows(
+        eval_true_df, eval_keep_mask = self._exclude_imputed_rows(
             panel_id=panel_id,
-            dataset_name="test",
-            source_df=test_df,
-            aligned_true_df=test_true_df,
+            window_name="scorer_eval",
+            source_df=scorer_eval_df,
+            aligned_true_df=eval_true_df,
         )
-        test_pred_df = test_pred_df.loc[test_keep_mask]
+        eval_pred_df = eval_pred_df.loc[eval_keep_mask]
 
-        if len(train_true_df) == 0 or len(test_true_df) == 0:
+        if len(fit_true_df) == 0 or len(eval_true_df) == 0:
             raise ValueError(f"Panel {panel_id}: no rows left after excluding imputed values via weight columns")
 
-        train_true_df, train_pred_df, test_true_df, test_pred_df = self._exclude_invalid_training_rows(
+        fit_true_df, fit_pred_df, eval_true_df, eval_pred_df = self._exclude_invalid_scorer_fit_rows(
             panel_id=panel_id,
-            train_true_df=train_true_df,
-            train_pred_df=train_pred_df,
-            test_true_df=test_true_df,
-            test_pred_df=test_pred_df,
+            fit_true_df=fit_true_df,
+            fit_pred_df=fit_pred_df,
+            eval_true_df=eval_true_df,
+            eval_pred_df=eval_pred_df,
         )
+
+        # Keep unweighted predictions for report visualizations
+        report_pred_df = eval_pred_df.copy()
+
+        # Flow-weight residuals: multiply both true and pred by exogenous flow
+        # so that residual = flow*(actual - predicted). This suppresses anomalies
+        # during low-flow periods and amplifies them during high-flow periods.
+        weight_cfg = self.config.get("exogenous", {}).get("weight_residuals", {})
+        if weight_cfg.get("enabled", False):
+            fit_true_df, fit_pred_df, eval_true_df, eval_pred_df = self._apply_flow_weights(
+                panel_id=panel_id,
+                source_fit_df=scorer_fit_df,
+                source_eval_df=scorer_eval_df,
+                fit_true_df=fit_true_df,
+                fit_pred_df=fit_pred_df,
+                eval_true_df=eval_true_df,
+                eval_pred_df=eval_pred_df,
+            )
 
         self._validate_scoring_inputs(
             panel_id=panel_id,
-            test_true_df=test_true_df,
-            test_pred_df=test_pred_df,
+            eval_true_df=eval_true_df,
+            eval_pred_df=eval_pred_df,
         )
 
-        if len(train_pred_df) == 0:
+        if len(fit_pred_df) == 0:
             raise InsufficientDataException(
-                f"Panel {panel_id}: no valid training samples after prediction. "
+                f"Panel {panel_id}: no valid samples in scorer-fit window after prediction. "
                 f"This usually means one or more target columns are entirely NaN "
-                f"in the training window. "
+                f"in the scorer-fit window. "
                 f"Fix: delete data/processed/live/ so it re-bootstraps from the "
                 f"clean baseline, then restart live mode."
             )
@@ -448,11 +593,34 @@ class AnomalyDetector:
         contributions_df: pd.DataFrame | None = None
         try:
             scores_df, flags_df = detector.fit_score_detect(
-                y_true_train=train_true_df,
-                y_pred_train=train_pred_df,
-                y_true_test=test_true_df,
-                y_pred_test=test_pred_df,
+                y_true_train=fit_true_df,
+                y_pred_train=fit_pred_df,
+                y_true_test=eval_true_df,
+                y_pred_test=eval_pred_df,
             )
+            # Override the upstream normalized score so 1.0 lines up with the
+            # actual detection threshold. Two upstream issues motivate this:
+            #   1. spotanomaly2_safe.ForecastingAnomalyDetector.score_and_detect()
+            #      refits the normalizer on the *test* window, which collapses
+            #      the range in short/quiet live batches and pushes ordinary
+            #      scores to ~1.0.
+            #   2. Even when refit on the train window, the normalizer saturates
+            #      at q_high(train) + 20% — which is unrelated to the detection
+            #      threshold (train q_high_detect). So values below the anomaly
+            #      flag could still show normalized=1.0.
+            # Anchor the upper bound at the train-fitted detection threshold so
+            # that normalized == 1.0 iff the point is at/above the anomaly flag.
+            train_threshold = getattr(getattr(detector, "detector", None), "threshold", None)
+            train_q_low = getattr(getattr(detector, "normalizer", None), "q_low", None)
+            if (
+                "anomaly_score_normalized" in scores_df.columns
+                and train_threshold is not None
+                and train_q_low is not None
+                and train_threshold > train_q_low
+            ):
+                raw = scores_df["anomaly_score"].to_numpy()
+                normalized = (raw - train_q_low) / (train_threshold - train_q_low)
+                scores_df["anomaly_score_normalized"] = np.clip(normalized, 0.0, 1.0)
         except ValueError as exc:
             self.logger.warning(
                 f"Panel {panel_id}: scoring failed ({exc}); returning NaN scores and no flags for this panel"
@@ -462,30 +630,52 @@ class AnomalyDetector:
                     "anomaly_score": np.nan,
                     "anomaly_score_normalized": np.nan,
                 },
-                index=test_true_df.index,
+                index=eval_true_df.index,
             )
             flags_df = pd.DataFrame(
                 {
                     "anomaly_flag": 0,
                 },
-                index=test_true_df.index,
+                index=eval_true_df.index,
             )
+
+        # --- Per-channel detection (complement to combined scorer) ---
+        pc_cfg = self.config.get("detect", {}).get("per_channel", {})
+        per_channel_results: dict[str, pd.DataFrame] | None = None
+        if pc_cfg.get("enabled", False):
+            try:
+                per_channel_results = self._detect_per_channel(
+                    panel_id=panel_id,
+                    fit_true_df=fit_true_df,
+                    fit_pred_df=fit_pred_df,
+                    eval_true_df=eval_true_df,
+                    eval_pred_df=eval_pred_df,
+                )
+            except Exception as exc:
+                self.logger.warning(f"Panel {panel_id}: per-channel detection failed ({exc}); skipping")
 
         if scores_df.index.tz is None:
             scores_df.index = scores_df.index.tz_localize("UTC")
             flags_df.index = flags_df.index.tz_localize("UTC")
-            test_pred_df.index = test_pred_df.index.tz_localize("UTC")
+            report_pred_df.index = report_pred_df.index.tz_localize("UTC")
             if contributions_df is not None:
                 contributions_df.index = contributions_df.index.tz_localize("UTC")
+            if per_channel_results is not None:
+                for key in ("scores", "flags", "flags_combined"):
+                    if key in per_channel_results:
+                        per_channel_results[key].index = per_channel_results[key].index.tz_localize("UTC")
 
         num_anomalies = flags_df.sum().sum()
         self.logger.info(f"Detected {num_anomalies} anomalies for panel {panel_id}")
 
-        return scores_df, flags_df, test_pred_df, contributions_df
+        return scores_df, flags_df, report_pred_df, contributions_df, per_channel_results
 
     def detect_all_panels(
         self, panel_data: dict[str, pd.DataFrame]
-    ) -> dict[str, tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame | None]]:
+    ) -> dict[
+        str,
+        tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame | None, dict[str, pd.DataFrame] | None],
+    ]:
         results = {}
         for panel_id, df in panel_data.items():
             self.logger.info(f"Detecting anomalies for panel {panel_id}...")
@@ -496,7 +686,10 @@ class AnomalyDetector:
 
     def run(
         self, panel_data: dict[str, pd.DataFrame]
-    ) -> dict[str, tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame | None]]:
+    ) -> dict[
+        str,
+        tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame | None, dict[str, pd.DataFrame] | None],
+    ]:
         self.logger.info("Starting anomaly detection...")
         results = self.detect_all_panels(panel_data)
         self.logger.info("Anomaly detection completed successfully")

@@ -94,7 +94,7 @@ class Pipeline:
 
         return True
 
-    def _check_current_anomalies(self, results: dict[str, tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]]) -> None:
+    def _check_current_anomalies(self, results: dict[str, tuple]) -> None:
         """Check and report anomalies at the current (latest) timestamp."""
         self.logger.info("")
         self.logger.info("=" * 70)
@@ -103,7 +103,7 @@ class Pipeline:
 
         any_anomalies = False
 
-        for panel_id, (scores_df, flags_df, forecast_df, *_rest) in results.items():
+        for panel_id, (scores_df, flags_df, forecast_df, _contrib, *_rest) in results.items():
             if len(flags_df) == 0:
                 continue
 
@@ -302,6 +302,8 @@ class Pipeline:
         self.logger.info(f"Results saved to: {results_dir}")
         self.logger.info("=" * 70)
 
+        tuner.update_channel_configs(all_results)
+
         return all_results
 
     def detect(self) -> None:
@@ -366,7 +368,7 @@ class Pipeline:
         self.logger.info("Pipeline completed successfully")
         self.logger.info("=" * 60)
 
-    def live(self) -> dict[str, tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]]:
+    def live(self) -> dict[str, tuple]:
         """Live prediction: download new data, process, detect with existing model."""
         self.logger.info("=" * 60)
         self.logger.info("LIVE PREDICTION MODE")

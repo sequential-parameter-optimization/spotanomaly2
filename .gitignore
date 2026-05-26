@@ -218,6 +218,7 @@ data/evaluations
 data/tuning
 data/exogenous
 data/weather
+data/tuning_results
 config/*
 !config/default.yaml
 !config/channel_models/
@@ -231,3 +232,5 @@ config/channel_models/*
 *_files/
 
 catboost_info
+CLAUDE.md
+.claude
