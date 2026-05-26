@@ -46,6 +46,7 @@ dependencies = [
     "spotanomaly2_safe",
     "spotforecast2",
     "spotforecast2-safe",
+    "spotoptim>=0.0.160",
     "catboost>=1.2.10",
 ]
 
