@@ -18,6 +18,7 @@ from spotanomaly2.infrastructure import logging
 warnings.filterwarnings("ignore", message=".*does not have valid feature names.*")
 warnings.filterwarnings("ignore", message=".*TimeSeries with tz.*")
 warnings.filterwarnings("ignore", message=".*Failed to set device parameter.*")
+warnings.filterwarnings("ignore", message=".*One-step-ahead predictions are used.*")
 
 
 def build_parser() -> argparse.ArgumentParser:

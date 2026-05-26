@@ -1,10 +1,23 @@
-"""Test the SpotforecastTrainer adapter using the MultiTask-based API."""
+"""Tests for the spotforecast2 adapter (trainer + tuner)."""
 
+import copy
+from pathlib import Path
+
+import joblib
 import numpy as np
 import pandas as pd
 import pytest
 
-from spotanomaly2.domain.spotforecast_adapter import SpotforecastTrainer
+from spotanomaly2.domain.spotforecast_adapter import (
+    _NAN_PENALTY,
+    KernelRidgeApprox,
+    SpotforecastTrainer,
+    SpotforecastTuner,
+    SVRApprox,
+    _build_estimator,
+    _build_nan_safe_metric,
+    _create_forecaster,
+)
 
 
 @pytest.fixture
@@ -31,19 +44,6 @@ class TestSpotforecastTrainer:
         assert adapter is not None
         assert adapter.config is not None
 
-    def test_create_multitask(self, adapter, tmp_path):
-        mt = adapter._create_multitask("test", n_lags=6, cache_home=tmp_path)
-        assert mt is not None
-        assert mt.TASK == "lazy"
-        assert mt.config.use_exogenous_features is False
-
-    def test_create_multitask_forecaster(self, adapter, tmp_path):
-        mt = adapter._create_multitask("test", n_lags=6, cache_home=tmp_path)
-        forecaster = mt.create_forecaster()
-        assert forecaster is not None
-        assert hasattr(forecaster, "fit")
-        assert hasattr(forecaster, "predict")
-
     def test_train_panel_returns_eval_df(self, adapter, panel_df, tmp_path):
         adapter.config["paths"]["models_dir"] = str(tmp_path)
         eval_df, timestamp = adapter.train_panel("test", panel_df)
@@ -56,18 +56,13 @@ class TestSpotforecastTrainer:
 
     def test_predict_returns_dataframe(self, adapter, panel_df, tmp_path):
         adapter.config["paths"]["models_dir"] = str(tmp_path)
-        eval_df, timestamp = adapter.train_panel("test", panel_df)
-
-        from pathlib import Path
-
-        import joblib
+        _, timestamp = adapter.train_panel("test", panel_df)
 
         model_path = Path(tmp_path) / timestamp / "LightGBM_fc_model_panel_test.pkl"
         model_data = joblib.load(model_path)
 
         test_slice = panel_df.iloc[-30:]
         history_slice = panel_df.iloc[:-30]
-
         pred_df = adapter.predict(model_data, test_slice, history_df=history_slice)
 
         assert isinstance(pred_df, pd.DataFrame)
@@ -79,17 +74,671 @@ class TestSpotforecastTrainer:
         adapter.config["paths"]["models_dir"] = str(tmp_path)
         _, timestamp = adapter.train_panel("test", panel_df)
 
-        from pathlib import Path
+        model_path = Path(tmp_path) / timestamp / "LightGBM_fc_model_panel_test.pkl"
+        model_data = joblib.load(model_path)
 
-        import joblib
+        for key in ("forecasters", "n_lags", "target_cols", "exog_columns", "model_type"):
+            assert key in model_data
+        assert model_data["model_type"] == "spotforecast2_lightgbm"
+        assert set(model_data["target_cols"]) == {"sensor_a", "sensor_b"}
+
+    def test_train_eval_uses_one_step_ahead_for_long_horizons(self, sample_config, tmp_path):
+        """Train-eval MAE for non-tree models must reflect one-step-ahead
+        accuracy on real lags, not recursive divergence over the full test
+        window. Recursive ``forecaster.predict(steps=N)`` on a kernel-style
+        regressor cascades beyond the data range within a few hundred steps;
+        one-step-ahead stays close to the noise floor.
+        """
+        rng = np.random.default_rng(0)
+        n = 2000  # 1800 train / 200 test under default 0.9 ratio
+        idx = pd.date_range("2026-01-01", periods=n, freq="5min")
+        seasonal = 50 * np.sin(np.arange(n) / 100)
+        drift = np.linspace(0, 30, n)
+        noise = rng.standard_normal(n) * 5
+        y = 100 + seasonal + drift + noise
+        df = pd.DataFrame({"sensor_a": y}, index=idx)
+
+        channel_cfg = tmp_path / "panel_test.yaml"
+        channel_cfg.write_text("default:\n  model: SVRApprox\n  params: {n_components: 256, C: 1.0}\n")
+
+        config = copy.deepcopy(sample_config)
+        config["paths"]["models_dir"] = str(tmp_path)
+        config["train"]["channel_config_files"] = {"test": str(channel_cfg)}
+
+        adapter = SpotforecastTrainer(config)
+        eval_df, _ = adapter.train_panel("test", df)
+
+        mae = float(eval_df.loc["sensor_a", "mae"])
+        # One-step-ahead on this signal should land near the ~5 noise floor;
+        # recursive predict over 200 steps would drift far beyond 30.
+        assert mae < 15.0, f"Train eval MAE looks recursive (got {mae:.3f})"
+
+    def test_per_channel_models_are_applied(self, adapter, panel_df, tmp_path):
+        """Per-channel YAML overrides must reach the fitted estimators and the saved metadata."""
+        from sklearn.linear_model import Ridge
+
+        channel_cfg_path = tmp_path / "panel_test.yaml"
+        channel_cfg_path.write_text(
+            "default:\n"
+            "  model: LightGBM\n"
+            "channels:\n"
+            "  sensor_a:\n"
+            "    model: SVRApprox\n"
+            "    params: {n_components: 64, C: 0.5}\n"
+            "  sensor_b:\n"
+            "    model: Ridge\n"
+            "    params: {alpha: 1.0}\n"
+        )
+        adapter.config["paths"]["models_dir"] = str(tmp_path)
+        adapter.config["train"]["channel_config_files"] = {"test": str(channel_cfg_path)}
+
+        _, timestamp = adapter.train_panel("test", panel_df)
 
         model_path = Path(tmp_path) / timestamp / "LightGBM_fc_model_panel_test.pkl"
         model_data = joblib.load(model_path)
 
-        assert "forecasters" in model_data
-        assert "n_lags" in model_data
-        assert "target_cols" in model_data
-        assert "exog_columns" in model_data
-        assert "model_type" in model_data
-        assert model_data["model_type"] == "spotforecast2_lightgbm"
-        assert set(model_data["target_cols"]) == {"sensor_a", "sensor_b"}
+        assert model_data["model_type"] == "spotforecast2_multi"
+        assert model_data["model_name"] == "Multi"
+        assert model_data["channel_models"]["sensor_a"]["model"] == "SVRApprox"
+        assert model_data["channel_models"]["sensor_b"]["model"] == "Ridge"
+        assert isinstance(model_data["forecasters"]["sensor_a"].estimator, SVRApprox)
+        assert isinstance(model_data["forecasters"]["sensor_b"].estimator, Ridge)
+
+
+SUPPORTED_MODELS = [
+    "LightGBM",
+    "XGBoost",
+    "CatBoost",
+    "Ridge",
+    "ElasticNet",
+    "Lasso",
+    "BayesianRidge",
+    "Huber",
+    "KernelRidgeApprox",
+    "SVRApprox",
+    "MLP",
+]
+
+NON_TREE_MODELS = [
+    "Ridge",
+    "ElasticNet",
+    "Lasso",
+    "BayesianRidge",
+    "Huber",
+    "KernelRidgeApprox",
+    "SVRApprox",
+    "MLP",
+]
+
+
+class TestBuildEstimator:
+    """Direct tests for the model-name → sklearn estimator factory."""
+
+    @pytest.mark.parametrize("name", SUPPORTED_MODELS)
+    def test_build_returns_fittable_estimator(self, name):
+        estimator = _build_estimator(name, {}, random_seed=42)
+        assert hasattr(estimator, "fit")
+        assert hasattr(estimator, "predict")
+
+    def test_unsupported_model_raises(self):
+        with pytest.raises(ValueError, match="Unsupported model"):
+            _build_estimator("not_a_real_model", {}, random_seed=42)
+
+    def test_unsupported_params_are_filtered(self):
+        """Passing a kwarg that the base class does not support must not error."""
+        estimator = _build_estimator(
+            "ElasticNet",
+            {"alpha": 0.5, "definitely_not_a_param": 123},
+            random_seed=42,
+        )
+        assert estimator.alpha == 0.5
+
+
+class TestCreateForecaster:
+    """Verify the ForecasterRecursive helper plumbs scaling correctly."""
+
+    @pytest.mark.parametrize("name", NON_TREE_MODELS)
+    def test_non_tree_models_get_transformer_y(self, name):
+        """Scale-sensitive models must receive a StandardScaler on the target."""
+        forecaster = _create_forecaster(name, {}, n_lags=6, has_exog=False)
+        assert forecaster.transformer_y is not None
+        assert forecaster.transformer_exog is None
+
+    @pytest.mark.parametrize("name", NON_TREE_MODELS)
+    def test_non_tree_models_get_transformer_exog_when_exog_present(self, name):
+        forecaster = _create_forecaster(name, {}, n_lags=6, has_exog=True)
+        assert forecaster.transformer_y is not None
+        assert forecaster.transformer_exog is not None
+
+    @pytest.mark.parametrize("name", ["LightGBM", "XGBoost", "CatBoost"])
+    def test_tree_models_skip_transformers(self, name):
+        """Tree models don't need scaling — leaving transformers unset keeps fits cheap."""
+        forecaster = _create_forecaster(name, {}, n_lags=6, has_exog=True)
+        assert forecaster.transformer_y is None
+        assert forecaster.transformer_exog is None
+
+    @pytest.mark.parametrize(
+        "name,kwargs",
+        [
+            ("ElasticNet", {"alpha": 0.01, "l1_ratio": 0.5}),
+            ("Lasso", {"alpha": 0.01}),
+            ("BayesianRidge", {}),
+            ("Huber", {"alpha": 0.001, "epsilon": 1.5}),
+        ],
+    )
+    def test_recursive_predict_stays_in_range_for_linear_models(self, name, kwargs):
+        """Regression test for the LinearModel-bypass overflow.
+
+        Without ``transformer_y``, ForecasterRecursive's fast path
+        ``np.dot(X_raw, coef_) + intercept_`` cascades to ±inf within a few
+        recursive steps when channel scales differ from the fitted-coef scale.
+        With spotforecast2's native ``transformer_y`` / ``transformer_exog``
+        in place, predictions stay finite and in the data's range.
+        """
+        rng = np.random.default_rng(0)
+        n = 600
+        y = pd.Series(
+            100 + 20 * np.sin(np.arange(n) / 50) + rng.standard_normal(n) * 2,
+            index=pd.date_range("2026-01-01", periods=n, freq="5min"),
+            name="y",
+        )
+        forecaster = _create_forecaster(name, dict(kwargs), n_lags=24, has_exog=False)
+        forecaster.fit(y=y.iloc[:500])
+        pred = forecaster.predict(steps=20)
+
+        assert np.all(np.isfinite(pred.values))
+        # Values must stay in the same order of magnitude as the data.
+        assert pred.values.min() > 50
+        assert pred.values.max() < 200
+
+
+class TestSpotforecastTuner:
+    """Tune step must mirror train's feature topology + imputation handling."""
+
+    @pytest.fixture
+    def panel_df_with_exogenous(self):
+        rng = np.random.default_rng(0)
+        n = 400
+        idx = pd.date_range("2026-01-01", periods=n, freq="5min")
+        return pd.DataFrame(
+            {
+                "sensor_a": rng.standard_normal(n) + 10,
+                "sensor_b": rng.standard_normal(n) + 20,
+                "exogenous_zulauf": rng.standard_normal(n) + 5,
+            },
+            index=idx,
+        )
+
+    def _tune_config(self):
+        return {
+            "n_trials": 3,
+            "n_initial": 2,
+            "metric": "mean_absolute_error",
+            "models": ["LightGBM"],
+            "model_search_spaces": {"LightGBM": {"num_leaves": [8, 31]}},
+        }
+
+    def test_tune_treats_exogenous_columns_as_exog_not_targets(self, sample_config, panel_df_with_exogenous):
+        """Train fits with `exogenous_*` as features. Tune must do the same so
+        the hyperparameters it picks are optimal for the model train will
+        actually fit."""
+        config = copy.deepcopy(sample_config)
+        config["train"]["lags"] = 6
+        tuner = SpotforecastTuner(config)
+        results = tuner.tune_panel("test", panel_df_with_exogenous, self._tune_config())
+
+        assert "sensor_a" in results
+        assert "sensor_b" in results
+        assert "exogenous_zulauf" not in results, "exogenous_* columns must be exog features, not tuning targets"
+
+    def test_tune_uses_full_data_no_outer_holdout(self, sample_config):
+        """The tuner must use ALL the rows it's given — no outer 90/10 split
+        that quietly discards the most recent timeline window. The discarded
+        slice is exactly where distribution drift toward live conditions
+        shows up; chopping it off makes the CV blind to that drift and lets
+        constant-mean predictors tie real models.
+
+        Sentinel check: tune on N rows and assert the configured CV holdout
+        matches what production code uses. If a future change re-introduces
+        the outer split, the CV won't see the latest N×20% rows and this
+        test will catch it.
+        """
+        rng = np.random.default_rng(0)
+        n = 400
+        idx = pd.date_range("2026-01-01", periods=n, freq="5min")
+        y = np.zeros(n)
+        for t in range(1, n):
+            y[t] = 0.9 * y[t - 1] + rng.standard_normal() * 0.1
+        df = pd.DataFrame({"sensor_a": y + 10.0}, index=idx)
+
+        config = copy.deepcopy(sample_config)
+        config["train"]["lags"] = 6
+        tuner = SpotforecastTuner(config)
+        # Capture the OneStepAheadFold that the tuner actually builds.
+        from spotforecast2.model_selection import OneStepAheadFold
+
+        captured: dict = {}
+        real_init = OneStepAheadFold.__init__
+
+        def spy(self, *args, **kwargs):
+            captured["initial_train_size"] = kwargs.get("initial_train_size", args[0] if args else None)
+            return real_init(self, *args, **kwargs)
+
+        OneStepAheadFold.__init__ = spy
+        try:
+            tuner.tune_panel(
+                "test",
+                df,
+                {
+                    "n_trials": 3,
+                    "n_initial": 2,
+                    "metric": "r2",
+                    "models": ["Ridge"],
+                    "model_search_spaces": {"Ridge": {"alpha": (0.001, 10.0, "log10")}},
+                },
+            )
+        finally:
+            OneStepAheadFold.__init__ = real_init
+
+        # initial_train_size should be 80% of the FULL n, not 70% of an outer-
+        # split 90%. The val window is therefore the last 20% of df.
+        assert captured["initial_train_size"] == int(n * 0.8), (
+            f"Tuner CV is splitting the wrong number of rows. Expected "
+            f"initial_train_size={int(n * 0.8)} (80% of all {n} rows); got "
+            f"{captured['initial_train_size']}. A regressed outer 90/10 split "
+            "would yield ~252 instead, hiding the latest timeline from CV."
+        )
+
+    def test_tune_uses_one_step_ahead_cv_on_autocorrelated_data(self, sample_config):
+        """The tuner must score trials on one-step-ahead predictions (matching
+        production), not multi-step recursive backtest. Recursive backtest
+        cascade-diverges over thousands of steps for non-tree models and
+        rewards trivial-mean predictors as "least bad".
+
+        Regression check: on a strongly autocorrelated AR(1) series, lag-1
+        achieves R² ≈ 0.99. The tuner must report an R² well above 0 — under
+        the old recursive CV this would have been catastrophically negative.
+        """
+        rng = np.random.default_rng(0)
+        # AR(1) with phi=0.95 → lag-1 explains ~90% of variance.
+        n = 500
+        idx = pd.date_range("2026-01-01", periods=n, freq="5min")
+        y = np.zeros(n)
+        for t in range(1, n):
+            y[t] = 0.95 * y[t - 1] + rng.standard_normal() * 0.1
+        df = pd.DataFrame({"sensor_a": y + 10.0}, index=idx)
+
+        config = copy.deepcopy(sample_config)
+        config["train"]["lags"] = 6
+        # This test specifically targets the raw-target R² behaviour. Under
+        # differentiation the target is Δy, whose variance for an AR(1)
+        # process is dominated by noise → R²(Δy) ≈ 0.025 even with a
+        # perfect lag-1 weight. That doesn't disprove one-step-ahead CV,
+        # so disable differentiation here and let R²(raw y) be the signal.
+        config["train"]["differentiation"] = 0
+        tuner = SpotforecastTuner(config)
+        tune_config = {
+            "n_trials": 5,
+            "n_initial": 3,
+            "metric": "r2",
+            "models": ["Ridge"],
+            "model_search_spaces": {"Ridge": {"alpha": (0.001, 10.0, "log10")}},
+        }
+        results = tuner.tune_panel("test", df, tune_config)
+
+        # negated R² → -1 = perfect, 0 = constant-mean baseline, +∞ = catastrophic.
+        # With one-step-ahead CV on AR(1), Ridge should land well below -0.5.
+        # With the old recursive CV this was wildly positive (R² ≪ 0).
+        assert results["sensor_a"]["best_metric"] < -0.5, (
+            f"Tuner is not using one-step-ahead CV — got metric "
+            f"{results['sensor_a']['best_metric']:.3f}, expected < -0.5"
+        )
+
+    def test_tuner_r2_matches_production_r2_under_differentiation(self, sample_config):
+        """Under differentiation, the tuner's reported R² must match what
+        production / live mode reports for the *same* forecaster on the
+        *same* val window. Same numerator (residuals), same denominator
+        (Var(raw y)) — no more "tuner says 0.31, prod shows 0.91" gaps.
+
+        Tested both with and without ``transformer_y`` (Ridge has it,
+        LightGBM doesn't) — the metric must recover the scaler's σ
+        exactly so scaled residuals integrate back to the right raw
+        magnitude before R² is computed.
+        """
+        from sklearn.linear_model import Ridge
+        from sklearn.metrics import r2_score
+        from sklearn.preprocessing import StandardScaler
+        from spotforecast2.model_selection import OneStepAheadFold
+        from spotforecast2_safe.forecaster.recursive import ForecasterRecursive
+        from spotforecast2_safe.forecaster.utils import transform_numpy
+
+        from spotanomaly2.domain.spotforecast_adapter import (
+            _build_raw_r2_under_differentiation,
+            _difference,
+            _integrate_one_step,
+        )
+
+        rng = np.random.default_rng(0)
+        n = 800
+        idx = pd.date_range("2026-01-01", periods=n, freq="5min")
+        y = np.zeros(n)
+        for t in range(1, n):
+            y[t] = 0.95 * y[t - 1] + rng.standard_normal() * 0.5
+        y += 50.0
+        s = pd.Series(y, index=idx, name="y")
+        s_diff = _difference(s, 1).dropna()
+        fit_size = int(len(s_diff) * 0.8)
+        cv = OneStepAheadFold(initial_train_size=fit_size, verbose=False)
+
+        def production_r2(needs_scaling: bool) -> float:
+            """Mirror the predict() / detect() path exactly."""
+            fc = ForecasterRecursive(
+                estimator=Ridge(alpha=0.5),
+                lags=6,
+                transformer_y=StandardScaler() if needs_scaling else None,
+            )
+            fc.fit(y=s_diff.iloc[:fit_size])
+            x, y_tgt = fc.create_train_X_y(y=s_diff)
+            preds = fc.estimator.predict(x)
+            if fc.transformer_y is not None:
+                preds = transform_numpy(
+                    np.asarray(preds, dtype=float),
+                    fc.transformer_y,
+                    fit=False,
+                    inverse_transform=True,
+                )
+            preds_diff = pd.Series(preds, index=y_tgt.index)
+            val_idx = s_diff.iloc[fit_size:].index
+            abs_preds = _integrate_one_step(preds_diff.loc[val_idx], s, 1).dropna()
+            return float(r2_score(s.reindex(abs_preds.index), abs_preds))
+
+        def tuner_r2(needs_scaling: bool) -> float:
+            """Drive the metric through ``spotoptim_search_forecaster`` —
+            the actual code path the tuner uses. That path strips the
+            index off ``y_true``/``y_train`` (passes ndarrays), so the
+            metric MUST handle that case correctly. Using
+            ``backtesting_forecaster`` here would mask a regression
+            because it passes Series with intact ``.index``.
+            """
+            from spotforecast2.model_selection import spotoptim_search_forecaster
+
+            fc = ForecasterRecursive(
+                estimator=Ridge(),
+                lags=6,
+                transformer_y=StandardScaler() if needs_scaling else None,
+            )
+            new_metric = _build_raw_r2_under_differentiation(s)
+            results, _ = spotoptim_search_forecaster(
+                forecaster=fc,
+                y=s_diff,
+                cv=cv,
+                search_space={"alpha": (0.4, 0.6, "log10")},
+                metric=new_metric,
+                return_best=True,
+                random_state=42,
+                verbose=False,
+                n_trials=3,
+                n_initial=2,
+                show_progress=False,
+            )
+            return -float(results["r2_raw_after_integration"].iloc[0])
+
+        # Ridge — scaled path (StandardScaler on Δy target). Match should
+        # be within reporting precision (<0.001 R²): only the scaler's σ
+        # recovery + spotforecast2's window_size trimming separate the two.
+        prod_scaled = production_r2(needs_scaling=True)
+        tune_scaled = tuner_r2(needs_scaling=True)
+        assert abs(tune_scaled - prod_scaled) < 1e-3, (
+            f"Tuner R² (scaled) drifted from production: tuner={tune_scaled:.6f}, prod={prod_scaled:.6f}"
+        )
+
+        # Ridge without transformer_y — same R² formula in either space,
+        # so the only remaining gap is backtesting's internal window
+        # accounting. Still well under 0.001 R².
+        prod_raw = production_r2(needs_scaling=False)
+        tune_raw = tuner_r2(needs_scaling=False)
+        assert abs(tune_raw - prod_raw) < 1e-3, (
+            f"Tuner R² (raw) drifted from production: tuner={tune_raw:.6f}, prod={prod_raw:.6f}"
+        )
+
+    def test_differentiation_closes_the_trivial_mean_trap(self, sample_config, tmp_path):
+        """End-to-end: under differentiation, a degenerate hyperparameter
+        config that previously collapsed to ``mean(y_train)`` at live time
+        instead reduces to the lag-1 baseline at live time.
+
+        We deliberately fit XGBoost with the *exact* parameter signature that
+        kept winning the tuner historically — tiny ``learning_rate`` × few
+        ``n_estimators`` × heavy reg — on a time-series that drifts away
+        from the training mean. Without differentiation the prediction
+        collapses to a near-constant ``base_score = mean(y_train)``, scoring
+        wildly negative R² on live. With differentiation the same params
+        produce ``y_pred[t] ≈ y[t-1]`` after one-step integration, scoring
+        comfortably positive R² on live."""
+        rng = np.random.default_rng(0)
+        n = 1200
+        idx = pd.date_range("2026-01-01", periods=n, freq="5min")
+        # AR(1) with a slow drift — the live period (last 10%) is offset
+        # several σ below the training mean, exactly like cdp20.1.
+        y = np.zeros(n)
+        for t in range(1, n):
+            y[t] = 0.95 * y[t - 1] + rng.standard_normal() * 0.5
+        y += 50.0
+        y[int(n * 0.9) :] -= 7.0
+        df = pd.DataFrame({"sensor_a": y}, index=idx)
+
+        # Force the degenerate XGBoost config that was winning before.
+        degenerate_yaml = tmp_path / "panel_test.yaml"
+        degenerate_yaml.write_text(
+            "default:\n  model: XGBoost\n  params:\n"
+            "    n_estimators: 100\n    learning_rate: 0.001\n"
+            "    max_depth: 8\n    reg_alpha: 50.0\n    reg_lambda: 50.0\n"
+        )
+
+        def _train_and_score(diff_order: int) -> float:
+            cfg = copy.deepcopy(sample_config)
+            cfg["paths"]["models_dir"] = str(tmp_path / f"models_diff{diff_order}")
+            cfg["train"]["channel_config_files"] = {"test": str(degenerate_yaml)}
+            cfg["train"]["differentiation"] = diff_order
+            cfg["train"]["train_ratio"] = 0.9
+            cfg["train"]["lags"] = 6
+            trainer = SpotforecastTrainer(cfg)
+            _, ts = trainer.train_panel("test", df)
+            model_data = joblib.load(Path(cfg["paths"]["models_dir"]) / ts / "LightGBM_fc_model_panel_test.pkl")
+            n_local = len(df)
+            test_slice = df.iloc[int(n_local * 0.9) :]
+            history = df.iloc[: int(n_local * 0.9)]
+            preds = trainer.predict(model_data, test_slice, history_df=history)
+            pred = preds["sensor_a"].dropna()
+            truth = test_slice["sensor_a"].reindex(pred.index).dropna()
+            pred = pred.reindex(truth.index)
+            from sklearn.metrics import r2_score
+
+            return float(r2_score(truth, pred))
+
+        r2_raw = _train_and_score(diff_order=0)
+        r2_diff = _train_and_score(diff_order=1)
+
+        # Without differentiation, the degenerate model collapses to the
+        # training mean and scores catastrophically negative on the shifted
+        # live window.
+        assert r2_raw < 0.0, (
+            f"Sanity: the degenerate XGBoost config should fail without differentiation, but live R² = {r2_raw:+.3f}"
+        )
+        # With differentiation, the same params can't go below the lag-1
+        # baseline. For AR(1)+drift, lag-1 R² is well above 0.
+        assert r2_diff > 0.5, (
+            f"Differentiation should pin the live floor near the lag-1 baseline (R² ≫ 0), but got {r2_diff:+.3f}"
+        )
+
+    def test_tune_skips_imputed_rows_via_weight_func(self, sample_config, panel_df_with_exogenous):
+        """When `exclude_imputed_training_samples=True`, tune must zero out
+        imputed rows during the search just like train does, so the tuned
+        score reflects the same effective training set."""
+        df = panel_df_with_exogenous.copy()
+        df["sensor_a__weight"] = 1.0
+        # Mark a window of rows as imputed.
+        df.loc[df.index[100:200], "sensor_a__weight"] = 0.0
+
+        config = copy.deepcopy(sample_config)
+        config["train"]["lags"] = 6
+        config["train"]["exclude_imputed_training_samples"] = True
+
+        tuner = SpotforecastTuner(config)
+        results = tuner.tune_panel("test", df, self._tune_config())
+
+        # Search must complete (no skip) and produce a finite metric — meaning
+        # the masked rows shrank the effective set without breaking SpotOptim.
+        assert "sensor_a" in results
+        assert "error" not in results["sensor_a"]
+        assert results["sensor_a"]["best_metric"] is not None
+        assert np.isfinite(results["sensor_a"]["best_metric"])
+
+
+class TestNystroemApprox:
+    """Nyström-backed variants are the only kernel models in the project;
+    they replace the exact RBF SVR / KernelRidge that needed a row cap."""
+
+    def test_exact_kernel_models_are_no_longer_supported(self):
+        """Exact RBF SVR / KernelRidge were removed because their N×N Gram
+        matrix forces a row cap that biases tuning and degrades production
+        predictions. ``_build_estimator`` must reject them."""
+        with pytest.raises(ValueError, match="Unsupported model"):
+            _build_estimator("SVR", {}, random_seed=0)
+        with pytest.raises(ValueError, match="Unsupported model"):
+            _build_estimator("KernelRidge", {}, random_seed=0)
+
+    def test_kernel_ridge_approx_fits_and_predicts(self):
+        rng = np.random.default_rng(0)
+        n = 200
+        x = rng.standard_normal((n, 4))
+        y = np.sin(x[:, 0]) + 0.5 * x[:, 1] + rng.standard_normal(n) * 0.05
+
+        est = KernelRidgeApprox(n_components=64, gamma=0.5, alpha=0.1, random_state=0)
+        est.fit(x, y)
+        preds = est.predict(x)
+        assert preds.shape == (n,)
+        # MAE should be small on a smooth signal — Nyström approximates the
+        # exact KernelRidge well at this n_components.
+        assert float(np.mean(np.abs(preds - y))) < 0.5
+
+    def test_svr_approx_fits_and_predicts(self):
+        rng = np.random.default_rng(0)
+        n = 200
+        x = rng.standard_normal((n, 4))
+        y = np.sin(x[:, 0]) + 0.5 * x[:, 1] + rng.standard_normal(n) * 0.05
+
+        est = SVRApprox(n_components=64, gamma=0.5, C=1.0, epsilon=0.05, random_state=0)
+        est.fit(x, y)
+        preds = est.predict(x)
+        assert preds.shape == (n,)
+        assert float(np.mean(np.abs(preds - y))) < 0.5
+
+    def test_kernel_ridge_approx_honors_sample_weight(self):
+        """Ridge accepts sample_weight directly — zero-weight rows must not
+        steer the fit."""
+        rng = np.random.default_rng(0)
+        n = 300
+        x = rng.standard_normal((n, 2))
+        y = x[:, 0] + 0.1 * rng.standard_normal(n)
+        # Inject huge outliers in the second half, then mask them out.
+        y[150:] += 1000.0
+        sample_weight = np.ones(n)
+        sample_weight[150:] = 0.0
+
+        est = KernelRidgeApprox(n_components=64, gamma=0.5, alpha=0.1, random_state=0)
+        est.fit(x, y, sample_weight=sample_weight)
+
+        # Predictions on the (clean) first half should ignore the masked outliers.
+        preds = est.predict(x[:150])
+        assert float(np.mean(np.abs(preds - y[:150]))) < 0.5
+
+    def test_mlp_handles_zero_weight_rows(self):
+        """``MLPRegressor`` calls ``np.average(..., weights=sample_weight)``
+        inside its loss and a batch (or the early-stopping val slice) made
+        entirely of zero-weight rows raises *Weights sum to zero, can't be
+        normalized*. Our wrapper drops zero-weight rows up front so this
+        cannot happen, and the fit reflects only the kept rows."""
+        rng = np.random.default_rng(0)
+        n = 300
+        x = rng.standard_normal((n, 4))
+        y = x[:, 0] + 0.1 * rng.standard_normal(n)
+        # Add huge outliers and then mask them out via sample_weight.
+        y[150:] += 1000.0
+        sample_weight = np.ones(n)
+        sample_weight[150:] = 0.0
+
+        est = _build_estimator("MLP", {"hidden_layer_sizes": (16,), "max_iter": 200}, random_seed=0)
+        est.fit(x, y, sample_weight=sample_weight)
+
+        # The wrapper must have dropped the masked rows — predictions on the
+        # clean half should track the underlying y ≈ x[:, 0], not the +1000
+        # outliers. (~1.0 MAE leaves headroom for MLP noise; without the drop
+        # the fit either crashes or chases the outliers.)
+        preds = est.predict(x[:50])
+        assert float(np.mean(np.abs(preds - y[:50]))) < 1.0
+
+    def test_svr_approx_drops_zero_weight_rows(self):
+        """LinearSVR doesn't accept sample_weight; the wrapper must drop
+        zero-weight rows before fit so masking still works."""
+        rng = np.random.default_rng(0)
+        n = 300
+        x = rng.standard_normal((n, 2))
+        y = x[:, 0] + 0.1 * rng.standard_normal(n)
+        y[150:] += 1000.0
+        sample_weight = np.ones(n)
+        sample_weight[150:] = 0.0
+
+        est = SVRApprox(n_components=64, gamma=0.5, C=1.0, epsilon=0.05, random_state=0)
+        est.fit(x, y, sample_weight=sample_weight)
+
+        preds = est.predict(x[:150])
+        assert float(np.mean(np.abs(preds - y[:150]))) < 1.0
+
+
+class TestNanSafeMetric:
+    """The metric wrapper feeds SpotOptim a single scalar to *minimise*. R²
+    must therefore be negated, and any NaN/Inf trial must collapse to the
+    finite penalty so the GP surrogate doesn't crash."""
+
+    def test_mae_passes_through_lower_is_better(self):
+        metric = _build_nan_safe_metric("mae")
+        y_true = np.array([1.0, 2.0, 3.0, 4.0])
+        y_pred = np.array([1.1, 2.0, 2.9, 4.2])
+        # Plain MAE: positive, minimised when small.
+        assert metric(y_true, y_pred) == pytest.approx(0.1, abs=1e-9)
+
+    def test_r2_is_negated_so_minimiser_finds_better_fits(self):
+        metric = _build_nan_safe_metric("r2")
+        y_true = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+        # Perfect fit: r2_score = 1.0 → wrapper returns -1.0.
+        assert metric(y_true, y_true) == pytest.approx(-1.0, abs=1e-9)
+        # Constant-mean predictor: r2_score = 0 → wrapper returns 0.
+        # The trivial-mean trap that MAE/MSE fall into now sits *exactly*
+        # on the SpotOptim baseline; any real model with R² > 0 wins.
+        mean_pred = np.full_like(y_true, y_true.mean())
+        assert metric(y_true, mean_pred) == pytest.approx(0.0, abs=1e-9)
+
+    def test_r2_orders_real_fit_better_than_constant_predictor(self):
+        """The whole point of the switch: a model that tracks variation must
+        beat a constant predictor under the wrapped metric, even on
+        narrow-range targets where MAE would tie them."""
+        metric = _build_nan_safe_metric("r2")
+        y_true = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+        good_pred = y_true + 0.05  # slight bias, tracks variation
+        constant_pred = np.full_like(y_true, y_true.mean())
+        assert metric(y_true, good_pred) < metric(y_true, constant_pred)
+
+    def test_nan_predictions_become_finite_penalty(self):
+        """Divergent MLP / Bayesian trials must not poison the GP fit."""
+        metric_r2 = _build_nan_safe_metric("r2")
+        metric_mae = _build_nan_safe_metric("mae")
+        y_true = np.array([1.0, 2.0, 3.0, 4.0])
+        y_pred_nan = np.full_like(y_true, np.nan)
+        assert metric_r2(y_true, y_pred_nan) == _NAN_PENALTY
+        assert metric_mae(y_true, y_pred_nan) == _NAN_PENALTY
+
+    def test_unknown_metric_falls_through(self):
+        """Strings the wrapper doesn't recognise are returned verbatim so
+        spotforecast2 can resolve them itself."""
+        out = _build_nan_safe_metric("custom_unknown_metric")
+        assert out == "custom_unknown_metric"

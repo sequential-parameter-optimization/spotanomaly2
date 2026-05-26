@@ -257,9 +257,7 @@ class AnomalyDetector:
         eval_true_df = eval_true_df.multiply(eval_flow, axis=0)
         eval_pred_df = eval_pred_df.multiply(eval_flow, axis=0)
 
-        self.logger.info(
-            f"Panel {panel_id}: applied flow weighting using '{flow_col}' to residuals"
-        )
+        self.logger.info(f"Panel {panel_id}: applied flow weighting using '{flow_col}' to residuals")
 
         return fit_true_df, fit_pred_df, eval_true_df, eval_pred_df
 
@@ -372,8 +370,7 @@ class AnomalyDetector:
             first_ts = dropped_index.min()
             last_ts = dropped_index.max()
             self.logger.warning(
-                f"Panel {panel_id}: excluding {dropped_rows} invalid scorer-fit row(s) "
-                f"({first_ts} to {last_ts})"
+                f"Panel {panel_id}: excluding {dropped_rows} invalid scorer-fit row(s) ({first_ts} to {last_ts})"
             )
 
         fit_true_df = fit_true_df.loc[fit_keep_mask]
@@ -384,9 +381,89 @@ class AnomalyDetector:
 
         return fit_true_df, fit_pred_df, eval_true_df, eval_pred_df
 
+    # ------------------------------------------------------------------
+    # Per-channel detection
+    # ------------------------------------------------------------------
+
+    def _detect_per_channel(
+        self,
+        panel_id: str,
+        fit_true_df: pd.DataFrame,
+        fit_pred_df: pd.DataFrame,
+        eval_true_df: pd.DataFrame,
+        eval_pred_df: pd.DataFrame,
+    ) -> dict[str, pd.DataFrame]:
+        """Run per-channel quantile-based anomaly detection.
+
+        For each channel independently:
+        1. Compute absolute residuals.
+        2. Fit a quantile threshold on the training window.
+        3. Flag eval timestamps where the channel's residual exceeds its own threshold.
+
+        Returns a dict with keys:
+            "scores"  — DataFrame (n_eval, n_channels) of per-channel absolute residuals
+            "flags"   — DataFrame (n_eval, n_channels) of per-channel binary flags (0/1)
+            "thresholds" — DataFrame (1, n_channels) of fitted thresholds
+            "flags_combined" — DataFrame (n_eval, 1) with "per_channel_anomaly_flag"
+                               (1 if >= min_channels individual channels flagged)
+        """
+        pc_cfg = self.config.get("detect", {}).get("per_channel", {})
+        high_quantile = pc_cfg.get("high_quantile", 0.995)
+        min_channels = pc_cfg.get("min_channels", 1)
+        # Per-panel, per-channel quantile overrides (optional, scalar).
+        quantile_overrides = pc_cfg.get("quantile_overrides", {}).get(str(panel_id), {})
+
+        channels = fit_true_df.columns
+
+        # Absolute residuals
+        fit_residuals = (fit_true_df - fit_pred_df).abs()
+        eval_residuals = (eval_true_df - eval_pred_df).abs()
+
+        # Fit per-channel thresholds on the training window
+        thresholds = {}
+        for col in channels:
+            q = float(quantile_overrides.get(col, high_quantile))
+            col_residuals = fit_residuals[col].dropna()
+            col_residuals = col_residuals[np.isfinite(col_residuals)]
+            if len(col_residuals) == 0:
+                thresholds[col] = np.inf
+            else:
+                thresholds[col] = float(np.quantile(col_residuals, q))
+            if col in quantile_overrides:
+                self.logger.info(f"Panel {panel_id}: {col} q={q} → threshold={thresholds[col]:.4f}")
+
+        thresholds_df = pd.DataFrame(thresholds, index=["threshold"])
+
+        # Flag eval window
+        flags_dict = {}
+        for col in channels:
+            flags_dict[col] = (eval_residuals[col] > thresholds[col]).astype(int)
+        flags_df = pd.DataFrame(flags_dict, index=eval_true_df.index)
+
+        # Combined per-channel flag: at least min_channels must be flagged
+        channel_count = flags_df.sum(axis=1)
+        combined_flag = (channel_count >= min_channels).astype(int)
+        flags_combined_df = pd.DataFrame({"per_channel_anomaly_flag": combined_flag}, index=eval_true_df.index)
+
+        n_flagged = int(combined_flag.sum())
+        self.logger.info(
+            f"Panel {panel_id}: per-channel detection (q={high_quantile}, "
+            f"min_channels={min_channels}) flagged {n_flagged} timestamp(s)"
+        )
+        per_channel_flagged = {col: int(flags_df[col].sum()) for col in channels if flags_df[col].sum() > 0}
+        if per_channel_flagged:
+            self.logger.info(f"Panel {panel_id}: per-channel flags: {per_channel_flagged}")
+
+        return {
+            "scores": eval_residuals,
+            "flags": flags_df,
+            "thresholds": thresholds_df,
+            "flags_combined": flags_combined_df,
+        }
+
     def detect_panel(
         self, panel_id: str, df: pd.DataFrame
-    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame | None]:
+    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame | None, dict[str, pd.DataFrame] | None]:
         """Detect anomalies for a single panel."""
         self.logger.info(f"Detecting anomalies for panel {panel_id}...")
 
@@ -403,15 +480,11 @@ class AnomalyDetector:
         target_date = self.config["detect"].get("target_date", None)
 
         if target_date:
-            test_start_idx, test_end_idx = (
-                self._calculate_test_window_with_target_date(
-                    unseen_df, target_date, hist_window
-                )
+            test_start_idx, test_end_idx = self._calculate_test_window_with_target_date(
+                unseen_df, target_date, hist_window
             )
         else:
-            test_start_idx, test_end_idx = self._calculate_test_window_default(
-                unseen_df, hist_window
-            )
+            test_start_idx, test_end_idx = self._calculate_test_window_default(unseen_df, hist_window)
 
         test_start_idx, test_end_idx = self._adjust_window_for_insufficient_data(
             unseen_df, test_start_idx, test_end_idx, hist_window
@@ -428,7 +501,15 @@ class AnomalyDetector:
         self.logger.info(f"Scorer fit window: {len(scorer_fit_df)}, Scorer eval window: {len(scorer_eval_df)}")
 
         # Generate predictions via spotforecast2 adapter
-        self.logger.info(f"Generating predictions using {model_type} model...")
+        channel_models = model_data.get("channel_models") or {}
+        if channel_models:
+            from collections import Counter
+
+            counts = Counter(spec.get("model", "?") for spec in channel_models.values())
+            breakdown = ", ".join(f"{m}×{n}" for m, n in counts.most_common())
+            self.logger.info(f"Generating predictions ({model_type}; channels: {breakdown})...")
+        else:
+            self.logger.info(f"Generating predictions using {model_type} model...")
         adapter = SpotforecastTrainer(self.config, self.logger)
         history_for_fit_pred = history_df if len(history_df) > 0 else None
         fit_pred_df = adapter.predict(
@@ -517,6 +598,29 @@ class AnomalyDetector:
                 y_true_test=eval_true_df,
                 y_pred_test=eval_pred_df,
             )
+            # Override the upstream normalized score so 1.0 lines up with the
+            # actual detection threshold. Two upstream issues motivate this:
+            #   1. spotanomaly2_safe.ForecastingAnomalyDetector.score_and_detect()
+            #      refits the normalizer on the *test* window, which collapses
+            #      the range in short/quiet live batches and pushes ordinary
+            #      scores to ~1.0.
+            #   2. Even when refit on the train window, the normalizer saturates
+            #      at q_high(train) + 20% — which is unrelated to the detection
+            #      threshold (train q_high_detect). So values below the anomaly
+            #      flag could still show normalized=1.0.
+            # Anchor the upper bound at the train-fitted detection threshold so
+            # that normalized == 1.0 iff the point is at/above the anomaly flag.
+            train_threshold = getattr(getattr(detector, "detector", None), "threshold", None)
+            train_q_low = getattr(getattr(detector, "normalizer", None), "q_low", None)
+            if (
+                "anomaly_score_normalized" in scores_df.columns
+                and train_threshold is not None
+                and train_q_low is not None
+                and train_threshold > train_q_low
+            ):
+                raw = scores_df["anomaly_score"].to_numpy()
+                normalized = (raw - train_q_low) / (train_threshold - train_q_low)
+                scores_df["anomaly_score_normalized"] = np.clip(normalized, 0.0, 1.0)
         except ValueError as exc:
             self.logger.warning(
                 f"Panel {panel_id}: scoring failed ({exc}); returning NaN scores and no flags for this panel"
@@ -535,21 +639,43 @@ class AnomalyDetector:
                 index=eval_true_df.index,
             )
 
+        # --- Per-channel detection (complement to combined scorer) ---
+        pc_cfg = self.config.get("detect", {}).get("per_channel", {})
+        per_channel_results: dict[str, pd.DataFrame] | None = None
+        if pc_cfg.get("enabled", False):
+            try:
+                per_channel_results = self._detect_per_channel(
+                    panel_id=panel_id,
+                    fit_true_df=fit_true_df,
+                    fit_pred_df=fit_pred_df,
+                    eval_true_df=eval_true_df,
+                    eval_pred_df=eval_pred_df,
+                )
+            except Exception as exc:
+                self.logger.warning(f"Panel {panel_id}: per-channel detection failed ({exc}); skipping")
+
         if scores_df.index.tz is None:
             scores_df.index = scores_df.index.tz_localize("UTC")
             flags_df.index = flags_df.index.tz_localize("UTC")
             report_pred_df.index = report_pred_df.index.tz_localize("UTC")
             if contributions_df is not None:
                 contributions_df.index = contributions_df.index.tz_localize("UTC")
+            if per_channel_results is not None:
+                for key in ("scores", "flags", "flags_combined"):
+                    if key in per_channel_results:
+                        per_channel_results[key].index = per_channel_results[key].index.tz_localize("UTC")
 
         num_anomalies = flags_df.sum().sum()
         self.logger.info(f"Detected {num_anomalies} anomalies for panel {panel_id}")
 
-        return scores_df, flags_df, report_pred_df, contributions_df
+        return scores_df, flags_df, report_pred_df, contributions_df, per_channel_results
 
     def detect_all_panels(
         self, panel_data: dict[str, pd.DataFrame]
-    ) -> dict[str, tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame | None]]:
+    ) -> dict[
+        str,
+        tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame | None, dict[str, pd.DataFrame] | None],
+    ]:
         results = {}
         for panel_id, df in panel_data.items():
             self.logger.info(f"Detecting anomalies for panel {panel_id}...")
@@ -560,7 +686,10 @@ class AnomalyDetector:
 
     def run(
         self, panel_data: dict[str, pd.DataFrame]
-    ) -> dict[str, tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame | None]]:
+    ) -> dict[
+        str,
+        tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame | None, dict[str, pd.DataFrame] | None],
+    ]:
         self.logger.info("Starting anomaly detection...")
         results = self.detect_all_panels(panel_data)
         self.logger.info("Anomaly detection completed successfully")
