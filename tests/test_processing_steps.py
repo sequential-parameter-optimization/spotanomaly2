@@ -75,8 +75,8 @@ def test_manual_outlier_removal(sample_process_config):
     values[15] = 999  # above upper bound
     df = pd.DataFrame({"value": values}, index=idx)
 
-    step = ManualOutlierRemovalStep(sample_process_config, panel_id="1")
-    result = step.process(df)
+    step = ManualOutlierRemovalStep(sample_process_config)
+    result = step.process(df, panel_id="1")
 
     assert pd.isna(result["value"].iloc[5])
     assert pd.isna(result["value"].iloc[15])
@@ -318,90 +318,44 @@ def test_temperature_aggregation_ignores_weight_columns(sample_process_config):
 # ----- WeatherAdjustmentStep ------------------------------------------------
 
 
-def test_weather_adjustment_no_fetcher_passes_through(sample_process_config):
-    idx = pd.date_range("2025-01-01", periods=10, freq="5min", tz="UTC")
-    df = pd.DataFrame({"temperature": np.full(10, 20.0)}, index=idx)
-    step = WeatherAdjustmentStep(sample_process_config, weather_fetcher=None)
-    result = step.process(df)
-    pd.testing.assert_frame_equal(result, df)
-
-
 def test_weather_adjustment_no_temperature_col_passes_through(sample_process_config):
     idx = pd.date_range("2025-01-01", periods=10, freq="5min", tz="UTC")
-    df = pd.DataFrame({"value": np.arange(10, dtype=float)}, index=idx)
-    mock_fetcher = MagicMock()
-    step = WeatherAdjustmentStep(sample_process_config, weather_fetcher=mock_fetcher)
+    df = pd.DataFrame(
+        {"value": np.arange(10, dtype=float), "weather_temperature_baseline": np.full(10, 5.0)},
+        index=idx,
+    )
+    step = WeatherAdjustmentStep(sample_process_config)
     result = step.process(df)
     pd.testing.assert_frame_equal(result, df)
-    # Fetcher should not have been called since temperature column is absent
-    mock_fetcher.get_weather_data.assert_not_called()
 
 
-def test_weather_adjustment_applies_baseline(sample_process_config):
-    cfg = {**sample_process_config}
-    cfg["process"] = {**sample_process_config["process"]}
-    cfg["process"]["weather"] = {
-        "enabled": True,
-        "lookback_days": 14,
-        "fallback_on_failure": True,
-        "feature_columns": [],
-    }
+def test_weather_adjustment_no_baseline_col_passes_through(sample_process_config):
     idx = pd.date_range("2025-01-01", periods=10, freq="5min", tz="UTC")
     df = pd.DataFrame({"temperature": np.full(10, 20.0)}, index=idx)
-
-    # Mock weather fetcher returning a dense weather DataFrame
-    weather_idx = pd.date_range("2024-12-15", periods=5000, freq="5min", tz="UTC")
-    weather_df = pd.DataFrame(
-        {"temperature_2m": np.full(len(weather_idx), 5.0)},
-        index=weather_idx,
-    )
-    mock_fetcher = MagicMock()
-    mock_fetcher.get_weather_data.return_value = weather_df
-
-    step = WeatherAdjustmentStep(cfg, weather_fetcher=mock_fetcher)
+    step = WeatherAdjustmentStep(sample_process_config)
     result = step.process(df)
-    # Temperature has been adjusted by subtracting the rolling baseline (5.0) → 15.0
+    pd.testing.assert_frame_equal(result, df)
+
+
+def test_weather_adjustment_subtracts_merged_baseline(sample_process_config):
+    idx = pd.date_range("2025-01-01", periods=10, freq="5min", tz="UTC")
+    df = pd.DataFrame(
+        {"temperature": np.full(10, 20.0), "weather_temperature_baseline": np.full(10, 5.0)},
+        index=idx,
+    )
+    step = WeatherAdjustmentStep(sample_process_config)
+    result = step.process(df)
     assert (result["temperature"] == 15.0).all()
+    # baseline column is left in place — the merger owns it
+    assert "weather_temperature_baseline" in result.columns
 
 
-def test_weather_adjustment_missing_temperature_2m_skipped(sample_process_config):
-    cfg = {**sample_process_config}
-    cfg["process"] = {**sample_process_config["process"]}
-    cfg["process"]["weather"] = {
-        "enabled": True,
-        "lookback_days": 14,
-        "fallback_on_failure": True,
-    }
-    idx = pd.date_range("2025-01-01", periods=10, freq="5min", tz="UTC")
-    df = pd.DataFrame({"temperature": np.full(10, 20.0)}, index=idx)
-    # Return a DataFrame WITHOUT 'temperature_2m'
-    weather_df = pd.DataFrame(
-        {"other": np.zeros(50)},
-        index=pd.date_range("2024-12-15", periods=50, freq="1h", tz="UTC"),
+def test_weather_adjustment_does_not_mutate_input(sample_process_config):
+    idx = pd.date_range("2025-01-01", periods=5, freq="5min", tz="UTC")
+    df = pd.DataFrame(
+        {"temperature": np.full(5, 20.0), "weather_temperature_baseline": np.full(5, 5.0)},
+        index=idx,
     )
-    mock_fetcher = MagicMock()
-    mock_fetcher.get_weather_data.return_value = weather_df
-
-    step = WeatherAdjustmentStep(cfg, weather_fetcher=mock_fetcher)
-    result = step.process(df)
-    # No adjustment since weather data is missing temperature_2m
-    pd.testing.assert_series_equal(result["temperature"], df["temperature"])
-
-
-def test_weather_adjustment_handles_fetch_exception(sample_process_config):
-    cfg = {**sample_process_config}
-    cfg["process"] = {**sample_process_config["process"]}
-    cfg["process"]["weather"] = {
-        "enabled": True,
-        "lookback_days": 14,
-        "fallback_on_failure": True,
-    }
-    idx = pd.date_range("2025-01-01", periods=10, freq="5min", tz="UTC")
-    df = pd.DataFrame({"temperature": np.full(10, 20.0)}, index=idx)
-    mock_fetcher = MagicMock()
-    mock_fetcher.get_weather_data.side_effect = RuntimeError("network down")
-
-    step = WeatherAdjustmentStep(cfg, weather_fetcher=mock_fetcher)
-    result = step.process(df)
-    # On fetch failure, the step passes through unchanged
-    pd.testing.assert_series_equal(result["temperature"], df["temperature"])
+    original = df.copy()
+    WeatherAdjustmentStep(sample_process_config).process(df)
+    pd.testing.assert_frame_equal(df, original)

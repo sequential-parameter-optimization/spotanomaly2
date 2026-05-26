@@ -13,7 +13,6 @@ from spotanomaly2.domain.processing_steps import (
     TemperatureAggregationStep,
     WeatherAdjustmentStep,
 )
-from spotanomaly2.domain.weather_fetcher import WeatherFetcher
 from spotanomaly2.infrastructure import logging
 
 
@@ -30,32 +29,17 @@ class DataProcessor:
         self.config = config
         self.logger = logger or logging.get_logger("DataProcessor")
 
-        weather_fetcher: Optional[WeatherFetcher] = None
-        weather_cfg = self.config.get("process", {}).get("weather", {})
-        if weather_cfg.get("enabled", False):
-            weather_config = {
-                "latitude": weather_cfg.get("latitude"),
-                "longitude": weather_cfg.get("longitude"),
-                "use_forecast": weather_cfg.get("use_forecast", True),
-            }
-            if weather_config["latitude"] is None or weather_config["longitude"] is None:
-                self.logger.warning(
-                    "Weather adjustment enabled but latitude/longitude not configured. "
-                    "Weather adjustment will be skipped."
-                )
-            else:
-                weather_fetcher = WeatherFetcher(weather_config, self.logger)
-
-        # Initialize processing steps with panel_id placeholder (will be set per panel)
-        self._base_steps = [
+        # Weather is fetched + merged upstream by PanelDataMerger; WeatherAdjustmentStep
+        # is a pure transform that consumes the pre-merged weather_temperature_baseline.
+        # ManualOutlierRemovalStep receives panel_id at call time via process_panel.
+        self._steps = [
             ResampleStep(config, self.logger),
             MaintenanceRemovalStep(config, self.logger),
-        ]
-        self._post_outlier_steps = [
+            ManualOutlierRemovalStep(config, self.logger),
             ImputationStep(config, self.logger),
             MedianFilterStep(config, self.logger),
             TemperatureAggregationStep(config, self.logger),
-            WeatherAdjustmentStep(config, self.logger, weather_fetcher),
+            WeatherAdjustmentStep(config, self.logger),
         ]
 
     def process_panel(self, df: pd.DataFrame, panel_id: Optional[str] = None) -> pd.DataFrame:
@@ -72,24 +56,9 @@ class DataProcessor:
         Returns:
             Processed DataFrame
         """
-        # Build complete step list with panel-specific manual outlier removal
-        steps = (
-            self._base_steps + [ManualOutlierRemovalStep(self.config, self.logger, panel_id)] + self._post_outlier_steps
-        )
-
-        step_names = [
-            "Resampling data",
-            "Removing maintenance periods",
-            "Manual outlier removal",
-            "Imputing missing values",
-            "Applying median filter to flow columns",
-            "Aggregating temperature sensors",
-            "Adjusting temperature with weather baseline",
-        ]
-
-        for step, name in zip(steps, step_names):
-            self.logger.info(f"Step: {name}")
-            df = step.process(df)
+        for step in self._steps:
+            self.logger.info(f"Step: {step.name}")
+            df = step.process(df, panel_id=panel_id)
 
         return df
 

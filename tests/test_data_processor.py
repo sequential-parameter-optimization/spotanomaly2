@@ -7,7 +7,6 @@ from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from spotanomaly2.domain.data_processor import DataProcessor
 from spotanomaly2.domain.processing_steps import (
@@ -21,20 +20,19 @@ from spotanomaly2.domain.processing_steps import (
 )
 
 
-def test_constructs_base_and_post_outlier_steps_in_order(sample_config):
+def test_constructs_steps_in_pipeline_order(sample_config):
     proc = DataProcessor(sample_config)
 
-    # _base_steps: ResampleStep, MaintenanceRemovalStep
-    assert isinstance(proc._base_steps[0], ResampleStep)
-    assert isinstance(proc._base_steps[1], MaintenanceRemovalStep)
-    assert len(proc._base_steps) == 2
-
-    # _post_outlier_steps: ImputationStep, MedianFilterStep, TemperatureAggregationStep, WeatherAdjustmentStep
-    assert isinstance(proc._post_outlier_steps[0], ImputationStep)
-    assert isinstance(proc._post_outlier_steps[1], MedianFilterStep)
-    assert isinstance(proc._post_outlier_steps[2], TemperatureAggregationStep)
-    assert isinstance(proc._post_outlier_steps[3], WeatherAdjustmentStep)
-    assert len(proc._post_outlier_steps) == 4
+    expected_types = [
+        ResampleStep,
+        MaintenanceRemovalStep,
+        ManualOutlierRemovalStep,
+        ImputationStep,
+        MedianFilterStep,
+        TemperatureAggregationStep,
+        WeatherAdjustmentStep,
+    ]
+    assert [type(s) for s in proc._steps] == expected_types
 
 
 def test_default_logger_used_when_none_given(sample_config):
@@ -47,41 +45,6 @@ def test_custom_logger_used_when_passed(sample_config):
     custom = logging.getLogger("custom_test_logger")
     proc = DataProcessor(sample_config, logger=custom)
     assert proc.logger is custom
-
-
-def test_weather_disabled_no_fetcher(sample_config):
-    # sample_config has weather.enabled = False
-    proc = DataProcessor(sample_config)
-    weather_step = proc._post_outlier_steps[3]
-    assert weather_step.weather_fetcher is None
-
-
-def test_weather_enabled_but_missing_coords_logs_warning(sample_config, caplog):
-    cfg = {**sample_config}
-    cfg["process"] = {**sample_config["process"]}
-    cfg["process"]["weather"] = {"enabled": True, "latitude": None, "longitude": None}
-    with caplog.at_level(logging.WARNING):
-        proc = DataProcessor(cfg)
-    weather_step = proc._post_outlier_steps[3]
-    assert weather_step.weather_fetcher is None
-    assert any("latitude" in rec.message.lower() for rec in caplog.records)
-
-
-def test_weather_enabled_with_coords_creates_fetcher(sample_config):
-    cfg = {**sample_config}
-    cfg["process"] = {**sample_config["process"]}
-    cfg["process"]["weather"] = {
-        "enabled": True,
-        "latitude": 52.0,
-        "longitude": 13.0,
-        "use_forecast": True,
-    }
-    # Patch WeatherFetcher to avoid real I/O during construction
-    with patch("spotanomaly2.domain.data_processor.WeatherFetcher") as mock_fetcher:
-        proc = DataProcessor(cfg)
-    assert mock_fetcher.called
-    weather_step = proc._post_outlier_steps[3]
-    assert weather_step.weather_fetcher is not None
 
 
 def _make_panel_df(n=60, freq="1min"):
@@ -133,9 +96,9 @@ def test_manual_outlier_removal_step_uses_panel_id(sample_config):
 
     real_process = ManualOutlierRemovalStep.process
 
-    def spy_process(self, df):
-        captured_panel_ids.append(self.panel_id)
-        return real_process(self, df)
+    def spy_process(self, df, panel_id=None):
+        captured_panel_ids.append(panel_id)
+        return real_process(self, df, panel_id=panel_id)
 
     with patch.object(ManualOutlierRemovalStep, "process", new=spy_process):
         proc = DataProcessor(cfg)
@@ -150,13 +113,13 @@ def test_process_panel_passes_panel_id_into_manual_outlier_step(sample_config):
     df = _make_panel_df()
     captured = {}
 
-    real_init = ManualOutlierRemovalStep.__init__
+    real_process = ManualOutlierRemovalStep.process
 
-    def spy_init(self, config, logger=None, panel_id=None):
+    def spy_process(self, df, panel_id=None):
         captured["panel_id"] = panel_id
-        real_init(self, config, logger, panel_id)
+        return real_process(self, df, panel_id=panel_id)
 
-    with patch.object(ManualOutlierRemovalStep, "__init__", new=spy_init):
+    with patch.object(ManualOutlierRemovalStep, "process", new=spy_process):
         proc.process_panel(df, panel_id="42")
 
     assert captured["panel_id"] == "42"
