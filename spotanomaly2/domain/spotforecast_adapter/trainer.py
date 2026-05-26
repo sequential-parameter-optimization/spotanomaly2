@@ -14,8 +14,8 @@ from typing import Any
 import joblib
 import numpy as np
 import pandas as pd
-import yaml
 
+from spotanomaly2.application.config import load_panel_channel_config
 from spotanomaly2.infrastructure import logging, storage
 from spotanomaly2.infrastructure.storage import generate_timestamp
 
@@ -40,42 +40,15 @@ class SpotforecastTrainer:
         self.config = config
         self.logger = logger or logging.get_logger("SpotforecastTrainer")
 
-    def _load_panel_channel_config(self, panel_id: str) -> dict[str, Any]:
-        """Load panel-specific channel model config YAML, if configured."""
-        train_cfg = self.config.get("train", {})
-        file_map = train_cfg.get("channel_config_files", {})
-        if not isinstance(file_map, dict):
-            return {}
-
-        cfg_path_value = file_map.get(panel_id) or file_map.get(f"panel_{panel_id}")
-        if not cfg_path_value:
-            return {}
-
-        cfg_path = Path(cfg_path_value)
-        if not cfg_path.is_absolute():
-            cfg_path = (Path.cwd() / cfg_path).resolve()
-
-        if not cfg_path.exists():
-            raise FileNotFoundError(f"Channel model config for panel {panel_id} not found: {cfg_path}")
-
-        with open(cfg_path, "r", encoding="utf-8") as f:
-            loaded = yaml.safe_load(f) or {}
-
-        if not isinstance(loaded, dict):
-            raise ValueError(f"Channel model config for panel {panel_id} must be a mapping: {cfg_path}")
-        return loaded
-
     def _get_weight_suffix(self) -> str:
         return self.config.get("process", {}).get("imputation", {}).get("weight_suffix", "__weight")
 
     def train_panel(
         self,
         panel_id: str,
-        df: pd.DataFrame,
+        panel_data: pd.DataFrame,
         timestamp: str | None = None,
         save_model: bool = True,
-        panel_specific_params: dict[str, Any] | None = None,
-        channel_specific_params: dict[str, Any] | None = None,
     ) -> tuple[pd.DataFrame, str]:
         """Train one ForecasterRecursive per target channel for a panel."""
         base_models_dir = Path(self.config["paths"]["models_dir"])
@@ -93,24 +66,24 @@ class SpotforecastTrainer:
             timestamp = generate_timestamp()
         models_dir = base_models_dir / timestamp
 
-        self.logger.info(f"Training spotforecast2 models on {len(df)} rows for panel {panel_id}")
+        self.logger.info(f"Training spotforecast2 models on {len(panel_data)} rows for panel {panel_id}")
 
         configured_exog_columns = self.config["train"].get("exog_columns", [])
 
         weight_suffix = self._get_weight_suffix()
-        weight_residuals_enabled = self.config.get("exogenous", {}).get("weight_residuals", {}).get("enabled", False)
+        weight_residuals_enabled = self.config.get("residual_weighting", {}).get("enabled", False)
         if weight_residuals_enabled:
-            self.logger.info("weight_residuals enabled: exogenous columns excluded from model features")
+            self.logger.info("residual_weighting enabled: exogenous columns excluded from model features")
         target_cols, exog_columns = _split_panel_columns(
-            df, configured_exog_columns, weight_suffix, weight_residuals_enabled
+            panel_data, configured_exog_columns, weight_suffix, weight_residuals_enabled
         )
 
         known_anomalies = self.config.get("known_anomalies", [])
         known_anomaly_buffer = self.config["train"].get("known_anomaly_buffer")
         if known_anomalies and known_anomaly_buffer:
-            df = _mask_known_anomalies(df, known_anomalies, known_anomaly_buffer, columns=target_cols)
+            panel_data = _mask_known_anomalies(panel_data, known_anomalies, known_anomaly_buffer, columns=target_cols)
 
-        train_df, test_df = _time_series_train_test_split(df, train_ratio=train_ratio)
+        train_df, test_df = _time_series_train_test_split(panel_data, train_ratio=train_ratio)
 
         fallback_freq = self.config.get("process", {}).get("resample", {}).get("freq", "5min")
         train_df = _ensure_freq(train_df, fallback_freq)
@@ -118,9 +91,7 @@ class SpotforecastTrainer:
 
         self.logger.info(f"Train size: {len(train_df)}, Test size: {len(test_df)}")
 
-        panel_cfg_from_yaml = self._load_panel_channel_config(panel_id)
-        if panel_specific_params:
-            panel_cfg_from_yaml = {**panel_cfg_from_yaml, **panel_specific_params}
+        panel_cfg_from_yaml = load_panel_channel_config(panel_id, self.config)
 
         panel_default_section = panel_cfg_from_yaml.get("default")
         if isinstance(panel_default_section, dict):
@@ -130,8 +101,6 @@ class SpotforecastTrainer:
             panel_default_model = panel_cfg_from_yaml.get("default_model")
             panel_default_params = panel_cfg_from_yaml.get("default_params", {})
         channel_cfg_map = panel_cfg_from_yaml.get("channels", {})
-        if channel_specific_params:
-            channel_cfg_map = {**channel_cfg_map, **channel_specific_params}
 
         forecasters: dict[str, Any] = {}
         channel_model_specs: dict[str, dict[str, Any]] = {}

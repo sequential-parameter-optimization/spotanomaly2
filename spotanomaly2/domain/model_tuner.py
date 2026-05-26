@@ -8,6 +8,7 @@ import pandas as pd
 import yaml
 from tqdm.auto import tqdm
 
+from spotanomaly2.application.config import load_panel_channel_config
 from spotanomaly2.domain.spotforecast_adapter import SpotforecastTuner
 from spotanomaly2.infrastructure import logging
 
@@ -67,15 +68,12 @@ class ModelTuner:
             cfg_path_value = channel_config_files.get(pid) or channel_config_files.get(f"panel_{pid}")
             if not cfg_path_value:
                 continue
-
             cfg_path = Path(cfg_path_value)
-            if not cfg_path.is_absolute():
-                cfg_path = (Path.cwd() / cfg_path).resolve()
 
-            if cfg_path.exists():
-                with open(cfg_path, "r", encoding="utf-8") as f:
-                    panel_cfg = yaml.safe_load(f) or {}
-            else:
+            try:
+                panel_cfg = load_panel_channel_config(pid, self.config)
+            except FileNotFoundError:
+                # First tune run for this panel; file will be created below.
                 panel_cfg = {}
 
             channels_section = panel_cfg.setdefault("channels", {})
