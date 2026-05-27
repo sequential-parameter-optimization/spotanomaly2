@@ -11,6 +11,7 @@ import pytest
 from spotanomaly2.domain.spotforecast_adapter import (
     _NAN_PENALTY,
     KernelRidgeApprox,
+    SpotforecastPredictor,
     SpotforecastTrainer,
     SpotforecastTuner,
     SVRApprox,
@@ -63,7 +64,8 @@ class TestSpotforecastTrainer:
 
         test_slice = panel_df.iloc[-30:]
         history_slice = panel_df.iloc[:-30]
-        pred_df = adapter.predict(model_data, test_slice, history_df=history_slice)
+        predictor = SpotforecastPredictor(adapter.config)
+        pred_df = predictor.predict(model_data, test_slice, history_df=history_slice)
 
         assert isinstance(pred_df, pd.DataFrame)
         assert len(pred_df) == 30
@@ -547,7 +549,8 @@ class TestSpotforecastTuner:
             n_local = len(df)
             test_slice = df.iloc[int(n_local * 0.9) :]
             history = df.iloc[: int(n_local * 0.9)]
-            preds = trainer.predict(model_data, test_slice, history_df=history)
+            predictor = SpotforecastPredictor(cfg)
+            preds = predictor.predict(model_data, test_slice, history_df=history)
             pred = preds["sensor_a"].dropna()
             truth = test_slice["sensor_a"].reindex(pred.index).dropna()
             pred = pred.reindex(truth.index)
@@ -742,3 +745,107 @@ class TestNanSafeMetric:
         spotforecast2 can resolve them itself."""
         out = _build_nan_safe_metric("custom_unknown_metric")
         assert out == "custom_unknown_metric"
+
+
+class TestSpotforecastPredictor:
+    """Inference against a trained model artifact, separate from training."""
+
+    def test_predict_returns_dataframe_indexed_to_input(self, adapter, panel_df, tmp_path):
+        adapter.config["paths"]["models_dir"] = str(tmp_path)
+        _, timestamp = adapter.train_panel("test", panel_df)
+        model_data = joblib.load(Path(tmp_path) / timestamp / "fc_model_panel_test.pkl")
+
+        test_slice = panel_df.iloc[-30:]
+        history_slice = panel_df.iloc[:-30]
+        predictor = SpotforecastPredictor(adapter.config)
+        pred_df = predictor.predict(model_data, test_slice, history_df=history_slice)
+
+        assert list(pred_df.index) == list(test_slice.index)
+        assert set(pred_df.columns) == set(model_data["target_cols"])
+
+    def test_predict_without_history_still_returns_finite_predictions(self, adapter, panel_df, tmp_path):
+        """``history_df=None`` is the supported live-mode signature; the
+        predictor should fall back to using ``df`` as its own history."""
+        adapter.config["paths"]["models_dir"] = str(tmp_path)
+        _, timestamp = adapter.train_panel("test", panel_df)
+        model_data = joblib.load(Path(tmp_path) / timestamp / "fc_model_panel_test.pkl")
+
+        predictor = SpotforecastPredictor(adapter.config)
+        pred_df = predictor.predict(model_data, panel_df.iloc[-50:])
+        # At least some predictions should resolve - the recursive lag block at
+        # the front is NaN, but the bulk of the window should be finite.
+        assert pred_df.notna().any().all()
+
+    def test_missing_forecaster_yields_nan_column(self, adapter, panel_df, tmp_path):
+        """If a target column's forecaster is missing from the artifact
+        (e.g. trainer skipped it), the predictor returns an all-NaN column
+        instead of raising — keeps detection alive on partial models."""
+        adapter.config["paths"]["models_dir"] = str(tmp_path)
+        _, timestamp = adapter.train_panel("test", panel_df)
+        model_data = joblib.load(Path(tmp_path) / timestamp / "fc_model_panel_test.pkl")
+        # Drop one channel's forecaster but keep the column in target_cols
+        # so the predictor still iterates over it.
+        del model_data["forecasters"]["sensor_a"]
+
+        predictor = SpotforecastPredictor(adapter.config)
+        pred_df = predictor.predict(model_data, panel_df.iloc[-30:], history_df=panel_df.iloc[:-30])
+
+        assert pred_df["sensor_a"].isna().all()
+        assert pred_df["sensor_b"].notna().any()
+
+
+class TestTrainerHelpers:
+    """Pure, side-effect-free helpers exposed for unit testing."""
+
+    def test_resolve_channel_lags_passes_through_int(self):
+        eff, n = SpotforecastTrainer._resolve_channel_lags({}, 24)
+        assert eff == 24
+        assert n == 24
+
+    def test_resolve_channel_lags_prefers_best_lags_list_over_default(self):
+        eff, n = SpotforecastTrainer._resolve_channel_lags({"best_lags": [1, 3, 7, 24]}, 12)
+        assert eff == [1, 3, 7, 24]
+        assert n == 24  # max of the list — used for sufficiency checks
+
+    def test_resolve_channel_lags_best_lags_scalar_overrides_default(self):
+        eff, n = SpotforecastTrainer._resolve_channel_lags({"best_lags": 6}, 24)
+        assert eff == 6
+        assert n == 6
+
+    def test_resolve_channel_lags_invalid_best_lags_falls_back_to_default(self):
+        eff, n = SpotforecastTrainer._resolve_channel_lags({"best_lags": "not-a-number"}, 24)
+        assert eff == 24
+        assert n == 24
+
+    def test_resolve_channel_model_spec_channel_overrides_panel_default(self):
+        name, params = SpotforecastTrainer._resolve_channel_model_spec(
+            channel_cfg={"model": "Ridge", "params": {"alpha": 0.5}},
+            panel_default_model="LightGBM",
+            panel_default_params={"num_leaves": 31},
+            model_label="LightGBM",
+        )
+        assert name == "Ridge"
+        # Panel defaults must NOT bleed into the channel when the channel
+        # picks a different model — those defaults belong to LightGBM.
+        assert params == {"alpha": 0.5}
+
+    def test_resolve_channel_model_spec_inherits_panel_default_params_when_models_match(self):
+        name, params = SpotforecastTrainer._resolve_channel_model_spec(
+            channel_cfg={"params": {"num_leaves": 63}},  # override one knob
+            panel_default_model="LightGBM",
+            panel_default_params={"num_leaves": 31, "learning_rate": 0.05},
+            model_label="Ridge",
+        )
+        assert name == "LightGBM"
+        # Channel params override panel defaults key-by-key, others inherited.
+        assert params == {"num_leaves": 63, "learning_rate": 0.05}
+
+    def test_resolve_channel_model_spec_falls_back_to_fallback_model(self):
+        name, params = SpotforecastTrainer._resolve_channel_model_spec(
+            channel_cfg={},
+            panel_default_model=None,
+            panel_default_params={},
+            model_label="LightGBM",
+        )
+        assert name == "LightGBM"
+        assert params == {}

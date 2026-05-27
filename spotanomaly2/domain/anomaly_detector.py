@@ -10,7 +10,7 @@ from spotanomaly2_safe.scoring.pipeline import ForecastingAnomalyDetector
 
 from spotanomaly2.domain.constants import MIN_TRAIN_SIZE, TRAIN_TEST_SPLIT_RATIO
 from spotanomaly2.domain.exceptions import InsufficientDataException, ModelNotFoundException
-from spotanomaly2.domain.spotforecast_adapter import SpotforecastTrainer
+from spotanomaly2.domain.spotforecast_adapter import SpotforecastPredictor
 from spotanomaly2.infrastructure import logging, storage
 
 
@@ -509,15 +509,15 @@ class AnomalyDetector:
             self.logger.info(f"Generating predictions ({model_type}; channels: {breakdown})...")
         else:
             self.logger.info(f"Generating predictions using {model_type} model...")
-        adapter = SpotforecastTrainer(self.config, self.logger)
+        predictor = SpotforecastPredictor(self.config, self.logger)
         history_for_fit_pred = history_df if len(history_df) > 0 else None
-        fit_pred_df = adapter.predict(
+        fit_pred_df = predictor.predict(
             model_data,
             scorer_fit_df,
             history_df=history_for_fit_pred,
         )
         eval_history_df = pd.concat([history_df, scorer_fit_df]) if len(history_df) > 0 else scorer_fit_df
-        eval_pred_df = adapter.predict(model_data, scorer_eval_df, history_df=eval_history_df)
+        eval_pred_df = predictor.predict(model_data, scorer_eval_df, history_df=eval_history_df)
 
         # Align true values with predictions
         target_cols = fit_pred_df.columns

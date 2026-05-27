@@ -35,6 +35,7 @@ import pandas as pd
 from sklearn.metrics import average_precision_score, cohen_kappa_score, precision_recall_curve
 
 from spotanomaly2.domain.spotforecast_adapter import (
+    SpotforecastPredictor,
     SpotforecastTrainer,
     _mask_known_anomalies,
 )
@@ -197,7 +198,8 @@ def compute_residuals(
         train_df = df.iloc[:split_idx]
         test_df = df.iloc[split_idx:]
 
-        y_pred_test = trainer.predict(model_data, test_df, history_df=train_df)
+        predictor = SpotforecastPredictor(cfg, logger=logger)
+        y_pred_test = predictor.predict(model_data, test_df, history_df=train_df)
         # Align y_true to the columns the forecaster actually produced
         # (exog columns are dropped from target_cols inside the trainer).
         target_cols = list(y_pred_test.columns)
