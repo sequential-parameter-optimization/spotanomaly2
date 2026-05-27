@@ -15,6 +15,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from spotanomaly2.infrastructure import logging
+
 
 def _time_series_train_test_split(df: pd.DataFrame, train_ratio: float = 0.8) -> tuple[pd.DataFrame, pd.DataFrame]:
     split_idx = int(len(df) * train_ratio)
@@ -33,6 +35,7 @@ def _mask_known_anomalies(
     buffer_td = pd.Timedelta(buffer)
     df = df.copy()
     cols_to_mask = columns if columns is not None else list(df.columns)
+    existing_cols = [c for c in cols_to_mask if c in df.columns]
     for anomaly in known_anomalies:
         start_str = anomaly.get("start")
         end_str = anomaly.get("end")
@@ -45,10 +48,9 @@ def _mask_known_anomalies(
                 a_start = a_start.tz_convert(df.index.tz) if a_start.tz else a_start.tz_localize(df.index.tz)
                 a_end = a_end.tz_convert(df.index.tz) if a_end.tz else a_end.tz_localize(df.index.tz)
             mask = (df.index >= a_start - buffer_td) & (df.index <= a_end + buffer_td)
-            existing_cols = [c for c in cols_to_mask if c in df.columns]
-            if existing_cols:
-                df.loc[mask, existing_cols] = np.nan
-        except (ValueError, TypeError):
+            df.loc[mask, existing_cols] = np.nan
+        except (ValueError, TypeError) as exc:
+            logging.get_logger().error("Failed to mask known anomaly window: %s", exc)
             continue
     return df
 
