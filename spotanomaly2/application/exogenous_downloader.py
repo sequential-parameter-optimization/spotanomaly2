@@ -42,6 +42,22 @@ class ExogenousDownloader:
                 self.logger.warning(f"{name} fetch failed, continuing without it: {exc}")
                 self._set_status(fetch_status, name, "error", str(exc))
 
+    def derive_fetch_window(self, panel_data: dict[str, pd.DataFrame]) -> tuple[pd.Timestamp, pd.Timestamp]:
+        """Union [min, max] of timestamps across the just-fetched primary panels.
+
+        Falls back to ``config.fetch.start_date``/``now()`` when no primary data
+        is available (e.g. first ever run, or an empty incremental tick).
+        """
+        non_empty = [df for df in panel_data.values() if len(df) > 0]
+        if non_empty:
+            start = min(df.index.min() for df in non_empty)
+            end = max(df.index.max() for df in non_empty)
+            return pd.Timestamp(start), pd.Timestamp(end)
+        start_iso = self.config.get("fetch", {}).get("start_date")
+        end = pd.Timestamp.now(tz="UTC")
+        start = pd.Timestamp(start_iso) if start_iso else end - pd.Timedelta(days=30)
+        return start, end
+
     @staticmethod
     def _set_status(status: Optional[dict], name: str, state: str, error: Optional[str]) -> None:
         if status is None:

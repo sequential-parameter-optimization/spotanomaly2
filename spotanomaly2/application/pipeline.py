@@ -47,7 +47,7 @@ class Pipeline:
         panel_data = primary_fetcher.run()
         self._data_manager.save_raw_data(panel_data)
 
-        start, end = self._derive_fetch_window(panel_data)
+        start, end = self._exogenous_downloader.derive_fetch_window(panel_data)
         self._exogenous_downloader.download_all(start, end)
 
     def process(self) -> None:
@@ -61,22 +61,6 @@ class Pipeline:
         processor = DataProcessor(self.config, self.logger)
         processed_data = processor.run(panel_data)
         self._data_manager.save_processed_data(processed_data)
-
-    def _derive_fetch_window(self, panel_data: dict[str, pd.DataFrame]) -> tuple[pd.Timestamp, pd.Timestamp]:
-        """Union [min, max] of timestamps across the just-fetched primary panels.
-
-        Falls back to ``config.fetch.start_date``/``now()`` when no primary data
-        is available (e.g. first ever run, or an empty incremental tick).
-        """
-        non_empty = [df for df in panel_data.values() if len(df) > 0]
-        if non_empty:
-            start = min(df.index.min() for df in non_empty)
-            end = max(df.index.max() for df in non_empty)
-            return pd.Timestamp(start), pd.Timestamp(end)
-        start_iso = self.config.get("fetch", {}).get("start_date")
-        end = pd.Timestamp.now(tz="UTC")
-        start = pd.Timestamp(start_iso) if start_iso else end - pd.Timedelta(days=30)
-        return start, end
 
     def train(self) -> None:
         self.logger.info("=" * 60)
@@ -195,7 +179,7 @@ class Pipeline:
                 fetcher = PrimaryDataFetcher(self.config, self.logger)
                 panel_data = fetcher.run()
                 self._data_manager.save_raw_data(panel_data)
-                start, end = self._derive_fetch_window(panel_data)
+                start, end = self._exogenous_downloader.derive_fetch_window(panel_data)
                 self._exogenous_downloader.download_all(start, end)
             else:
                 self.logger.info("Skipping download step - loading from disk")
@@ -257,7 +241,6 @@ class Pipeline:
             self.logger.error(error_msg)
             raise RuntimeError(error_msg)
 
-        processed_dir = Path(self.config["paths"]["processed_dir"])
         panels = self.config["panels"]["panel_ids"]
 
         fetch_status: dict[str, dict] = {}
@@ -291,7 +274,7 @@ class Pipeline:
             }
             new_panel_data = {pid: pd.DataFrame(index=pd.DatetimeIndex([], name="timestamp")) for pid in panels}
 
-        start, end = self._derive_fetch_window(new_panel_data)
+        start, end = self._exogenous_downloader.derive_fetch_window(new_panel_data)
         self._exogenous_downloader.download_all(start, end, fetch_status)
         new_panel_data = self._exogenous_joiner.join_all(new_panel_data, fetch_status)
         processor = DataProcessor(self.config, self.logger)
