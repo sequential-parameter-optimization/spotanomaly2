@@ -72,6 +72,7 @@ class SpotforecastTrainer:
         panel_data, target_cols, exog_columns = self._prepare_panel_data(panel_data, weight_suffix)
         train_df, test_df = self._split_train_test(panel_data, train_ratio)
         panel_default_model, panel_default_params, channel_cfg_map = self._load_and_resolve_panel_config(panel_id)
+        full_exog = self._build_full_exog(train_df, test_df, exog_columns)
 
         forecasters: dict[str, Any] = {}
         channel_model_specs: dict[str, dict[str, Any]] = {}
@@ -95,6 +96,7 @@ class SpotforecastTrainer:
                 train_df=train_df,
                 test_df=test_df,
                 exog_columns=exog_columns,
+                full_exog=full_exog,
             )
             if channel_result is None:
                 continue
@@ -301,15 +303,33 @@ class SpotforecastTrainer:
 
         return forecaster
 
+    @staticmethod
+    def _build_full_exog(
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        exog_columns: list[str],
+    ) -> pd.DataFrame | None:
+        """Concat + interpolate the train+test exog frame once for the panel.
+
+        The result is reused across every channel's one-step-ahead test
+        prediction. Exog columns don't depend on the target, so rebuilding
+        this per channel is pure waste.
+        """
+        if not exog_columns:
+            return None
+        full_exog = pd.concat([train_df[exog_columns], test_df[exog_columns]])
+        if full_exog.isna().any().any():
+            full_exog = _interpolate_inplace(full_exog)
+        return full_exog
+
     def _predict_test_window(
         self,
         forecaster,
         y_train: pd.Series,
-        train_df: pd.DataFrame,
         test_df: pd.DataFrame,
         target_col: str,
         weight_suffix: str,
-        exog_columns: list[str],
+        full_exog: pd.DataFrame | None,
         diff_order: int,
     ) -> np.ndarray:
         """One-step-ahead test predictions on real observed lags.
@@ -327,15 +347,10 @@ class SpotforecastTrainer:
         full_y_raw = pd.concat([y_train, y_test_for_lags])
         full_y_raw.name = target_col
 
-        full_exog = None
-        if exog_columns:
-            full_exog = pd.concat([train_df[exog_columns], test_df[exog_columns]])
-            if full_exog.isna().any().any():
-                full_exog = _interpolate_inplace(full_exog)
-            full_exog = full_exog.loc[full_y_raw.index]
+        exog_for_pred = full_exog.loc[full_y_raw.index] if full_exog is not None else None
 
         try:
-            return _predict_one_step_integrated(forecaster, full_y_raw, full_exog, test_df.index, diff_order)
+            return _predict_one_step_integrated(forecaster, full_y_raw, exog_for_pred, test_df.index, diff_order)
         except Exception as exc:
             self.logger.warning(f"  One-step-ahead test prediction failed for {target_col}: {exc}")
             return np.full(len(test_df), np.nan)
@@ -354,6 +369,7 @@ class SpotforecastTrainer:
         train_df: pd.DataFrame,
         test_df: pd.DataFrame,
         exog_columns: list[str],
+        full_exog: pd.DataFrame | None,
     ) -> tuple[Any, dict[str, Any], np.ndarray] | None:
         """Train one forecaster + run test eval for a single channel.
 
@@ -398,7 +414,7 @@ class SpotforecastTrainer:
         )
 
         channel_preds = self._predict_test_window(
-            forecaster, y_train, train_df, test_df, target_col, weight_suffix, exog_columns, diff_order
+            forecaster, y_train, test_df, target_col, weight_suffix, full_exog, diff_order
         )
 
         y_test_col = test_df[target_col].values
