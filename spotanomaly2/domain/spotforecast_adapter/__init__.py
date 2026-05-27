@@ -35,6 +35,7 @@ from .prediction import (
     _one_step_ahead_predict,
     _predict_one_step_integrated,
 )
+from .predictor import SpotforecastPredictor
 from .preprocessing import (
     _build_strict_training_sample_mask,
     _compute_observed_mask,
@@ -57,6 +58,7 @@ from .tuning_metrics import (
 __all__ = [
     "KernelRidgeApprox",
     "SVRApprox",
+    "SpotforecastPredictor",
     "SpotforecastTrainer",
     "SpotforecastTuner",
     "_NAN_PENALTY",
