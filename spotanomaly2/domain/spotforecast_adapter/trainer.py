@@ -22,6 +22,7 @@ from spotanomaly2.infrastructure import logging, storage
 from spotanomaly2.infrastructure.storage import generate_timestamp
 
 from .factory import _create_forecaster
+from .panel_layout import _split_panel_columns
 from .prediction import _difference, _predict_one_step_integrated
 from .preprocessing import (
     _build_strict_training_sample_mask,
@@ -30,7 +31,6 @@ from .preprocessing import (
     _ensure_freq,
     _interpolate_inplace,
     _mask_known_anomalies,
-    _split_panel_columns,
     _time_series_train_test_split,
 )
 
@@ -133,13 +133,7 @@ class SpotforecastTrainer:
         weight_suffix: str,
     ) -> tuple[pd.DataFrame, list[str], list[str]]:
         """Split columns into target/exog and apply known-anomaly masking to targets."""
-        configured_exog_columns = self.config["train"].get("exog_columns", [])
-        weight_residuals_enabled = self.config.get("residual_weighting", {}).get("enabled", False)
-        if weight_residuals_enabled:
-            self.logger.info("residual_weighting enabled: exogenous columns excluded from model features")
-        target_cols, exog_columns = _split_panel_columns(
-            panel_data, configured_exog_columns, weight_suffix, weight_residuals_enabled
-        )
+        target_cols, exog_columns = _split_panel_columns(self.config, self.logger, panel_data, weight_suffix)
 
         known_anomalies = self.config.get("known_anomalies", [])
         known_anomaly_buffer = self.config["train"].get("known_anomaly_buffer")
@@ -164,6 +158,7 @@ class SpotforecastTrainer:
     def _load_and_resolve_panel_config(self, panel_id: str) -> tuple[str | None, dict[str, Any], dict[str, Any]]:
         """Load per-panel YAML and extract (default_model, default_params, channel_cfg_map)."""
         panel_cfg = load_panel_channel_config(panel_id, self.config)
+
         default_section = panel_cfg.get("default")
         if isinstance(default_section, dict):
             panel_default_model = default_section.get("model")

@@ -29,6 +29,7 @@ from .factory import (
     _create_forecaster,
     _filter_params,
 )
+from .panel_layout import _split_panel_columns
 from .prediction import (
     _difference,
     _integrate_one_step,
@@ -43,7 +44,6 @@ from .preprocessing import (
     _ensure_freq,
     _interpolate_inplace,
     _mask_known_anomalies,
-    _split_panel_columns,
     _time_series_train_test_split,
 )
 from .trainer import SpotforecastTrainer

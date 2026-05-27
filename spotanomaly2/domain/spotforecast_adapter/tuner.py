@@ -20,6 +20,7 @@ import pandas as pd
 from spotanomaly2.infrastructure import logging
 
 from .factory import _build_estimator, _create_forecaster
+from .panel_layout import _split_panel_columns
 from .prediction import _difference
 from .preprocessing import (
     _build_strict_training_sample_mask,
@@ -28,7 +29,6 @@ from .preprocessing import (
     _ensure_freq,
     _interpolate_inplace,
     _mask_known_anomalies,
-    _split_panel_columns,
 )
 from .tuning_metrics import (
     _build_nan_safe_metric,
@@ -96,12 +96,8 @@ class SpotforecastTuner:
         # Match SpotforecastTrainer.train_panel exactly: include `exogenous_*`
         # columns as exog features and exclude them from the tuning targets.
         # Otherwise tune optimizes a different model than train ends up fitting.
-        configured_exog_columns = self.config["train"].get("exog_columns", [])
         weight_suffix = self._get_weight_suffix()
-        weight_residuals_enabled = self.config.get("residual_weighting", {}).get("enabled", False)
-        target_cols, exog_columns = _split_panel_columns(
-            df, configured_exog_columns, weight_suffix, weight_residuals_enabled
-        )
+        target_cols, exog_columns = _split_panel_columns(self.config, self.logger, df, weight_suffix)
 
         if channels is not None:
             target_cols = [c for c in target_cols if c in channels]

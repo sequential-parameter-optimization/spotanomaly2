@@ -2,11 +2,12 @@
 
 Pure functions over panel DataFrames / target Series — no model state, no I/O.
 Handles the bits spotanomaly2 needs that ``MultiTask.prepare_data`` doesn't
-cover: known-anomaly masking with a buffer, target/exog column split,
-imputation-flag-aware observation masks, a strict mask that requires all lag
-inputs to be observed too, a Ridge-residual anomaly pre-pass for training-region
-cleanup, and the small frequency/interpolation conveniences used by the
-predict-path helpers.
+cover: known-anomaly masking with a buffer, imputation-flag-aware observation
+masks, a strict mask that requires all lag inputs to be observed too, a
+Ridge-residual anomaly pre-pass for training-region cleanup, and the small
+frequency/interpolation conveniences used by the predict-path helpers.
+
+Target/exog column-role resolution lives in ``panel_layout``.
 """
 
 from typing import Any
@@ -50,36 +51,6 @@ def _mask_known_anomalies(
         except (ValueError, TypeError):
             continue
     return df
-
-
-def _split_panel_columns(
-    df: pd.DataFrame,
-    configured_exog_columns: list[str],
-    weight_suffix: str,
-    weight_residuals_enabled: bool,
-) -> tuple[list[str], list[str]]:
-    """Split DataFrame columns into (target_cols, exog_columns).
-
-    Mirrors the logic ``SpotforecastTrainer.train_panel`` uses so the tuner sees
-    the same model topology as the training step: ``exogenous_*`` columns are
-    fed in as exog features (unless ``weight_residuals`` consumes them), and
-    they are NOT scored as targets.
-    """
-    if weight_residuals_enabled:
-        prefixed_exog_columns: list[str] = []
-    else:
-        prefixed_exog_columns = [
-            col for col in df.columns if col.startswith("exogenous_") and not col.endswith(weight_suffix)
-        ]
-    exog_columns = list(
-        dict.fromkeys([col for col in [*configured_exog_columns, *prefixed_exog_columns] if col in df.columns])
-    )
-    target_cols = [
-        col
-        for col in df.columns
-        if not col.endswith(weight_suffix) and col not in exog_columns and not col.startswith("exogenous_")
-    ]
-    return target_cols, exog_columns
 
 
 def _compute_observed_mask(df: pd.DataFrame, target_col: str, weight_suffix: str) -> pd.Series:
