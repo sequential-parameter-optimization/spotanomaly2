@@ -26,11 +26,11 @@ from .panel_layout import _split_panel_columns
 from .prediction import _difference, _predict_one_step_integrated
 from .preprocessing import (
     _build_strict_training_sample_mask,
-    _compute_observed_mask,
     _detect_anomalies_via_ridge,
     _ensure_freq,
     _interpolate_inplace,
     _mask_known_anomalies,
+    _prepare_target_for_lag_features,
     _time_series_train_test_split,
 )
 
@@ -213,7 +213,7 @@ class SpotforecastTrainer:
                 return list(n_lags), int(max(n_lags))
             return n_lags, int(n_lags) if not isinstance(n_lags, (list, tuple)) else 24
 
-    def _compute_training_weights(
+    def _build_sample_weights(
         self,
         observed_mask: pd.Series,
         effective_n_lags: int,
@@ -338,11 +338,7 @@ class SpotforecastTrainer:
         ``_predict_one_step_integrated``), so the train-time eval metric is
         the same one production reports.
         """
-        test_observed = _compute_observed_mask(test_df, target_col, weight_suffix)
-        y_test_for_lags = test_df[target_col].copy()
-        y_test_for_lags.loc[~test_observed] = np.nan
-        if y_test_for_lags.isna().any():
-            y_test_for_lags = _interpolate_inplace(y_test_for_lags)
+        y_test_for_lags, _ = _prepare_target_for_lag_features(test_df, target_col, weight_suffix)
 
         full_y_raw = pd.concat([y_train, y_test_for_lags])
         full_y_raw.name = target_col
@@ -384,19 +380,14 @@ class SpotforecastTrainer:
 
         self.logger.info(f"  Training forecaster for: {target_col} (model={channel_model_name})")
 
-        y_train_raw = train_df[target_col].copy()
-        y_train_raw.name = target_col
-
-        observed_mask = _compute_observed_mask(train_df, target_col, weight_suffix)
-        y_train = y_train_raw.copy()
-        y_train.loc[~observed_mask] = np.nan
-        if y_train.isna().any():
-            y_train = _interpolate_inplace(y_train)
+        # y_train: imputed rows interpolated so later observed rows have valid lag features.
+        # observed_mask: original boolean — drives loss weighting below, not feature values.
+        y_train, observed_mask = _prepare_target_for_lag_features(train_df, target_col, weight_suffix)
         if len(y_train) < effective_n_lags + 10:
             self.logger.warning(f"  Skipping {target_col}: insufficient data ({len(y_train)} rows)")
             return None
 
-        sample_mask = self._compute_training_weights(observed_mask, effective_n_lags, y_train, target_col)
+        sample_mask = self._build_sample_weights(observed_mask, effective_n_lags, y_train, target_col)
         if sample_mask == "skip":
             self.logger.warning(f"  Skipping {target_col}: no fully observed training samples left")
             return None

@@ -63,6 +63,38 @@ def _compute_observed_mask(df: pd.DataFrame, target_col: str, weight_suffix: str
     return pd.Series(True, index=df.index)
 
 
+def _prepare_target_for_lag_features(
+    df: pd.DataFrame,
+    target_col: str,
+    weight_suffix: str,
+) -> tuple[pd.Series, pd.Series]:
+    """Build a target series suitable for forming lag features.
+
+    Returns ``(y, observed_mask)``:
+
+    - ``observed_mask`` flags which rows came from real measurements (not
+      imputation). It is the source of truth for *loss weighting* — pass it
+      into ``_build_strict_training_sample_mask`` or hand it to whoever
+      builds the forecaster's ``weight_func``.
+    - ``y`` has imputed positions blanked then linearly interpolated, so any
+      later *observed* row still has well-defined lag values to form features
+      from. The interpolated values are scaffolding for feature extraction
+      only — don't treat them as real measurements.
+
+    These two roles are deliberately separate: ``y`` keeps the lag pipeline
+    happy; ``observed_mask`` decides what the model is allowed to learn from.
+    Callers that only need lag-feature continuity (e.g. the test/predict
+    path) can discard the mask.
+    """
+    observed = _compute_observed_mask(df, target_col, weight_suffix)
+    y = df[target_col].copy()
+    y.name = target_col
+    y.loc[~observed] = np.nan
+    if y.isna().any():
+        y = _interpolate_inplace(y)
+    return y, observed
+
+
 def _build_strict_training_sample_mask(observed_mask: pd.Series, n_lags: int) -> pd.Series:
     """Return True only when target and all required lag inputs are observed.
 
