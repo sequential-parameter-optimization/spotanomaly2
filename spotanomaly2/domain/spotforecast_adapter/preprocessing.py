@@ -64,11 +64,16 @@ def _compute_observed_mask(df: pd.DataFrame, target_col: str, weight_suffix: str
 
 
 def _build_strict_training_sample_mask(observed_mask: pd.Series, n_lags: int) -> pd.Series:
-    """Return True only when target and all required lag inputs are observed."""
-    mask = observed_mask.fillna(False).astype(bool).copy()
-    for lag in range(1, n_lags + 1):
-        mask &= observed_mask.shift(lag).fillna(False).astype(bool)
-    return mask
+    """Return True only when target and all required lag inputs are observed.
+
+    Equivalent to ANDing ``observed_mask`` with each of its 1..n_lags shifts,
+    expressed as a single backward-looking rolling-min over a window of size
+    ``n_lags + 1``. For 0/1 inputs, ``min == 1`` iff every value in the window
+    is True. Incomplete leading windows (positions ``< n_lags``) become False.
+    """
+    obs = observed_mask.fillna(False).astype(int)
+    rolled = obs.rolling(n_lags + 1, min_periods=n_lags + 1).min()
+    return rolled.fillna(0).astype(bool)
 
 
 def _detect_anomalies_via_ridge(
