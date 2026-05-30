@@ -37,6 +37,7 @@ from .prediction import (
 )
 from .predictor import SpotforecastPredictor
 from .preprocessing import (
+    _apply_known_anomaly_imputation,
     _build_strict_training_sample_mask,
     _compute_observed_mask,
     _detect_anomalies_via_ridge,
@@ -63,6 +64,7 @@ __all__ = [
     "SpotforecastTuner",
     "_NAN_PENALTY",
     "_NEEDS_SCALING",
+    "_apply_known_anomaly_imputation",
     "_build_estimator",
     "_build_nan_safe_metric",
     "_build_raw_r2_under_differentiation",

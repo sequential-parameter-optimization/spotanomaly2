@@ -14,7 +14,6 @@ matches what production scoring shows.
 
 from typing import Any
 
-import numpy as np
 import pandas as pd
 
 from spotanomaly2.domain.exogenous.residual_multiplier import multiplier_prefixes
@@ -23,12 +22,12 @@ from spotanomaly2.infrastructure import logging
 from .factory import _build_estimator, _create_forecaster
 from .prediction import _difference
 from .preprocessing import (
+    _apply_known_anomaly_imputation,
     _build_strict_training_sample_mask,
     _compute_observed_mask,
     _detect_anomalies_via_ridge,
     _ensure_freq,
     _interpolate_inplace,
-    _mask_known_anomalies,
     _split_panel_columns,
 )
 from .tuning_metrics import (
@@ -89,11 +88,6 @@ class SpotforecastTuner:
             except (TypeError, ValueError):
                 n_lags_max = 24
 
-        known_anomalies = self.config.get("known_anomalies", [])
-        known_anomaly_buffer = self.config["train"].get("known_anomaly_buffer")
-        if known_anomalies and known_anomaly_buffer:
-            df = _mask_known_anomalies(df, known_anomalies, known_anomaly_buffer)
-
         # Match SpotforecastTrainer.train_panel exactly: include `exogenous_*`
         # columns as exog features and exclude them from the tuning targets.
         # Otherwise tune optimizes a different model than train ends up fitting.
@@ -101,6 +95,24 @@ class SpotforecastTuner:
         configured_exog_columns = self.config["train"].get("exog_columns", [])
         mult_prefixes = multiplier_prefixes(self.config)
         target_cols, exog_columns = _split_panel_columns(df, configured_exog_columns, weight_suffix, mult_prefixes)
+
+        # Known-anomaly masking: blank target windows, re-impute with the same
+        # method the process stage used (single source of truth), and merge
+        # __weight so downstream observed_mask / strict-sample-mask see those
+        # rows as "not real" uniformly with process-imputed rows.
+        known_anomalies = self.config.get("known_anomalies", [])
+        known_anomaly_buffer = self.config["train"].get("known_anomaly_buffer")
+        if known_anomalies and known_anomaly_buffer:
+            imp_cfg = self.config.get("process", {}).get("imputation", {})
+            df = _apply_known_anomaly_imputation(
+                df,
+                known_anomalies,
+                known_anomaly_buffer,
+                target_cols=target_cols,
+                weight_suffix=weight_suffix,
+                imputation_method=imp_cfg.get("method", "linear_interpolation"),
+                imputation_params=imp_cfg.get("params", {}),
+            )
 
         if channels is not None:
             target_cols = [c for c in target_cols if c in channels]
@@ -170,14 +182,11 @@ class SpotforecastTuner:
                 channel_n_initial = channel_overrides.get("n_initial", channel_n_initial)
 
             # Match train: respect imputation `__weight` flags so imputed rows
-            # don't masquerade as observations during the search.
+            # don't masquerade as observations during the search. Targets are
+            # already gap-free (process stage + _apply_known_anomaly_imputation).
             observed_mask = _compute_observed_mask(tune_df, target_col, weight_suffix)
-            y_train_raw = tune_df[target_col].copy()
-            y_train_raw.name = target_col
-            y_train = y_train_raw.copy()
-            y_train.loc[~observed_mask] = np.nan
-            if y_train.isna().any():
-                y_train = _interpolate_inplace(y_train)
+            y_train = tune_df[target_col].copy()
+            y_train.name = target_col
             if len(y_train) < n_lags_max + 10:
                 self.logger.warning(f"  Skipping {target_col}: insufficient data ({len(y_train)} rows)")
                 continue

@@ -16,7 +16,7 @@ import pandas as pd
 from spotanomaly2.infrastructure import logging
 
 from .prediction import _predict_one_step_integrated
-from .preprocessing import _compute_observed_mask, _ensure_freq, _interpolate_inplace
+from .preprocessing import _ensure_freq, _interpolate_inplace
 
 
 class SpotforecastPredictor:
@@ -25,9 +25,6 @@ class SpotforecastPredictor:
     def __init__(self, config: dict[str, Any], logger=None):
         self.config = config
         self.logger = logger or logging.get_logger("SpotforecastPredictor")
-
-    def _get_weight_suffix(self) -> str:
-        return self.config.get("process", {}).get("imputation", {}).get("weight_suffix", "__weight")
 
     def predict(
         self,
@@ -48,7 +45,6 @@ class SpotforecastPredictor:
         # Older model artifacts (pre-differentiation) default to 0 = predict
         # raw y. Newer artifacts carry the actual order used at train time.
         diff_order = int(model_data.get("differentiation", 0))
-        weight_suffix = self._get_weight_suffix()
 
         df = _ensure_freq(df)
         if history_df is not None:
@@ -62,7 +58,6 @@ class SpotforecastPredictor:
                 df,
                 history_df,
                 exog_columns,
-                weight_suffix,
                 diff_order,
             )
         return pd.DataFrame(predictions, index=df.index)
@@ -74,14 +69,13 @@ class SpotforecastPredictor:
         df: pd.DataFrame,
         history_df: pd.DataFrame | None,
         exog_columns: list[str],
-        weight_suffix: str,
         diff_order: int,
     ) -> np.ndarray:
         """Predict one channel; return an all-NaN array if the forecaster is missing or the call fails."""
         if forecaster is None:
             return np.full(len(df), np.nan)
 
-        full_y = self._stitch_observed_target(target_col, df, history_df, weight_suffix)
+        full_y = self._stitch_observed_target(target_col, df, history_df)
         if len(full_y) == 0:
             return np.full(len(df), np.nan)
 
@@ -98,26 +92,17 @@ class SpotforecastPredictor:
         target_col: str,
         df: pd.DataFrame,
         history_df: pd.DataFrame | None,
-        weight_suffix: str,
     ) -> pd.Series:
-        """Build the observed-and-interpolated target series; concat history when present."""
+        """Concat history + df target into a single Series for the lag matrix.
+
+        Trusts preprocessing for imputation — process-stage `ImputationStep`
+        leaves the target gap-free, so no re-interpolation is needed here.
+        """
         if history_df is not None:
             full_y = pd.concat([history_df[target_col], df[target_col]])
-            observed_mask = pd.concat(
-                [
-                    _compute_observed_mask(history_df, target_col, weight_suffix),
-                    _compute_observed_mask(df, target_col, weight_suffix),
-                ]
-            )
         else:
             full_y = df[target_col].copy()
-            observed_mask = _compute_observed_mask(df, target_col, weight_suffix)
         full_y.name = target_col
-
-        full_y = full_y.copy()
-        full_y.loc[~observed_mask] = np.nan
-        if full_y.isna().any():
-            full_y = _interpolate_inplace(full_y)
         return _ensure_freq(full_y)
 
     @staticmethod

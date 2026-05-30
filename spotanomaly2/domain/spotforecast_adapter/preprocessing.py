@@ -14,6 +14,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from spotanomaly2.domain import imputation_methods
 from spotanomaly2.infrastructure import logging
 
 
@@ -54,6 +55,67 @@ def _mask_known_anomalies(
     return df
 
 
+def _apply_known_anomaly_imputation(
+    df: pd.DataFrame,
+    known_anomalies: list[dict],
+    buffer: str,
+    target_cols: list[str],
+    weight_suffix: str,
+    imputation_method: str = "linear_interpolation",
+    imputation_params: dict[str, Any] | None = None,
+) -> pd.DataFrame:
+    """Blank known-anomaly windows on ``target_cols``, re-impute, merge ``__weight``.
+
+    The trainer/tuner need a gap-free target series so autoregressive lag
+    features are computable, but they also need a way to keep known anomalies
+    out of the loss. This helper does both in one pass:
+
+    1. Blank target cells inside known-anomaly windows (extended by ``buffer``).
+    2. Re-impute with ``imputation_method`` — same method the process stage
+       uses, so the imputation strategy is single-sourced from config.
+    3. Set the matching ``{target}{weight_suffix}`` column to 0 for the
+       blanked rows, AND-ed with any pre-existing weight from the process
+       stage.
+
+    After this, ``__weight`` uniformly marks "this row is not real" for any
+    reason (process-imputed or known-anomaly), so ``_compute_observed_mask`` and
+    ``_build_strict_training_sample_mask`` do the right thing without any
+    further branching downstream.
+
+    The legacy ``psm`` method isn't registered in
+    ``imputation_methods.IMPUTATION_METHODS``; for the small interior cells from
+    known-anomaly masking, fall back to ``linear_interpolation``.
+    """
+    if not known_anomalies or not buffer or not target_cols:
+        return df
+
+    imputation_params = dict(imputation_params or {})
+    if imputation_method not in imputation_methods.IMPUTATION_METHODS:
+        imputation_method = "linear_interpolation"
+        imputation_params = {}
+
+    masked = _mask_known_anomalies(df, known_anomalies, buffer, columns=target_cols)
+
+    for col in target_cols:
+        # Cells the mask blanked: NaN now AND not NaN in the input. This is the
+        # purely additive contribution of known-anomaly masking on top of
+        # whatever the process stage already left behind.
+        anomaly_nan = masked[col].isna() & ~df[col].isna()
+        if not anomaly_nan.any():
+            continue
+
+        weight_col = f"{col}{weight_suffix}"
+        pre_weight = (
+            masked[weight_col].fillna(0).astype(int)
+            if weight_col in masked.columns
+            else pd.Series(1, index=masked.index, dtype=int)
+        )
+        masked[col] = imputation_methods.impute_series(masked[col], method=imputation_method, **imputation_params)
+        masked[weight_col] = (pre_weight & (~anomaly_nan).astype(int)).astype(int)
+
+    return masked
+
+
 def _split_panel_columns(
     df: pd.DataFrame,
     configured_exog_columns: list[str],
@@ -92,38 +154,6 @@ def _compute_observed_mask(df: pd.DataFrame, target_col: str, weight_suffix: str
     if weight_col in df.columns:
         return df[weight_col].fillna(0.0) >= 0.5
     return pd.Series(True, index=df.index)
-
-
-def _prepare_target_for_lag_features(
-    df: pd.DataFrame,
-    target_col: str,
-    weight_suffix: str,
-) -> tuple[pd.Series, pd.Series]:
-    """Build a target series suitable for forming lag features.
-
-    Returns ``(y, observed_mask)``:
-
-    - ``observed_mask`` flags which rows came from real measurements (not
-      imputation). It is the source of truth for *loss weighting* — pass it
-      into ``_build_strict_training_sample_mask`` or hand it to whoever
-      builds the forecaster's ``weight_func``.
-    - ``y`` has imputed positions blanked then linearly interpolated, so any
-      later *observed* row still has well-defined lag values to form features
-      from. The interpolated values are scaffolding for feature extraction
-      only — don't treat them as real measurements.
-
-    These two roles are deliberately separate: ``y`` keeps the lag pipeline
-    happy; ``observed_mask`` decides what the model is allowed to learn from.
-    Callers that only need lag-feature continuity (e.g. the test/predict
-    path) can discard the mask.
-    """
-    observed = _compute_observed_mask(df, target_col, weight_suffix)
-    y = df[target_col].copy()
-    y.name = target_col
-    y.loc[~observed] = np.nan
-    if y.isna().any():
-        y = _interpolate_inplace(y)
-    return y, observed
 
 
 def _build_strict_training_sample_mask(observed_mask: pd.Series, n_lags: int) -> pd.Series:

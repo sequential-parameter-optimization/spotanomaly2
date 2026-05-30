@@ -25,12 +25,12 @@ from spotanomaly2.infrastructure.storage import generate_timestamp
 from .factory import _create_forecaster
 from .prediction import _difference, _predict_one_step_integrated
 from .preprocessing import (
+    _apply_known_anomaly_imputation,
     _build_strict_training_sample_mask,
+    _compute_observed_mask,
     _detect_anomalies_via_ridge,
     _ensure_freq,
     _interpolate_inplace,
-    _mask_known_anomalies,
-    _prepare_target_for_lag_features,
     _split_panel_columns,
     _time_series_train_test_split,
 )
@@ -108,7 +108,7 @@ class SpotforecastTrainer:
 
         self.logger.info(f"Trained {len(forecasters)} forecasters")
 
-        res_df = self._compute_eval_metrics(test_df, target_cols, y_pred_test)
+        res_df = self._compute_eval_metrics(test_df, target_cols, y_pred_test, weight_suffix)
         self.logger.info(f"Average RMSE: {res_df['rmse'].mean():.4f}")
 
         model_data = self._build_model_artifact(
@@ -147,7 +147,16 @@ class SpotforecastTrainer:
         known_anomalies = self.config.get("known_anomalies", [])
         known_anomaly_buffer = self.config["train"].get("known_anomaly_buffer")
         if known_anomalies and known_anomaly_buffer:
-            panel_data = _mask_known_anomalies(panel_data, known_anomalies, known_anomaly_buffer, columns=target_cols)
+            imp_cfg = self.config.get("process", {}).get("imputation", {})
+            panel_data = _apply_known_anomaly_imputation(
+                panel_data,
+                known_anomalies,
+                known_anomaly_buffer,
+                target_cols=target_cols,
+                weight_suffix=weight_suffix,
+                imputation_method=imp_cfg.get("method", "linear_interpolation"),
+                imputation_params=imp_cfg.get("params", {}),
+            )
 
         return panel_data, target_cols, exog_columns
 
@@ -345,7 +354,8 @@ class SpotforecastTrainer:
         ``_predict_one_step_integrated``), so the train-time eval metric is
         the same one production reports.
         """
-        y_test_for_lags, _ = _prepare_target_for_lag_features(test_df, target_col, weight_suffix)
+        # test_df targets are already gap-free (process stage + _apply_known_anomaly_imputation).
+        y_test_for_lags = test_df[target_col].copy()
 
         full_y_raw = pd.concat([y_train, y_test_for_lags])
         full_y_raw.name = target_col
@@ -387,9 +397,13 @@ class SpotforecastTrainer:
 
         self.logger.info(f"  Training forecaster for: {target_col} (model={channel_model_name})")
 
-        # y_train: imputed rows interpolated so later observed rows have valid lag features.
-        # observed_mask: original boolean — drives loss weighting below, not feature values.
-        y_train, observed_mask = _prepare_target_for_lag_features(train_df, target_col, weight_suffix)
+        # Process stage + _apply_known_anomaly_imputation together guarantee a
+        # gap-free target with __weight=0 marking every non-real row (process-
+        # imputed or known-anomaly). No re-interpolation needed here.
+        y_train = train_df[target_col].copy()
+        y_train.name = target_col
+
+        observed_mask = _compute_observed_mask(train_df, target_col, weight_suffix)
         if len(y_train) < effective_n_lags + 10:
             self.logger.warning(f"  Skipping {target_col}: insufficient data ({len(y_train)} rows)")
             return None
@@ -415,11 +429,15 @@ class SpotforecastTrainer:
             forecaster, y_train, test_df, target_col, weight_suffix, full_exog, diff_order
         )
 
-        y_test_col = test_df[target_col].values
-        valid = ~np.isnan(y_test_col)
-        if valid.any():
-            rmse = np.sqrt(np.mean((y_test_col[valid] - channel_preds[valid]) ** 2))
-            mae = np.mean(np.abs(y_test_col[valid] - channel_preds[valid]))
+        # Score against real observations only — rows where __weight < 0.5
+        # (process-imputed or known-anomaly) are interpolated values and would
+        # bias RMSE/MAE if compared against the model's prediction.
+        test_observed = _compute_observed_mask(test_df, target_col, weight_suffix).to_numpy()
+        if test_observed.any():
+            y_real = test_df[target_col].to_numpy(dtype=float)[test_observed]
+            preds_real = channel_preds[test_observed]
+            rmse = np.sqrt(np.mean((y_real - preds_real) ** 2))
+            mae = np.mean(np.abs(y_real - preds_real))
             self.logger.info(f"    {target_col}: RMSE={rmse:.4f}, MAE={mae:.4f}")
 
         return (
@@ -437,9 +455,18 @@ class SpotforecastTrainer:
         test_df: pd.DataFrame,
         target_cols: list[str],
         y_pred_test: np.ndarray,
+        weight_suffix: str,
     ) -> pd.DataFrame:
-        """Build per-channel RMSE/MAE DataFrame from the test predictions."""
-        y_test_vals = test_df[target_cols].values
+        """Build per-channel RMSE/MAE DataFrame from the test predictions.
+
+        Imputed / known-anomaly rows (``__weight < 0.5``) are excluded from the
+        metric — their stored value is interpolated, not observed, so comparing
+        it to the model's prediction would bias the score.
+        """
+        y_test_vals = test_df[target_cols].to_numpy(dtype=float).copy()
+        for i, col in enumerate(target_cols):
+            obs = _compute_observed_mask(test_df, col, weight_suffix).to_numpy()
+            y_test_vals[~obs, i] = np.nan
         rmse = np.sqrt(np.nanmean((y_test_vals - y_pred_test) ** 2, axis=0))
         mae = np.nanmean(np.abs(y_test_vals - y_pred_test), axis=0)
         return pd.DataFrame({"rmse": rmse, "mae": mae}, index=target_cols)
