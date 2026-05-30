@@ -1,4 +1,5 @@
 """Model training service using spotforecast2."""
+
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +23,7 @@ class ModelTrainer:
         panel_data: pd.DataFrame,
         timestamp: str,
         save_model: bool = True,
-    ):
+    ) -> tuple[pd.DataFrame, str]:
         eval_df, timestamp = self.trainer.train_panel(
             panel_id,
             panel_data,
@@ -36,6 +37,8 @@ class ModelTrainer:
         eval_path = models_dir / eval_filename
         eval_df.to_csv(eval_path)
         self.logger.info(f"Saved evaluation results to {eval_path}")
+
+        return eval_df, timestamp
 
     def train_all_panels(self, panel_data: dict[str, pd.DataFrame]) -> dict[str, tuple[pd.DataFrame, str]]:
         return self.trainer.train_all_panels(panel_data)
