@@ -34,10 +34,12 @@ def test_load_default_config():
 def test_load_config_train_section():
     config = load_default_config()
     train = config["train"]
-    assert "train_ratio" in train
+    assert "split" in train
     assert "fallback_model" in train
     assert "lags" in train
-    assert isinstance(train["train_ratio"], float)
+    split = train["split"]
+    assert {"train", "test", "score"} <= set(split)
+    assert split["train"] + split["test"] + split["score"] == 100
 
 
 def test_load_config_detect_section():

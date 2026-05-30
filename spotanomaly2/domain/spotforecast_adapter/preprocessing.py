@@ -18,11 +18,6 @@ from spotanomaly2.domain import imputation_methods
 from spotanomaly2.infrastructure import logging
 
 
-def _time_series_train_test_split(df: pd.DataFrame, train_ratio: float = 0.8) -> tuple[pd.DataFrame, pd.DataFrame]:
-    split_idx = int(len(df) * train_ratio)
-    return df.iloc[:split_idx], df.iloc[split_idx:]
-
-
 def _mask_known_anomalies(
     df: pd.DataFrame,
     known_anomalies: list[dict],

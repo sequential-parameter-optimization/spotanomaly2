@@ -311,16 +311,18 @@ class TestSpotforecastTuner:
         assert "exogenous_zulauf" not in results, "exogenous_* columns must be exog features, not tuning targets"
 
     def test_tune_uses_full_data_no_outer_holdout(self, sample_config):
-        """The tuner must use ALL the rows it's given — no outer 90/10 split
-        that quietly discards the most recent timeline window. The discarded
-        slice is exactly where distribution drift toward live conditions
-        shows up; chopping it off makes the CV blind to that drift and lets
-        constant-mean predictors tie real models.
+        """The tuner's CV must:
 
-        Sentinel check: tune on N rows and assert the configured CV holdout
-        matches what production code uses. If a future change re-introduces
-        the outer split, the CV won't see the latest N×20% rows and this
-        test will catch it.
+        - Slice off the ``train.split.score`` percentage entirely (those rows
+          belong to the scorer; the tuner must never see them).
+        - Inside the train+test portion, split at the train/test boundary so
+          CV-train mirrors what the trainer fits on and CV-val mirrors the
+          trainer's test window.
+
+        Sentinel check: with the standard 80/10/10 split, on N rows the CV
+        ``initial_train_size`` must be ``int(N * 0.80)`` (NOT ``int((N*0.9) * 0.8)``).
+        If a future change re-introduces a percentage-of-available split inside
+        CV (e.g. 80% of the 90% pool), this test will catch it.
         """
         rng = np.random.default_rng(0)
         n = 400
@@ -359,13 +361,15 @@ class TestSpotforecastTuner:
         finally:
             OneStepAheadFold.__init__ = real_init
 
-        # initial_train_size should be 80% of the FULL n, not 70% of an outer-
-        # split 90%. The val window is therefore the last 20% of df.
-        assert captured["initial_train_size"] == int(n * 0.8), (
+        # CV train size is ``int(N * split.train / 100)``, computed against the
+        # FULL N rows, not against the (train + test) sub-pool. The score window
+        # is sliced off before CV runs.
+        split = config["train"]["split"]
+        expected = int(n * split["train"] / 100)
+        assert captured["initial_train_size"] == expected, (
             f"Tuner CV is splitting the wrong number of rows. Expected "
-            f"initial_train_size={int(n * 0.8)} (80% of all {n} rows); got "
-            f"{captured['initial_train_size']}. A regressed outer 90/10 split "
-            "would yield ~252 instead, hiding the latest timeline from CV."
+            f"initial_train_size={expected} ({split['train']}% of all {n} rows); "
+            f"got {captured['initial_train_size']}."
         )
 
     def test_tune_uses_one_step_ahead_cv_on_autocorrelated_data(self, sample_config):
@@ -558,7 +562,6 @@ class TestSpotforecastTuner:
             cfg["paths"]["models_dir"] = str(tmp_path / f"models_diff{diff_order}")
             cfg["train"]["channel_config_files"] = {"test": str(degenerate_yaml)}
             cfg["train"]["differentiation"] = diff_order
-            cfg["train"]["train_ratio"] = 0.9
             cfg["train"]["lags"] = 6
             trainer = SpotforecastTrainer(cfg)
             _, ts = trainer.train_panel("test", df)

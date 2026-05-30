@@ -1,6 +1,5 @@
 """Pipeline orchestration for event detection system."""
 
-from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -13,8 +12,8 @@ from spotanomaly2.domain.anomaly_detector import AnomalyDetector
 from spotanomaly2.domain.data_processor import DataProcessor
 from spotanomaly2.domain.model_trainer import ModelTrainer
 from spotanomaly2.domain.primary_fetcher import PrimaryDataFetcher
-from spotanomaly2.infrastructure import logging, storage
-from spotanomaly2.infrastructure.storage import generate_timestamp, make_yaml_serializable
+from spotanomaly2.infrastructure import logging
+from spotanomaly2.infrastructure.storage import generate_timestamp
 
 
 class Pipeline:
@@ -124,12 +123,12 @@ class Pipeline:
         Returns:
             Dict of panel_id -> channel -> tuning results.
         """
-        import yaml
-
         self.logger.info("=" * 60)
         self.logger.info("STEP: Tune forecaster hyperparameters (SpotOptim)")
         self.logger.info("=" * 60)
 
+        # Lazy import: spotoptim / surrogate-model deps are heavy and
+        # detect-only runs shouldn't pay for them.
         from spotanomaly2.domain.model_tuner import ModelTuner
 
         panel_data = self._data_manager.load_processed_data()
@@ -140,58 +139,7 @@ class Pipeline:
             panel_data = {panel_id: panel_data[panel_id]}
 
         channels_filter = [channel] if channel else None
-
-        tuner = ModelTuner(self.config, self.logger)
-        all_results = tuner.tune_all_panels(panel_data, channels=channels_filter)
-
-        tune_cfg = self.config.get("tune", {})
-        output_dir = Path(tune_cfg.get("output_dir", "data/tuning_results"))
-        timestamp = storage.generate_timestamp()
-        results_dir = output_dir / timestamp
-        storage.ensure_dir(results_dir)
-
-        for pid, channel_results in all_results.items():
-            output_data = {
-                "panel_id": pid,
-                "timestamp": timestamp,
-                "channels": {},
-            }
-            for ch_name, ch_result in channel_results.items():
-                output_data["channels"][ch_name] = make_yaml_serializable(ch_result)
-
-            result_path = results_dir / f"panel_{pid}.yaml"
-            with open(result_path, "w") as f:
-                yaml.dump(output_data, f, default_flow_style=False, sort_keys=False)
-            self.logger.info(f"Saved tuning results to {result_path}")
-
-        self.logger.info("")
-        self.logger.info("=" * 70)
-        self.logger.info("TUNING RESULTS SUMMARY")
-        self.logger.info("=" * 70)
-        for pid, channel_results in all_results.items():
-            self.logger.info(f"\nPanel {pid}:")
-            self.logger.info("-" * 50)
-            for ch_name, ch_result in channel_results.items():
-                if "error" in ch_result:
-                    self.logger.error(f"  {ch_name}: FAILED - {ch_result['error']}")
-                    continue
-                metric_val = ch_result.get("best_metric")
-                best_lags = ch_result.get("best_lags")
-                best_model = ch_result.get("best_model", "?")
-                best_params = ch_result.get("best_params", {})
-                self.logger.info(f"  {ch_name}:")
-                self.logger.info(f"    model  = {best_model}")
-                self.logger.info(f"    metric = {metric_val}")
-                self.logger.info(f"    lags   = {best_lags}")
-                for pname, pval in best_params.items():
-                    self.logger.info(f"    {pname} = {pval}")
-        self.logger.info("=" * 70)
-        self.logger.info(f"Results saved to: {results_dir}")
-        self.logger.info("=" * 70)
-
-        tuner.update_channel_configs(all_results)
-
-        return all_results
+        return ModelTuner(self.config, self.logger).run(panel_data, channels=channels_filter)
 
     def detect(self) -> dict[str, tuple]:
         """Run anomaly detection over processed data and persist results.

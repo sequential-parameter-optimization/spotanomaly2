@@ -17,7 +17,7 @@ import joblib
 import numpy as np
 import pandas as pd
 
-from spotanomaly2.application.config import load_panel_channel_config
+from spotanomaly2.application.config import load_panel_channel_config, resolve_data_split
 from spotanomaly2.infrastructure import logging, storage
 from spotanomaly2.infrastructure.storage import generate_timestamp
 
@@ -30,11 +30,7 @@ from .channel_prep import (
 )
 from .factory import _create_forecaster
 from .prediction import _predict_one_step_integrated
-from .preprocessing import (
-    _compute_observed_mask,
-    _ensure_freq,
-    _time_series_train_test_split,
-)
+from .preprocessing import _compute_observed_mask
 
 
 class SpotforecastTrainer:
@@ -53,7 +49,7 @@ class SpotforecastTrainer:
     ) -> tuple[pd.DataFrame, str]:
         """Train one ForecasterRecursive per target channel for a panel."""
         knobs = resolve_train_settings(self.config)
-        train_ratio = self.config["train"]["train_ratio"]
+        split = resolve_data_split(self.config)
         model_label = self.config["train"]["fallback_model"]
         n_lags = knobs.n_lags
         random_seed = knobs.random_seed
@@ -66,7 +62,7 @@ class SpotforecastTrainer:
         self.logger.info(f"Training spotforecast2 models on {len(panel_data)} rows for panel {panel_id}")
 
         panel_data, target_cols, exog_columns = prepare_panel(self.config, panel_data, weight_suffix, self.logger)
-        train_df, test_df = self._split_train_test(panel_data, train_ratio)
+        train_df, test_df, score_start_timestamp = self._split_train_test_score(panel_data, split)
         panel_default_model, panel_default_params, channel_cfg_map = self._load_and_resolve_panel_config(panel_id)
         full_exog = self._build_full_exog(train_df, test_df, exog_columns)
 
@@ -115,9 +111,10 @@ class SpotforecastTrainer:
                 diff_order=diff_order,
                 n_lags=n_lags,
                 model_label=model_label,
-                train_ratio=train_ratio,
+                split=split,
                 train_df=train_df,
                 test_df=test_df,
+                score_start_timestamp=score_start_timestamp,
                 timestamp=timestamp,
             )
 
@@ -125,18 +122,32 @@ class SpotforecastTrainer:
 
         return res_df, timestamp
 
-    def _split_train_test(
+    def _split_train_test_score(
         self,
         panel_data: pd.DataFrame,
-        train_ratio: float,
-    ) -> tuple[pd.DataFrame, pd.DataFrame]:
-        """Time-series split with frequency normalization on both halves."""
-        train_df, test_df = _time_series_train_test_split(panel_data, train_ratio=train_ratio)
-        fallback_freq = self.config.get("process", {}).get("resample", {}).get("freq", "5min")
-        train_df = _ensure_freq(train_df, fallback_freq)
-        test_df = _ensure_freq(test_df, fallback_freq)
-        self.logger.info(f"Train size: {len(train_df)}, Test size: {len(test_df)}")
-        return train_df, test_df
+        split,
+    ) -> tuple[pd.DataFrame, pd.DataFrame, str | None]:
+        """Carve panel_data into (train_df, test_df, score_start_timestamp).
+
+        ``train_df`` is the forecaster's fit window; ``test_df`` is held-out
+        for eval (mirrors the tuner's CV val window). The final ``score`` slice
+        is **not returned** — the trainer must never see it. The boundary is
+        persisted as ``score_start_timestamp`` so the detector can identify
+        which rows are unseen by the forecaster + tuner pipeline.
+        """
+        n = len(panel_data)
+        train_end = int(n * split.train / 100)
+        score_start = int(n * (split.train + split.test) / 100)
+        train_df = panel_data.iloc[:train_end]
+        test_df = panel_data.iloc[train_end:score_start]
+        score_start_ts: str | None = None
+        if isinstance(panel_data.index, pd.DatetimeIndex) and score_start < n:
+            score_start_ts = panel_data.index[score_start].isoformat()
+        self.logger.info(
+            f"Train size: {len(train_df)} ({split.train}%), Test size: {len(test_df)} ({split.test}%), "
+            f"Score reserved: {n - score_start} ({split.score}%, not visible to trainer)"
+        )
+        return train_df, test_df, score_start_ts
 
     def _load_and_resolve_panel_config(self, panel_id: str) -> tuple[str | None, dict[str, Any], dict[str, Any]]:
         """Load per-panel YAML and extract (default_model, default_params, channel_cfg_map)."""
@@ -388,12 +399,18 @@ class SpotforecastTrainer:
         diff_order: int,
         n_lags: int | list[int],
         model_label: str,
-        train_ratio: float,
+        split,
         train_df: pd.DataFrame,
         test_df: pd.DataFrame,
+        score_start_timestamp: str | None,
         timestamp: str,
     ) -> dict[str, Any]:
-        """Package the dict that ``SpotforecastPredictor`` consumes."""
+        """Package the dict that ``SpotforecastPredictor`` and the detector consume.
+
+        ``score_start_timestamp`` marks the first row reserved for the scorer
+        (never seen by trainer or tuner). The detector uses it to draw the
+        leakage-free seen/unseen boundary.
+        """
         unique_models = {spec["model"] for spec in channel_model_specs.values()}
         if len(unique_models) == 1:
             actual_label = next(iter(unique_models))
@@ -411,12 +428,14 @@ class SpotforecastTrainer:
             "differentiation": diff_order,
             "model_type": f"spotforecast2_{actual_label.lower()}",
             "model_name": actual_label,
-            "train_ratio": train_ratio,
+            "split": {"train": split.train, "test": split.test, "score": split.score},
             "train_size": len(train_df),
             "test_size": len(test_df),
             "train_start_timestamp": self._iso_min(train_df),
             "train_end_timestamp": self._iso_max(train_df),
             "test_start_timestamp": self._iso_min(test_df),
+            "test_end_timestamp": self._iso_max(test_df),
+            "score_start_timestamp": score_start_timestamp,
             "timestamp": timestamp,
         }
 

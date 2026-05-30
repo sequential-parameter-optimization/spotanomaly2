@@ -57,6 +57,7 @@ paths:
   raw_dir: "data/raw"
   processed_dir: "data/processed"
   models_dir: "data/models"
+  tuning_dir: "data/tuning_results"
   results_dir: "data/results"
   evaluations_dir: "data/evaluations"
   credentials_file: ".env"
@@ -140,7 +141,16 @@ process:
   median_filter_kernel: 3
 
 train:
-  train_ratio: 0.9
+  # Three disjoint windows of the processed data — must sum to 100.
+  # - train: forecaster fits here.
+  # - test:  trainer's eval window AND tuner's CV val window. Held out from
+  #          the forecaster's fit.
+  # - score: scorer's territory. NEVER seen by trainer or tuner — this closes
+  #          the hyperparameter-selection leakage older designs had.
+  split:
+    train: 80
+    test: 10
+    score: 10
   random_seed: 42
   fallback_model: "LightGBM"  # used when no per-channel/per-panel model is set in channel_config_files
   lags: 6  # Number of autoregressive lags for ForecasterRecursive
@@ -273,7 +283,12 @@ tune:
   # targets (e.g. pH, turbidity). Higher is better; the adapter negates
   # internally so SpotOptim's minimiser still works.
   metric: "r2"
-  output_dir: "data/tuning_results"
+  # OneStepAheadFold splits at ``train.split.train`` / ``train.split.test``:
+  # CV-train on the train% rows, CV-val on the test% rows. The score% window
+  # is sliced off before CV so the tuner physically cannot leak into the
+  # scorer's territory.
+  # Output dir for tuning result YAMLs is read from ``paths.tuning_dir``;
+  # ``tune.output_dir`` is honored as a fallback for existing user configs.
   lags:
     - "[1, 2, 3, 11, 12, 22, 23, 24, 47, 48, 167, 168]"
     - "48"

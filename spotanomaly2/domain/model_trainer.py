@@ -1,4 +1,5 @@
 """Model training service using spotforecast2."""
+
 from pathlib import Path
 from typing import Any
 
