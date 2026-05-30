@@ -20,7 +20,7 @@ import types
 import pandas as pd
 import pytest
 
-from spotanomaly2.application.exogenous_downloader import ExogenousDownloader
+from spotanomaly2.application.exogenous_downloader import ExogenousDownloadManager
 
 
 @pytest.fixture
@@ -84,7 +84,7 @@ class TestDisabledSource:
                 }
             ],
         }
-        downloader = ExogenousDownloader(cfg)
+        downloader = ExogenousDownloadManager(cfg)
         status: dict = {}
         downloader.download_all(*time_window, status)
 
@@ -111,7 +111,7 @@ class TestEnabledSource:
                 }
             ],
         }
-        downloader = ExogenousDownloader(cfg)
+        downloader = ExogenousDownloadManager(cfg)
         status: dict = {}
         downloader.download_all(*time_window, status)
 
@@ -146,7 +146,7 @@ class TestFailurePaths:
                 }
             ],
         }
-        downloader = ExogenousDownloader(cfg)
+        downloader = ExogenousDownloadManager(cfg)
         status: dict = {}
         downloader.download_all(*time_window, status)
 
@@ -177,7 +177,7 @@ class TestFailurePaths:
                 }
             ],
         }
-        downloader = ExogenousDownloader(cfg)
+        downloader = ExogenousDownloadManager(cfg)
         status: dict = {}
         downloader.download_all(*time_window, status)
 
@@ -192,7 +192,7 @@ class TestMalformedEntries:
                 {"name": "no_fetcher", "joiner": "spotanomaly2.x:Y", "config": {}},
             ],
         }
-        downloader = ExogenousDownloader(cfg)
+        downloader = ExogenousDownloadManager(cfg)
         status: dict = {}
         downloader.download_all(*time_window, status)
         assert status == {}
@@ -208,7 +208,7 @@ class TestMalformedEntries:
                 }
             ],
         }
-        downloader = ExogenousDownloader(cfg)
+        downloader = ExogenousDownloadManager(cfg)
         status: dict = {}
         downloader.download_all(*time_window, status)
         assert status == {}
@@ -232,5 +232,5 @@ class TestFetchStatusOptional:
                 }
             ],
         }
-        ExogenousDownloader(cfg).download_all(*time_window, fetch_status=None)
+        ExogenousDownloadManager(cfg).download_all(*time_window, fetch_status=None)
         assert calls == [time_window]

@@ -19,7 +19,7 @@ from typing import Any
 import pandas as pd
 
 from spotanomaly2.domain.exogenous.residual_multiplier import multiplier_prefixes
-from spotanomaly2.domain.imputation_methods import impute_dataframe
+from spotanomaly2.domain.imputation import impute_dataframe
 
 from .prediction import _difference
 from .preprocessing import (
@@ -48,8 +48,8 @@ class TrainKnobs:
     largest in the search space.
     """
 
-    n_lags: int | list[int]
-    n_lags_max: int
+    fallback_lags: int | list[int]
+    fallback_lags_max: int
     random_seed: int
     diff_order: int
     weight_suffix: str
@@ -71,8 +71,8 @@ def resolve_train_settings(config: dict[str, Any]) -> TrainKnobs:
         except (TypeError, ValueError):
             n_lags_max = 24
     return TrainKnobs(
-        n_lags=n_lags,
-        n_lags_max=n_lags_max,
+        fallback_lags=n_lags,
+        fallback_lags_max=n_lags_max,
         random_seed=train_cfg.get("random_seed", 42),
         # Δy order — must match what train_panel fits, otherwise the tuner's
         # winning hyperparameters aren't optimal for the production estimator.

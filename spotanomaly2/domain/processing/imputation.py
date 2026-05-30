@@ -5,8 +5,8 @@ from typing import Any, Optional
 import numpy as np
 import pandas as pd
 
-from spotanomaly2.domain import imputation, imputation_methods
-from spotanomaly2.domain.processing_steps.base import ProcessingStep
+from spotanomaly2.domain import imputation
+from spotanomaly2.domain.processing.base import ProcessingStep
 
 
 class ImputationStep(ProcessingStep):
@@ -43,6 +43,9 @@ class ImputationStep(ProcessingStep):
             self.logger.info(f"Imputation method: {self.method}")
 
     def process(self, df: pd.DataFrame, panel_id: Optional[str] = None) -> pd.DataFrame:
+        # deep=True so the in-place index.freq assignment below cannot leak to the caller.
+        df = df.copy()
+        df.index = df.index.copy(deep=True)
         # Set frequency on index if not already set
         if df.index.freq is None:
             freq_str = self.config.get("process", {}).get("resample", {}).get("freq", "5min")
@@ -56,29 +59,15 @@ class ImputationStep(ProcessingStep):
             except (ValueError, TypeError):
                 df.index.freq = pd.tseries.frequencies.to_offset(freq_str)
 
-        if self.method == "psm":
-            # Use original PSM + mean imputation (current behavior)
-            return self._impute_psm(df)
-        else:
-            # Use new imputation methods
-            return self._impute_alternative(df)
+        return self._impute(df)
 
-    def _impute_psm(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Original PSM-based imputation (backward compatible)."""
-        for col in df.columns:
-            if col.endswith(self.weight_suffix):
-                continue
-            series = df[col].copy()
-            imputed_mask = series.isna()
-            series = imputation.fill_missing_with_mean(series)
-            series = imputation.subsequence_imputation(series)
-            df[col] = series
-            if self.add_weights and series.dtype in [np.float64, np.float32, np.int64, np.int32]:
-                df[f"{col}{self.weight_suffix}"] = (~imputed_mask).astype(int)
-        return df
+    def _impute(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Impute every numeric column using the configured registry method.
 
-    def _impute_alternative(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Use alternative imputation methods."""
+        ``psm`` is a registered strategy like any other (see
+        :class:`spotanomaly2.domain.imputation.PSMImputation`), so there is no
+        special-casing here. If a method raises, fall back to PSM per column.
+        """
         for col in df.columns:
             if col.endswith(self.weight_suffix):
                 continue
@@ -89,7 +78,7 @@ class ImputationStep(ProcessingStep):
                     continue
 
                 # Apply imputation + shared weight flag creation
-                imputed, observed_weight = imputation_methods.impute_series_with_weight(
+                imputed, observed_weight = imputation.impute_series_with_weight(
                     series, method=self.method, **self.method_params
                 )
                 df[col] = imputed

@@ -51,7 +51,7 @@ class SpotforecastTrainer:
         knobs = resolve_train_settings(self.config)
         split = resolve_data_split(self.config)
         model_label = self.config["train"]["fallback_model"]
-        n_lags = knobs.n_lags
+        fallback_lags = knobs.fallback_lags
         random_seed = knobs.random_seed
         diff_order = knobs.diff_order
         weight_suffix = knobs.weight_suffix
@@ -81,7 +81,7 @@ class SpotforecastTrainer:
                 panel_default_model=panel_default_model,
                 panel_default_params=panel_default_params,
                 model_label=model_label,
-                n_lags=n_lags,
+                fallback_lags=fallback_lags,
                 random_seed=random_seed,
                 diff_order=diff_order,
                 weight_suffix=weight_suffix,
@@ -109,7 +109,7 @@ class SpotforecastTrainer:
                 exog_columns=exog_columns,
                 channel_model_specs=channel_model_specs,
                 diff_order=diff_order,
-                n_lags=n_lags,
+                n_lags=fallback_lags,
                 model_label=model_label,
                 split=split,
                 train_df=train_df,
@@ -186,7 +186,7 @@ class SpotforecastTrainer:
     @staticmethod
     def _resolve_channel_lags(
         channel_cfg: dict[str, Any],
-        n_lags: int | list[int],
+        fallback_lags: int | list[int],
     ) -> tuple[int | list[int], int]:
         """Return (effective_lags, effective_n_lags) from per-channel ``best_lags`` if any.
 
@@ -194,16 +194,16 @@ class SpotforecastTrainer:
         specific lag offsets). ``effective_n_lags`` is the int used for
         sufficiency checks (max lag = longest history needed).
         """
-        effective = channel_cfg.get("best_lags", n_lags)
+        effective = channel_cfg.get("best_lags", fallback_lags)
         if isinstance(effective, (list, tuple)) and effective:
             return list(effective), int(max(effective))
         try:
             n = int(effective)
             return n, n
         except (TypeError, ValueError):
-            if isinstance(n_lags, (list, tuple)) and n_lags:
-                return list(n_lags), int(max(n_lags))
-            return n_lags, int(n_lags) if not isinstance(n_lags, (list, tuple)) else 24
+            if isinstance(fallback_lags, (list, tuple)) and fallback_lags:
+                return list(fallback_lags), int(max(fallback_lags))
+            return fallback_lags, int(fallback_lags) if not isinstance(fallback_lags, (list, tuple)) else 24
 
     def _fit_channel_forecaster(
         self,
@@ -295,7 +295,7 @@ class SpotforecastTrainer:
         panel_default_model: str | None,
         panel_default_params: dict[str, Any],
         model_label: str,
-        n_lags: int | list[int],
+        fallback_lags: int | list[int],
         random_seed: int,
         diff_order: int,
         weight_suffix: str,
@@ -313,7 +313,7 @@ class SpotforecastTrainer:
         channel_model_name, channel_model_params = self._resolve_channel_model_spec(
             channel_cfg, panel_default_model, panel_default_params, model_label
         )
-        effective_lags, effective_n_lags = self._resolve_channel_lags(channel_cfg, n_lags)
+        effective_lags, effective_n_lags = self._resolve_channel_lags(channel_cfg, fallback_lags)
 
         self.logger.info(f"  Training forecaster for: {target_col} (model={channel_model_name})")
 

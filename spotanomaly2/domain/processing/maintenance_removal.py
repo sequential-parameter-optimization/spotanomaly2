@@ -5,7 +5,7 @@ from typing import Any, Optional
 import numpy as np
 import pandas as pd
 
-from spotanomaly2.domain.processing_steps.base import ProcessingStep
+from spotanomaly2.domain.processing.base import ProcessingStep
 
 
 class MaintenanceRemovalStep(ProcessingStep):

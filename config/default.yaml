@@ -237,8 +237,14 @@ detect:
     #     channel_1_orp_mv: 0.9997
     #     channel_3_turbidity: 0.999
 
+# The primary data source is pluggable: set ``fetcher`` to a "module:ClassName"
+# spec implementing the primary-fetcher contract. spotanomaly2 ships no built-in
+# primary source — the public ENTSO-E reference is
+# ``spotanomaly2.examples.entsoe_fetcher:EntsoePrimaryFetcher`` (see the runnable
+# ``config/entsoe_example.yaml``); point this at your own data source otherwise.
 primary:
   display_name: "Primary"
+  # fetcher: "your_package.your_module:YourPrimaryFetcher"
 
 # Each source's joiner emits ``exogenous_<name>_<measurement>`` columns, which
 # are auto-detected as model exog features. Set ``multiply_residuals: true`` on a
@@ -246,19 +252,6 @@ primary:
 # (residual = column * (actual - predicted)) rather than feed the model — useful
 # for e.g. a flow signal that should scale anomaly sensitivity.
 exogenous:
-  - name: "a"
-    fetcher: "spotanomaly2.domain.exogenous.source_a:ExogenousAFetcher"
-    joiner: "spotanomaly2.domain.exogenous.source_a:ExogenousAJoiner"
-    config:
-      enabled: true
-      multiply_residuals: true
-      cache_dir: "data/exogenous"
-      display_name: "Source A"
-      panel_sources:
-        "1":
-          - "source_a"
-        "2":
-          - "source_b"
   - name: "weather"
     fetcher: "spotanomaly2.domain.exogenous.weather:ExogenousWeatherFetcher"
     joiner: "spotanomaly2.domain.exogenous.weather:ExogenousWeatherJoiner"

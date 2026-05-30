@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from spotanomaly2.domain.processing_steps import (
+from spotanomaly2.domain.processing import (
     ImputationStep,
     MaintenanceRemovalStep,
     ManualOutlierRemovalStep,
@@ -361,4 +361,33 @@ def test_weather_adjustment_does_not_mutate_input(sample_process_config):
     )
     original = df.copy()
     WeatherAdjustmentStep(sample_process_config).process(df)
+    pd.testing.assert_frame_equal(df, original)
+
+
+# ----- no-mutation regression tests (audit C3) -------------------------------
+
+
+def test_imputation_step_does_not_mutate_input(sample_process_config):
+    # ImputationStep used to write columns/weights and set index.freq on the caller's
+    # frame. It must operate on a copy (incl. a copied index, since copy() shares the
+    # Index's data array, so an in-place freq write would otherwise leak).
+    idx = pd.date_range("2025-01-01", periods=6, freq="5min", tz="UTC")
+    df = pd.DataFrame({"flow_a": [1.0, np.nan, 3.0, np.nan, 5.0, 6.0]}, index=idx)
+    df.index.freq = None  # caller's frame has no freq set
+    original = df.copy()
+
+    ImputationStep(sample_process_config).process(df)
+
+    pd.testing.assert_frame_equal(df, original)
+    assert df.index.freq is None
+    assert "flow_a__weight" not in df.columns
+
+
+def test_median_filter_does_not_mutate_input(sample_process_config):
+    idx = pd.date_range("2025-01-01", periods=6, freq="5min", tz="UTC")
+    df = pd.DataFrame({"flow_a": [1.0, 1.0, 99.0, 1.0, 1.0, 1.0]}, index=idx)
+    original = df.copy()
+
+    MedianFilterStep(sample_process_config).process(df)
+
     pd.testing.assert_frame_equal(df, original)

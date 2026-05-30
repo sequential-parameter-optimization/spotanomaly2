@@ -185,7 +185,7 @@ class TestLiveFreshnessBlock:
         monitor = LiveMonitor(config)
 
         with (
-            patch("spotanomaly2.dashboard.live_monitor.PrimaryDataFetcher") as fetcher_cls,
+            patch("spotanomaly2.dashboard.live_monitor.resolve_primary_fetcher") as fetcher_cls,
             patch("spotanomaly2.dashboard.live_monitor.DataProcessor") as proc_cls,
             patch("spotanomaly2.dashboard.live_monitor.AnomalyDetector") as det_cls,
             patch.object(monitor._data_manager, "save_processed_data_live"),
@@ -244,7 +244,7 @@ class TestLiveFreshnessBlock:
         monitor = LiveMonitor(config)
 
         with (
-            patch("spotanomaly2.dashboard.live_monitor.PrimaryDataFetcher") as fetcher_cls,
+            patch("spotanomaly2.dashboard.live_monitor.resolve_primary_fetcher") as fetcher_cls,
             patch("spotanomaly2.dashboard.live_monitor.DataProcessor") as proc_cls,
             patch("spotanomaly2.dashboard.live_monitor.AnomalyDetector") as det_cls,
             patch.object(monitor._data_manager, "save_processed_data_live"),
@@ -292,7 +292,7 @@ class TestLiveFreshnessBlock:
         monitor = LiveMonitor(config)
 
         with (
-            patch("spotanomaly2.dashboard.live_monitor.PrimaryDataFetcher") as fetcher_cls,
+            patch("spotanomaly2.dashboard.live_monitor.resolve_primary_fetcher") as fetcher_cls,
             patch("spotanomaly2.dashboard.live_monitor.DataProcessor") as proc_cls,
             patch("spotanomaly2.dashboard.live_monitor.AnomalyDetector") as det_cls,
             patch.object(monitor._data_manager, "save_processed_data_live"),
@@ -348,7 +348,7 @@ class TestLiveFreshnessBlock:
         monitor = LiveMonitor(config)
 
         with (
-            patch("spotanomaly2.dashboard.live_monitor.PrimaryDataFetcher") as fetcher_cls,
+            patch("spotanomaly2.dashboard.live_monitor.resolve_primary_fetcher") as fetcher_cls,
             patch("spotanomaly2.dashboard.live_monitor.DataProcessor") as proc_cls,
             patch("spotanomaly2.dashboard.live_monitor.AnomalyDetector") as det_cls,
             patch.object(monitor._data_manager, "save_processed_data_live"),
@@ -389,7 +389,7 @@ class TestLiveFreshnessBlock:
         monitor = LiveMonitor(config)
 
         with (
-            patch("spotanomaly2.dashboard.live_monitor.PrimaryDataFetcher") as fetcher_cls,
+            patch("spotanomaly2.dashboard.live_monitor.resolve_primary_fetcher") as fetcher_cls,
             patch("spotanomaly2.dashboard.live_monitor.DataProcessor") as proc_cls,
             patch("spotanomaly2.dashboard.live_monitor.AnomalyDetector") as det_cls,
             patch.object(monitor._data_manager, "save_processed_data_live"),
@@ -419,7 +419,7 @@ class TestLiveFreshnessBlock:
             assert "stale" in (fetch_status["primary"]["error"] or "").lower()
 
     def test_nan_only_incremental_data_marks_primary_degraded(self, ready_workspace):
-        """When PrimaryDataFetcher.run returns NaN-only data, primary status is degraded from the start."""
+        """When the primary fetcher's run returns NaN-only data, primary status is degraded from the start."""
         config, paths = ready_workspace
         config["report"] = {"enabled": True}
         # Fresh complete data so freshness logic doesn't overwrite us.
@@ -436,7 +436,7 @@ class TestLiveFreshnessBlock:
         nan_only = pd.DataFrame(index=empty_idx)
 
         with (
-            patch("spotanomaly2.dashboard.live_monitor.PrimaryDataFetcher") as fetcher_cls,
+            patch("spotanomaly2.dashboard.live_monitor.resolve_primary_fetcher") as fetcher_cls,
             patch("spotanomaly2.dashboard.live_monitor.DataProcessor") as proc_cls,
             patch("spotanomaly2.dashboard.live_monitor.AnomalyDetector") as det_cls,
             patch.object(monitor._data_manager, "save_processed_data_live"),

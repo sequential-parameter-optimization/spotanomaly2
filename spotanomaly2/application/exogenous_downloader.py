@@ -3,7 +3,7 @@
 
 """Download-stage orchestrator: runs every configured ExogenousFetcher.
 
-Mirrors the responsibility of ``PrimaryDataFetcher`` for the *primary* data —
+Mirrors the responsibility of the primary fetcher for the *primary* data —
 this class is to ``download()`` what ``DataProcessor`` is to ``process()``:
 the single application-layer entry point that delegates per-source work to
 plugin-supplied domain classes.
@@ -18,7 +18,7 @@ from spotanomaly2.domain.exogenous.registry import iter_configured_sources
 from spotanomaly2.infrastructure import logging as infra_logging
 
 
-class ExogenousDownloader:
+class ExogenousDownloadManager:
     """Invokes ``fetch_and_cache`` on every configured ExogenousFetcher class."""
 
     def __init__(self, config: dict[str, Any], logger=None):

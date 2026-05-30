@@ -5,13 +5,13 @@ from typing import Any
 import pandas as pd
 
 from spotanomaly2.application.data_manager import DataManager
-from spotanomaly2.application.exogenous_downloader import ExogenousDownloader
-from spotanomaly2.application.exogenous_joiner import ExogenousJoiner
+from spotanomaly2.application.exogenous_downloader import ExogenousDownloadManager
+from spotanomaly2.application.exogenous_joiner import ExogenousJoinManager
 from spotanomaly2.application.readiness_checker import ReadinessChecker
 from spotanomaly2.domain.anomaly_detector import AnomalyDetector
-from spotanomaly2.domain.data_processor import DataProcessor
 from spotanomaly2.domain.model_trainer import ModelTrainer
-from spotanomaly2.domain.primary_fetcher import PrimaryDataFetcher
+from spotanomaly2.domain.primary_registry import resolve_primary_fetcher
+from spotanomaly2.domain.processing.data_processor import DataProcessor
 from spotanomaly2.infrastructure import logging
 from spotanomaly2.infrastructure.storage import generate_timestamp
 
@@ -24,8 +24,8 @@ class Pipeline:
         self.logger = logger or logging.get_logger("Pipeline")
         self._data_manager = DataManager(config, self.logger)
         self._readiness_checker = ReadinessChecker(config, self.logger)
-        self._exogenous_downloader = ExogenousDownloader(config, self.logger)
-        self._exogenous_joiner = ExogenousJoiner(config, self.logger)
+        self._exogenous_download_manager = ExogenousDownloadManager(config, self.logger)
+        self._exogenous_join_manager = ExogenousJoinManager(config, self.logger)
 
     # ------------------------------------------------------------------
     # Readiness checks
@@ -59,12 +59,12 @@ class Pipeline:
         self.logger.info("STEP: Download data from API")
         self.logger.info("=" * 60)
 
-        primary_fetcher = PrimaryDataFetcher(self.config, self.logger)
+        primary_fetcher = resolve_primary_fetcher(self.config, self.logger)
         panel_data = primary_fetcher.run(ignore_cache=ignore_cache)
         self._data_manager.save_raw_data(panel_data)
 
-        start, end = self._exogenous_downloader.derive_fetch_window(panel_data)
-        self._exogenous_downloader.download_all(start, end, ignore_cache=ignore_cache)
+        start, end = self._exogenous_download_manager.derive_fetch_window(panel_data)
+        self._exogenous_download_manager.download_all(start, end, ignore_cache=ignore_cache)
 
         return panel_data
 
@@ -79,7 +79,7 @@ class Pipeline:
         self.logger.info("=" * 60)
 
         panel_data = self._data_manager.load_raw_data()
-        panel_data = self._exogenous_joiner.join_all(panel_data)
+        panel_data = self._exogenous_join_manager.join_all(panel_data)
 
         processor = DataProcessor(self.config, self.logger)
         processed_data = processor.run(panel_data)

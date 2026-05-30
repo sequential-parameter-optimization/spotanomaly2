@@ -41,18 +41,18 @@ class TestPerStageDelegation:
     def test_download_calls_primary_fetcher_and_returns_raw(self, sample_config):
         pipeline = Pipeline(sample_config)
         with (
-            patch("spotanomaly2.application.pipeline.PrimaryDataFetcher") as mock_fetcher_cls,
+            patch("spotanomaly2.application.pipeline.resolve_primary_fetcher") as mock_resolve,
             patch.object(pipeline._data_manager, "save_raw_data") as mock_save,
-            patch.object(pipeline._exogenous_downloader, "download_all") as mock_dl,
+            patch.object(pipeline._exogenous_download_manager, "download_all") as mock_dl,
         ):
             raw = {"1": _df("2025-01-01", 5)}
             mock_fetcher = MagicMock()
             mock_fetcher.run.return_value = raw
-            mock_fetcher_cls.return_value = mock_fetcher
+            mock_resolve.return_value = mock_fetcher
 
             result = pipeline.download()
 
-            mock_fetcher_cls.assert_called_once_with(sample_config, pipeline.logger)
+            mock_resolve.assert_called_once_with(sample_config, pipeline.logger)
             mock_fetcher.run.assert_called_once_with(ignore_cache=False)
             mock_save.assert_called_once()
             mock_dl.assert_called_once()
@@ -61,13 +61,13 @@ class TestPerStageDelegation:
     def test_download_ignore_cache_threads_flag(self, sample_config):
         pipeline = Pipeline(sample_config)
         with (
-            patch("spotanomaly2.application.pipeline.PrimaryDataFetcher") as mock_fetcher_cls,
+            patch("spotanomaly2.application.pipeline.resolve_primary_fetcher") as mock_resolve,
             patch.object(pipeline._data_manager, "save_raw_data"),
-            patch.object(pipeline._exogenous_downloader, "download_all") as mock_dl,
+            patch.object(pipeline._exogenous_download_manager, "download_all") as mock_dl,
         ):
             mock_fetcher = MagicMock()
             mock_fetcher.run.return_value = {"1": _df("2025-01-01", 5)}
-            mock_fetcher_cls.return_value = mock_fetcher
+            mock_resolve.return_value = mock_fetcher
 
             pipeline.download(ignore_cache=True)
 
@@ -79,7 +79,7 @@ class TestPerStageDelegation:
         with (
             patch.object(pipeline._data_manager, "load_raw_data") as mock_load,
             patch.object(pipeline._data_manager, "save_processed_data") as mock_save,
-            patch.object(pipeline._exogenous_joiner, "join_all") as mock_join,
+            patch.object(pipeline._exogenous_join_manager, "join_all") as mock_join,
             patch("spotanomaly2.application.pipeline.DataProcessor") as mock_proc_cls,
         ):
             raw = {"1": _df("2025-01-01", 5)}

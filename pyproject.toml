@@ -48,6 +48,7 @@ dependencies = [
     "spotoptim>=0.0.160",
     "catboost>=1.2.10",
     "scipy-stubs~=1.17.1",
+    "entsoe-py>=0.6.0",
 ]
 
 [project.optional-dependencies]

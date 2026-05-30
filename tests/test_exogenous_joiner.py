@@ -19,7 +19,7 @@ import types
 import pandas as pd
 import pytest
 
-from spotanomaly2.application.exogenous_joiner import ExogenousJoiner
+from spotanomaly2.application.exogenous_joiner import ExogenousJoinManager
 
 
 @pytest.fixture
@@ -52,7 +52,7 @@ def _fetcher_class(*, enabled: bool = True):
 
 class TestEmptyConfig:
     def test_no_sources_returns_panel_data_unchanged(self, panel_data):
-        joiner = ExogenousJoiner({"exogenous": []})
+        joiner = ExogenousJoinManager({"exogenous": []})
         assert joiner.join_all(panel_data) is panel_data
 
 
@@ -80,7 +80,7 @@ class TestDisabledSource:
             ],
         }
         status: dict = {}
-        ExogenousJoiner(cfg).join_all(panel_data, status)
+        ExogenousJoinManager(cfg).join_all(panel_data, status)
 
         assert status["off"]["status"] == "disabled"
         assert joiner_calls == []
@@ -107,7 +107,7 @@ class TestEnabledSource:
             ],
         }
         status: dict = {}
-        result = ExogenousJoiner(cfg).join_all(panel_data, status)
+        result = ExogenousJoinManager(cfg).join_all(panel_data, status)
 
         assert all("extra" in df.columns for df in result.values())
         assert status["ok"]["status"] == "ok"
@@ -148,7 +148,7 @@ class TestComposition:
             ],
         }
         status: dict = {}
-        result = ExogenousJoiner(cfg).join_all(panel_data, status)
+        result = ExogenousJoinManager(cfg).join_all(panel_data, status)
 
         # Second saw first's output (column 'a' present → 'b' computed from it).
         assert all(df["b"].iloc[0] == 2 for df in result.values())
@@ -177,7 +177,7 @@ class TestFailurePath:
             ],
         }
         status: dict = {}
-        result = ExogenousJoiner(cfg).join_all(panel_data, status)
+        result = ExogenousJoinManager(cfg).join_all(panel_data, status)
 
         # On failure: chain breaks cleanly, panel_data flows through.
         assert result is panel_data

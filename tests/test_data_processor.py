@@ -8,8 +8,7 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 
-from spotanomaly2.domain.data_processor import DataProcessor
-from spotanomaly2.domain.processing_steps import (
+from spotanomaly2.domain.processing import (
     ImputationStep,
     MaintenanceRemovalStep,
     ManualOutlierRemovalStep,
@@ -18,6 +17,7 @@ from spotanomaly2.domain.processing_steps import (
     TemperatureAggregationStep,
     WeatherAdjustmentStep,
 )
+from spotanomaly2.domain.processing.data_processor import DataProcessor
 
 
 def test_constructs_steps_in_pipeline_order(sample_config):

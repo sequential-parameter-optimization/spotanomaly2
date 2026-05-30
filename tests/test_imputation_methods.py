@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from spotanomaly2.domain.imputation_methods import (
+from spotanomaly2.domain.imputation import (
     IMPUTATION_METHODS,
     BackwardFillImputation,
     ForwardFillImputation,
@@ -46,26 +46,8 @@ def _make_series_with_nans(n=300, missing_ratio=0.05, seed=42):
     "method_name,kwargs",
     [
         ("mean", {}),
-        pytest.param(
-            "forward_fill",
-            {},
-            marks=pytest.mark.xfail(
-                reason="ForwardFillImputation uses deprecated series.fillna(method='ffill') which "
-                "raises TypeError in current pandas (>=2.2). Production bug.",
-                strict=True,
-                raises=TypeError,
-            ),
-        ),
-        pytest.param(
-            "backward_fill",
-            {},
-            marks=pytest.mark.xfail(
-                reason="BackwardFillImputation uses deprecated series.fillna(method='bfill') which "
-                "raises TypeError in current pandas (>=2.2). Production bug.",
-                strict=True,
-                raises=TypeError,
-            ),
-        ),
+        ("forward_fill", {}),
+        ("backward_fill", {}),
         ("linear_interpolation", {}),
         ("spline_interpolation", {}),
         ("knn_temporal", {"n_neighbors": 3}),
@@ -111,6 +93,22 @@ def test_get_imputation_method_passes_kwargs():
     inst = get_imputation_method("knn_temporal", n_neighbors=7)
     assert isinstance(inst, KNNTemporalImputation)
     assert inst.n_neighbors == 7
+
+
+def test_get_imputation_method_psm_fills_multi_point_gap():
+    from spotanomaly2.domain.imputation import PSMImputation
+
+    idx = pd.date_range("2025-01-01", periods=100, freq="5min")
+    base = np.sin(2 * np.pi * np.arange(100) / 10) * 10 + 50
+    base += np.random.default_rng(0).standard_normal(100) * 0.01  # tiny noise so windows differ
+    series = pd.Series(base, index=idx)
+    series.iloc[40:43] = np.nan  # 3-point gap (PSM territory, not single-gap)
+
+    method = get_imputation_method("psm")
+
+    assert isinstance(method, PSMImputation)
+    out = method.impute(series)
+    assert not out.iloc[40:43].isna().any()
 
 
 def test_registry_keys_match_classes():
@@ -178,12 +176,6 @@ def test_mean_neighbor_fills_isolated_singles():
     assert out.isna().sum() == 0
 
 
-@pytest.mark.xfail(
-    reason="ForwardFillImputation uses deprecated series.fillna(method='ffill') which raises "
-    "TypeError in current pandas (>=2.2). Production bug.",
-    strict=True,
-    raises=TypeError,
-)
 def test_forward_fill_propagates_forward():
     series = pd.Series([1.0, np.nan, np.nan, 4.0])
     out = ForwardFillImputation().impute(series)
@@ -192,12 +184,6 @@ def test_forward_fill_propagates_forward():
     assert out.iloc[3] == 4.0
 
 
-@pytest.mark.xfail(
-    reason="BackwardFillImputation uses deprecated series.fillna(method='bfill') which raises "
-    "TypeError in current pandas (>=2.2). Production bug.",
-    strict=True,
-    raises=TypeError,
-)
 def test_backward_fill_propagates_backward():
     series = pd.Series([1.0, np.nan, np.nan, 4.0])
     out = BackwardFillImputation().impute(series)

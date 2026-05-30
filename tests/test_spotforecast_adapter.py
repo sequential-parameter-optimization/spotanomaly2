@@ -15,6 +15,7 @@ from spotanomaly2.domain.spotforecast_adapter import (
     SpotforecastTrainer,
     SpotforecastTuner,
     SVRApprox,
+    _apply_known_anomaly_imputation,
     _build_estimator,
     _build_nan_safe_metric,
     _create_forecaster,
@@ -593,10 +594,15 @@ class TestSpotforecastTuner:
             f"Differentiation should pin the live floor near the lag-1 baseline (R² ≫ 0), but got {r2_diff:+.3f}"
         )
 
-    def test_tune_skips_imputed_rows_via_weight_func(self, sample_config, panel_df_with_exogenous):
-        """When `exclude_imputed_training_samples=True`, tune must zero out
-        imputed rows during the search just like train does, so the tuned
-        score reflects the same effective training set."""
+    def test_tune_handles_imputed_rows_when_exclusion_enabled(self, sample_config, panel_df_with_exogenous):
+        """Row-level imputed-sample exclusion is a TRAIN-ONLY feature (audit C2):
+        SpotforecastTrainer applies it via forecaster.weight_func, but the
+        one-step-ahead tuning objective fits the bare estimator and ignores
+        weight_func, so tuning cannot drop individual imputed rows. This test pins
+        the honest contract: with `exclude_imputed_training_samples=True` and
+        imputed rows present, the search still completes and yields a finite metric
+        (imputed rows are interpolated for lag context, and the observed mask only
+        gates channel skipping)."""
         df = panel_df_with_exogenous.copy()
         df["sensor_a__weight"] = 1.0
         # Mark a window of rows as imputed.
@@ -609,8 +615,6 @@ class TestSpotforecastTuner:
         tuner = SpotforecastTuner(config)
         results = tuner.tune_panel("test", df, self._tune_config())
 
-        # Search must complete (no skip) and produce a finite metric — meaning
-        # the masked rows shrank the effective set without breaking SpotOptim.
         assert "sensor_a" in results
         assert "error" not in results["sensor_a"]
         assert results["sensor_a"]["best_metric"] is not None
@@ -869,3 +873,29 @@ class TestTrainerHelpers:
         )
         assert name == "LightGBM"
         assert params == {}
+
+
+def test_apply_known_anomaly_imputation_falls_back_to_linear_for_psm():
+    # Regression: 'psm' is now a registered strategy, but it must NOT be used to
+    # re-impute the small interior cells produced by known-anomaly masking (PSM
+    # needs a freq-bearing DatetimeIndex and would otherwise raise). The helper
+    # must transparently fall back to linear interpolation.
+    # Build a DatetimeIndex with NO freq set: PSM would raise on it, linear won't.
+    idx = pd.DatetimeIndex(pd.date_range("2025-01-01", periods=10, freq="5min", tz="UTC").values, tz="UTC")
+    assert idx.freq is None  # the condition that makes PSM raise but linear cope
+    df = pd.DataFrame({"channel_1_ph": np.arange(10, dtype=float)}, index=idx)
+    known_anomalies = [{"start": "2025-01-01 00:20", "end": "2025-01-01 00:25"}]
+
+    out = _apply_known_anomaly_imputation(
+        df,
+        known_anomalies=known_anomalies,
+        buffer="0min",
+        target_cols=["channel_1_ph"],
+        weight_suffix="__weight",
+        imputation_method="psm",
+    )
+
+    # The masked cells were re-imputed (no NaNs, no PSM crash) ...
+    assert out["channel_1_ph"].isna().sum() == 0
+    # ... and flagged as not-real in the weight column.
+    assert (out["channel_1_ph__weight"] == 0).any()

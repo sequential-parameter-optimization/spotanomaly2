@@ -28,8 +28,8 @@ import pytest
 
 from spotanomaly2.application.data_manager import DataManager
 from spotanomaly2.application.pipeline import Pipeline
-from spotanomaly2.domain.data_processor import DataProcessor
 from spotanomaly2.domain.exceptions import InsufficientDataException
+from spotanomaly2.domain.processing.data_processor import DataProcessor
 
 
 def _make_processed_panel(n: int = 800, spike: bool = False) -> pd.DataFrame:

@@ -22,7 +22,6 @@ from spotanomaly2.infrastructure import logging
 
 from .channel_prep import (
     TrainKnobs,
-    attach_weight_func,
     prepare_channel,
     prepare_panel,
     resolve_train_settings,
@@ -221,8 +220,8 @@ class SpotforecastTuner:
         a ``model_scores`` sub-dict (or an ``{"error": ...}`` dict if every model
         failed).
         """
-        n_lags = train_settings.n_lags
-        n_lags_max = train_settings.n_lags_max
+        n_lags = train_settings.fallback_lags
+        n_lags_max = train_settings.fallback_lags_max
         random_seed = train_settings.random_seed
         diff_order = train_settings.diff_order
 
@@ -368,8 +367,12 @@ class SpotforecastTuner:
             )
             search_space = _yaml_search_space_to_dict(raw_search_space)
 
-            # Match train: zero out imputed rows during fit.
-            attach_weight_func(forecaster, sample_mask)
+            # Imputed/anomalous-row exclusion is train-only (audit C2): SpotforecastTrainer
+            # applies it via forecaster.weight_func, which forecaster.fit honours. The
+            # one-step-ahead tuning objective fits the bare estimator and ignores
+            # weight_func (and spotforecast2 rejects NaN targets), so it cannot drop
+            # individual rows here. sample_mask still gates channel-skipping in
+            # prepare_channel, keeping tuning and training aligned on trainable channels.
 
             tuning_results, _ = spotoptim_search_forecaster(
                 forecaster=forecaster,

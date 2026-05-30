@@ -4,7 +4,7 @@ from typing import Any, Optional
 
 import pandas as pd
 
-from spotanomaly2.domain.processing_steps import (
+from spotanomaly2.domain.processing import (
     ImputationStep,
     MaintenanceRemovalStep,
     ManualOutlierRemovalStep,

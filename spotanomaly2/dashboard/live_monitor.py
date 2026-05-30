@@ -17,13 +17,13 @@ from typing import Any
 import pandas as pd
 
 from spotanomaly2.application.data_manager import DataManager
-from spotanomaly2.application.exogenous_downloader import ExogenousDownloader
-from spotanomaly2.application.exogenous_joiner import ExogenousJoiner
+from spotanomaly2.application.exogenous_downloader import ExogenousDownloadManager
+from spotanomaly2.application.exogenous_joiner import ExogenousJoinManager
 from spotanomaly2.application.readiness_checker import ReadinessChecker
 from spotanomaly2.domain.anomaly_detector import AnomalyDetector
 from spotanomaly2.domain.constants import LIVE_REPORT_SERVER_PORT, MIN_ROWS_FOR_DETECTION
-from spotanomaly2.domain.data_processor import DataProcessor
-from spotanomaly2.domain.primary_fetcher import PrimaryDataFetcher
+from spotanomaly2.domain.primary_registry import resolve_primary_fetcher
+from spotanomaly2.domain.processing.data_processor import DataProcessor
 from spotanomaly2.infrastructure import logging, storage
 
 
@@ -35,8 +35,8 @@ class LiveMonitor:
         self.logger = logger or logging.get_logger("LiveMonitor")
         self._data_manager = DataManager(config, self.logger)
         self._readiness_checker = ReadinessChecker(config, self.logger)
-        self._exogenous_downloader = ExogenousDownloader(config, self.logger)
-        self._exogenous_joiner = ExogenousJoiner(config, self.logger)
+        self._exogenous_downloader = ExogenousDownloadManager(config, self.logger)
+        self._exogenous_joiner = ExogenousJoinManager(config, self.logger)
 
     def run_once(self) -> dict[str, tuple]:
         """Live prediction: download new data, process, detect with existing model."""
@@ -62,7 +62,7 @@ class LiveMonitor:
 
         # Step 1: Download and process new data
         self.logger.info("Step 1/2: Downloading and processing new data...")
-        fetcher = PrimaryDataFetcher(self.config, self.logger)
+        fetcher = resolve_primary_fetcher(self.config, self.logger)
 
         try:
             new_panel_data = fetcher.run(incremental_only=True)

@@ -14,7 +14,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from spotanomaly2.domain import imputation_methods
+from spotanomaly2.domain import imputation
 from spotanomaly2.infrastructure import logging
 
 
@@ -77,15 +77,16 @@ def _apply_known_anomaly_imputation(
     ``_build_strict_training_sample_mask`` do the right thing without any
     further branching downstream.
 
-    The legacy ``psm`` method isn't registered in
-    ``imputation_methods.IMPUTATION_METHODS``; for the small interior cells from
-    known-anomaly masking, fall back to ``linear_interpolation``.
+    PSM is unsuitable for the small interior cells produced by known-anomaly
+    masking (it matches whole-series subsequences and needs a freq-bearing
+    DatetimeIndex), so for ``psm`` — or any unregistered method — fall back to
+    ``linear_interpolation``.
     """
     if not known_anomalies or not buffer or not target_cols:
         return df
 
     imputation_params = dict(imputation_params or {})
-    if imputation_method not in imputation_methods.IMPUTATION_METHODS:
+    if imputation_method == "psm" or imputation_method not in imputation.IMPUTATION_METHODS:
         imputation_method = "linear_interpolation"
         imputation_params = {}
 
@@ -105,7 +106,7 @@ def _apply_known_anomaly_imputation(
             if weight_col in masked.columns
             else pd.Series(1, index=masked.index, dtype=int)
         )
-        masked[col] = imputation_methods.impute_series(masked[col], method=imputation_method, **imputation_params)
+        masked[col] = imputation.impute_series(masked[col], method=imputation_method, **imputation_params)
         masked[weight_col] = (pre_weight & (~anomaly_nan).astype(int)).astype(int)
 
     return masked

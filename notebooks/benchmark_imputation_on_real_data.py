@@ -12,7 +12,7 @@ import pandas as pd
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
-from spotanomaly2.domain import imputation_methods
+from spotanomaly2.domain import imputation as imputation_methods
 
 
 def load_all_processed_data() -> Dict[str, pd.DataFrame]:

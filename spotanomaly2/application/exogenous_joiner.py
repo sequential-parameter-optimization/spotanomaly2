@@ -16,7 +16,7 @@ from spotanomaly2.domain.exogenous.registry import iter_configured_sources
 from spotanomaly2.infrastructure import logging as infra_logging
 
 
-class ExogenousJoiner:
+class ExogenousJoinManager:
     """Invokes ``join_into_panels`` on every configured ExogenousJoiner class."""
 
     def __init__(self, config: dict[str, Any], logger=None):

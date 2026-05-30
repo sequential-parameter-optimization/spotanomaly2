@@ -5,7 +5,7 @@ from typing import Any, Optional
 import pandas as pd
 import scipy.signal
 
-from spotanomaly2.domain.processing_steps.base import ProcessingStep
+from spotanomaly2.domain.processing.base import ProcessingStep
 
 
 class MedianFilterStep(ProcessingStep):
@@ -19,6 +19,7 @@ class MedianFilterStep(ProcessingStep):
         self.weight_suffix = self.config.get("process", {}).get("imputation", {}).get("weight_suffix", "__weight")
 
     def process(self, df: pd.DataFrame, panel_id: Optional[str] = None) -> pd.DataFrame:
+        df = df.copy()
         flow_pattern = self.config["process"]["flow_columns_pattern"]
         kernel_size = self.config["process"]["median_filter_kernel"]
         for col in df.columns:

@@ -491,7 +491,6 @@ class AnomalyDetector:
         self.logger.info(f"Detecting anomalies for panel {panel_id}...")
 
         model_data = self.load_forecasting_model(panel_id)
-        model_type = model_data.get("model_type", "unknown")
 
         history_df, unseen_df = self._split_unseen_scoring_data(
             panel_id=panel_id,
@@ -527,15 +526,6 @@ class AnomalyDetector:
         self.logger.info(f"Scorer fit window: {len(scorer_fit_df)}, Scorer eval window: {len(scorer_eval_df)}")
 
         # Generate predictions via spotforecast2 adapter
-        channel_models = model_data.get("channel_models") or {}
-        if channel_models:
-            from collections import Counter
-
-            counts = Counter(spec.get("model", "?") for spec in channel_models.values())
-            breakdown = ", ".join(f"{m}×{n}" for m, n in counts.most_common())
-            self.logger.info(f"Generating predictions ({model_type}; channels: {breakdown})...")
-        else:
-            self.logger.info(f"Generating predictions using {model_type} model...")
         predictor = SpotforecastPredictor(self.config, self.logger)
         history_for_fit_pred = history_df if len(history_df) > 0 else None
         fit_pred_df = predictor.predict(
