@@ -97,8 +97,8 @@ class SpotforecastTuner:
         # Match SpotforecastTrainer.train_panel exactly: include `exogenous_*`
         # columns as exog features and exclude them from the tuning targets.
         # Otherwise tune optimizes a different model than train ends up fitting.
-        configured_exog_columns = self.config["train"].get("exog_columns", [])
         weight_suffix = self._get_weight_suffix()
+        configured_exog_columns = self.config["train"].get("exog_columns", [])
         mult_prefixes = multiplier_prefixes(self.config)
         target_cols, exog_columns = _split_panel_columns(df, configured_exog_columns, weight_suffix, mult_prefixes)
 

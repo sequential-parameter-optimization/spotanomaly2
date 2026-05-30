@@ -97,8 +97,10 @@ def _predict_one_step_integrated(
     """
     if diff_order <= 0:
         return _one_step_ahead_predict(forecaster, full_y_raw, full_exog, target_index)
+
     y_for_features = _difference(full_y_raw, diff_order).dropna()
     exog_for_features = full_exog.loc[y_for_features.index] if full_exog is not None else None
     diff_preds_arr = _one_step_ahead_predict(forecaster, y_for_features, exog_for_features, y_for_features.index)
     diff_preds = pd.Series(diff_preds_arr, index=y_for_features.index)
+
     return _integrate_one_step(diff_preds, full_y_raw, diff_order).reindex(target_index).to_numpy()

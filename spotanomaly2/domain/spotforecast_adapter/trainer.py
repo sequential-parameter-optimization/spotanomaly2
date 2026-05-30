@@ -26,11 +26,11 @@ from .factory import _create_forecaster
 from .prediction import _difference, _predict_one_step_integrated
 from .preprocessing import (
     _build_strict_training_sample_mask,
-    _compute_observed_mask,
     _detect_anomalies_via_ridge,
     _ensure_freq,
     _interpolate_inplace,
     _mask_known_anomalies,
+    _prepare_target_for_lag_features,
     _split_panel_columns,
     _time_series_train_test_split,
 )
@@ -73,6 +73,7 @@ class SpotforecastTrainer:
         panel_data, target_cols, exog_columns = self._prepare_panel_data(panel_data, weight_suffix)
         train_df, test_df = self._split_train_test(panel_data, train_ratio)
         panel_default_model, panel_default_params, channel_cfg_map = self._load_and_resolve_panel_config(panel_id)
+        full_exog = self._build_full_exog(train_df, test_df, exog_columns)
 
         forecasters: dict[str, Any] = {}
         channel_model_specs: dict[str, dict[str, Any]] = {}
@@ -96,6 +97,7 @@ class SpotforecastTrainer:
                 train_df=train_df,
                 test_df=test_df,
                 exog_columns=exog_columns,
+                full_exog=full_exog,
             )
             if channel_result is None:
                 continue
@@ -165,6 +167,7 @@ class SpotforecastTrainer:
     def _load_and_resolve_panel_config(self, panel_id: str) -> tuple[str | None, dict[str, Any], dict[str, Any]]:
         """Load per-panel YAML and extract (default_model, default_params, channel_cfg_map)."""
         panel_cfg = load_panel_channel_config(panel_id, self.config)
+
         default_section = panel_cfg.get("default")
         if isinstance(default_section, dict):
             panel_default_model = default_section.get("model")
@@ -217,7 +220,7 @@ class SpotforecastTrainer:
                 return list(n_lags), int(max(n_lags))
             return n_lags, int(n_lags) if not isinstance(n_lags, (list, tuple)) else 24
 
-    def _compute_training_weights(
+    def _build_sample_weights(
         self,
         observed_mask: pd.Series,
         effective_n_lags: int,
@@ -307,15 +310,33 @@ class SpotforecastTrainer:
 
         return forecaster
 
+    @staticmethod
+    def _build_full_exog(
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        exog_columns: list[str],
+    ) -> pd.DataFrame | None:
+        """Concat + interpolate the train+test exog frame once for the panel.
+
+        The result is reused across every channel's one-step-ahead test
+        prediction. Exog columns don't depend on the target, so rebuilding
+        this per channel is pure waste.
+        """
+        if not exog_columns:
+            return None
+        full_exog = pd.concat([train_df[exog_columns], test_df[exog_columns]])
+        if full_exog.isna().any().any():
+            full_exog = _interpolate_inplace(full_exog)
+        return full_exog
+
     def _predict_test_window(
         self,
         forecaster,
         y_train: pd.Series,
-        train_df: pd.DataFrame,
         test_df: pd.DataFrame,
         target_col: str,
         weight_suffix: str,
-        exog_columns: list[str],
+        full_exog: pd.DataFrame | None,
         diff_order: int,
     ) -> np.ndarray:
         """One-step-ahead test predictions on real observed lags.
@@ -324,24 +345,15 @@ class SpotforecastTrainer:
         ``_predict_one_step_integrated``), so the train-time eval metric is
         the same one production reports.
         """
-        test_observed = _compute_observed_mask(test_df, target_col, weight_suffix)
-        y_test_for_lags = test_df[target_col].copy()
-        y_test_for_lags.loc[~test_observed] = np.nan
-        if y_test_for_lags.isna().any():
-            y_test_for_lags = _interpolate_inplace(y_test_for_lags)
+        y_test_for_lags, _ = _prepare_target_for_lag_features(test_df, target_col, weight_suffix)
 
         full_y_raw = pd.concat([y_train, y_test_for_lags])
         full_y_raw.name = target_col
 
-        full_exog = None
-        if exog_columns:
-            full_exog = pd.concat([train_df[exog_columns], test_df[exog_columns]])
-            if full_exog.isna().any().any():
-                full_exog = _interpolate_inplace(full_exog)
-            full_exog = full_exog.loc[full_y_raw.index]
+        exog_for_pred = full_exog.loc[full_y_raw.index] if full_exog is not None else None
 
         try:
-            return _predict_one_step_integrated(forecaster, full_y_raw, full_exog, test_df.index, diff_order)
+            return _predict_one_step_integrated(forecaster, full_y_raw, exog_for_pred, test_df.index, diff_order)
         except Exception as exc:
             self.logger.warning(f"  One-step-ahead test prediction failed for {target_col}: {exc}")
             return np.full(len(test_df), np.nan)
@@ -360,6 +372,7 @@ class SpotforecastTrainer:
         train_df: pd.DataFrame,
         test_df: pd.DataFrame,
         exog_columns: list[str],
+        full_exog: pd.DataFrame | None,
     ) -> tuple[Any, dict[str, Any], np.ndarray] | None:
         """Train one forecaster + run test eval for a single channel.
 
@@ -374,19 +387,14 @@ class SpotforecastTrainer:
 
         self.logger.info(f"  Training forecaster for: {target_col} (model={channel_model_name})")
 
-        y_train_raw = train_df[target_col].copy()
-        y_train_raw.name = target_col
-
-        observed_mask = _compute_observed_mask(train_df, target_col, weight_suffix)
-        y_train = y_train_raw.copy()
-        y_train.loc[~observed_mask] = np.nan
-        if y_train.isna().any():
-            y_train = _interpolate_inplace(y_train)
+        # y_train: imputed rows interpolated so later observed rows have valid lag features.
+        # observed_mask: original boolean — drives loss weighting below, not feature values.
+        y_train, observed_mask = _prepare_target_for_lag_features(train_df, target_col, weight_suffix)
         if len(y_train) < effective_n_lags + 10:
             self.logger.warning(f"  Skipping {target_col}: insufficient data ({len(y_train)} rows)")
             return None
 
-        sample_mask = self._compute_training_weights(observed_mask, effective_n_lags, y_train, target_col)
+        sample_mask = self._build_sample_weights(observed_mask, effective_n_lags, y_train, target_col)
         if sample_mask == "skip":
             self.logger.warning(f"  Skipping {target_col}: no fully observed training samples left")
             return None
@@ -404,7 +412,7 @@ class SpotforecastTrainer:
         )
 
         channel_preds = self._predict_test_window(
-            forecaster, y_train, train_df, test_df, target_col, weight_suffix, exog_columns, diff_order
+            forecaster, y_train, test_df, target_col, weight_suffix, full_exog, diff_order
         )
 
         y_test_col = test_df[target_col].values

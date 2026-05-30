@@ -14,6 +14,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from spotanomaly2.infrastructure import logging
+
 
 def _time_series_train_test_split(df: pd.DataFrame, train_ratio: float = 0.8) -> tuple[pd.DataFrame, pd.DataFrame]:
     split_idx = int(len(df) * train_ratio)
@@ -32,6 +34,7 @@ def _mask_known_anomalies(
     buffer_td = pd.Timedelta(buffer)
     df = df.copy()
     cols_to_mask = columns if columns is not None else list(df.columns)
+    existing_cols = [c for c in cols_to_mask if c in df.columns]
     for anomaly in known_anomalies:
         start_str = anomaly.get("start")
         end_str = anomaly.get("end")
@@ -44,10 +47,9 @@ def _mask_known_anomalies(
                 a_start = a_start.tz_convert(df.index.tz) if a_start.tz else a_start.tz_localize(df.index.tz)
                 a_end = a_end.tz_convert(df.index.tz) if a_end.tz else a_end.tz_localize(df.index.tz)
             mask = (df.index >= a_start - buffer_td) & (df.index <= a_end + buffer_td)
-            existing_cols = [c for c in cols_to_mask if c in df.columns]
-            if existing_cols:
-                df.loc[mask, existing_cols] = np.nan
-        except (ValueError, TypeError):
+            df.loc[mask, existing_cols] = np.nan
+        except (ValueError, TypeError) as exc:
+            logging.get_logger().error("Failed to mask known anomaly window: %s", exc)
             continue
     return df
 
@@ -92,12 +94,49 @@ def _compute_observed_mask(df: pd.DataFrame, target_col: str, weight_suffix: str
     return pd.Series(True, index=df.index)
 
 
+def _prepare_target_for_lag_features(
+    df: pd.DataFrame,
+    target_col: str,
+    weight_suffix: str,
+) -> tuple[pd.Series, pd.Series]:
+    """Build a target series suitable for forming lag features.
+
+    Returns ``(y, observed_mask)``:
+
+    - ``observed_mask`` flags which rows came from real measurements (not
+      imputation). It is the source of truth for *loss weighting* — pass it
+      into ``_build_strict_training_sample_mask`` or hand it to whoever
+      builds the forecaster's ``weight_func``.
+    - ``y`` has imputed positions blanked then linearly interpolated, so any
+      later *observed* row still has well-defined lag values to form features
+      from. The interpolated values are scaffolding for feature extraction
+      only — don't treat them as real measurements.
+
+    These two roles are deliberately separate: ``y`` keeps the lag pipeline
+    happy; ``observed_mask`` decides what the model is allowed to learn from.
+    Callers that only need lag-feature continuity (e.g. the test/predict
+    path) can discard the mask.
+    """
+    observed = _compute_observed_mask(df, target_col, weight_suffix)
+    y = df[target_col].copy()
+    y.name = target_col
+    y.loc[~observed] = np.nan
+    if y.isna().any():
+        y = _interpolate_inplace(y)
+    return y, observed
+
+
 def _build_strict_training_sample_mask(observed_mask: pd.Series, n_lags: int) -> pd.Series:
-    """Return True only when target and all required lag inputs are observed."""
-    mask = observed_mask.fillna(False).astype(bool).copy()
-    for lag in range(1, n_lags + 1):
-        mask &= observed_mask.shift(lag).fillna(False).astype(bool)
-    return mask
+    """Return True only when target and all required lag inputs are observed.
+
+    Equivalent to ANDing ``observed_mask`` with each of its 1..n_lags shifts,
+    expressed as a single backward-looking rolling-min over a window of size
+    ``n_lags + 1``. For 0/1 inputs, ``min == 1`` iff every value in the window
+    is True. Incomplete leading windows (positions ``< n_lags``) become False.
+    """
+    obs = observed_mask.fillna(False).astype(int)
+    rolled = obs.rolling(n_lags + 1, min_periods=n_lags + 1).min()
+    return rolled.fillna(0).astype(bool)
 
 
 def _detect_anomalies_via_ridge(
