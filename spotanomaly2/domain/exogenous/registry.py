@@ -37,4 +37,8 @@ def iter_configured_sources(
             joiner_cls = _load_class(joiner_spec)
         except (ImportError, AttributeError, ValueError):
             continue
-        yield name, entry.get("config", {}), fetcher_cls, joiner_cls
+        # Inject the YAML name so joiners can prefix columns as
+        # ``exogenous_<name>_<measurement>`` — the convention the splitter,
+        # detector, and report generator rely on to map columns back to a source.
+        src_cfg = {**(entry.get("config") or {}), "source_name": name}
+        yield name, src_cfg, fetcher_cls, joiner_cls

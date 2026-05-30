@@ -5,8 +5,10 @@
 The fetcher's HTTP/cache machinery requires real upstream credentials and lives
 under integration tests. These tests cover ``ExogenousAJoiner`` in isolation:
 write a fixture parquet to a ``tmp_path`` cache_dir, instantiate the joiner,
-and assert the panel DataFrame gets the expected ``exogenous_<source>_*``
-columns appended.
+and assert the panel DataFrame gets the expected
+``exogenous_<yaml_name>_<panel_source>`` columns appended. Direct construction
+here doesn't pass ``source_name``, so the joiner falls back to its default
+identity ``"a"`` — matching what the registry injects for the bundled source.
 """
 
 from __future__ import annotations
@@ -52,7 +54,7 @@ class TestEmptyInputs:
         # No parquet on disk → joiner returns input unchanged (warning logged).
         result = joiner.join_into_panels(panel_data)
         # Panel kept; no exogenous columns added (cache missing).
-        assert "exogenous_flow_a" not in result["1"].columns
+        assert "exogenous_a_flow_a" not in result["1"].columns
 
 
 class TestSingleSourceJoin:
@@ -63,9 +65,9 @@ class TestSingleSourceJoin:
         joiner = ExogenousAJoiner(source_cfg, parent_cfg)
 
         result = joiner.join_into_panels({"1": _panel_df()})
-        assert "exogenous_flow_a" in result["1"].columns
+        assert "exogenous_a_flow_a" in result["1"].columns
         # Single col → no "_<colname>" suffix.
-        assert all(c.startswith("exogenous_flow_a") for c in result["1"].columns if c.startswith("exogenous_"))
+        assert all(c.startswith("exogenous_a_flow_a") for c in result["1"].columns if c.startswith("exogenous_"))
         # Original sensor column preserved.
         assert "sensor" in result["1"].columns
 
@@ -80,7 +82,7 @@ class TestSingleSourceJoin:
         result = joiner.join_into_panels({"1": _panel_df()})
         # 'metric' must not propagate as an exogenous column.
         assert not any("metric" in c for c in result["1"].columns)
-        assert "exogenous_flow_a" in result["1"].columns
+        assert "exogenous_a_flow_a" in result["1"].columns
 
 
 class TestPerPanelRouting:
@@ -96,10 +98,10 @@ class TestPerPanelRouting:
         panel_data = {"1": _panel_df(), "2": _panel_df()}
         result = joiner.join_into_panels(panel_data)
 
-        assert "exogenous_src_x" in result["1"].columns
-        assert "exogenous_src_x" not in result["2"].columns
-        assert "exogenous_src_y" in result["2"].columns
-        assert "exogenous_src_y" not in result["1"].columns
+        assert "exogenous_a_src_x" in result["1"].columns
+        assert "exogenous_a_src_x" not in result["2"].columns
+        assert "exogenous_a_src_y" in result["2"].columns
+        assert "exogenous_a_src_y" not in result["1"].columns
 
     def test_panel_without_mapping_gets_passthrough(self, parent_cfg, tmp_path):
         _write_source_parquet(tmp_path, "src_x", _source_df(value=10.0))
@@ -110,6 +112,6 @@ class TestPerPanelRouting:
         original_panel_2 = panel_data["2"].copy()
         result = joiner.join_into_panels(panel_data)
 
-        assert "exogenous_src_x" in result["1"].columns
+        assert "exogenous_a_src_x" in result["1"].columns
         # Panel 2 has no mapping → passthrough.
         pd.testing.assert_frame_equal(result["2"], original_panel_2)

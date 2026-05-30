@@ -332,7 +332,7 @@ class Pipeline:
                 }
                 continue
 
-            sensor_cols = [c for c in df.columns if not c.startswith("weather_") and not c.endswith(weight_suffix)]
+            sensor_cols = [c for c in df.columns if not c.startswith("exogenous_") and not c.endswith(weight_suffix)]
             if not sensor_cols:
                 continue
 

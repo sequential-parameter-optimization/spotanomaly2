@@ -29,8 +29,8 @@ class DataProcessor:
         self.config = config
         self.logger = logger or logging.get_logger("DataProcessor")
 
-        # Weather is fetched + merged upstream by PanelDataMerger; WeatherAdjustmentStep
-        # is a pure transform that consumes the pre-merged weather_temperature_baseline.
+        # Weather is fetched + merged upstream by ExogenousWeatherJoiner; WeatherAdjustmentStep
+        # is a pure transform that consumes the pre-merged exogenous_weather_temperature_baseline.
         # ManualOutlierRemovalStep receives panel_id at call time via process_panel.
         self._steps = [
             ResampleStep(config, self.logger),

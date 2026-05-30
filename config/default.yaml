@@ -150,8 +150,10 @@ train:
   # "predict the training mean" trivial-minimum that kept letting
   # degenerate tree configs win the tuner. Set 0 to disable.
   differentiation: 1
-  exog_columns:
-    - weather_snow_depth
+  # Escape hatch for non-``exogenous_``-prefixed exog features. All exogenous
+  # sources now emit ``exogenous_<name>_*`` columns, which are auto-detected as
+  # model features, so this is normally empty.
+  exog_columns: []
   known_anomaly_buffer: "1d"
   # Optional: panel-specific YAMLs with per-channel model and parameter selection
   # Each file can define:
@@ -300,12 +302,18 @@ benchmark:
 primary:
   display_name: "Primary"
 
+# Each source's joiner emits ``exogenous_<name>_<measurement>`` columns, which
+# are auto-detected as model exog features. Set ``multiply_residuals: true`` on a
+# source instead to make its column(s) multiply detection residuals
+# (residual = column * (actual - predicted)) rather than feed the model — useful
+# for e.g. a flow signal that should scale anomaly sensitivity.
 exogenous:
   - name: "a"
     fetcher: "spotanomaly2.domain.exogenous.source_a:ExogenousAFetcher"
     joiner: "spotanomaly2.domain.exogenous.source_a:ExogenousAJoiner"
     config:
       enabled: true
+      multiply_residuals: false
       cache_dir: "data/exogenous"
       display_name: "Source A"
       panel_sources:
@@ -318,6 +326,7 @@ exogenous:
     joiner: "spotanomaly2.domain.exogenous.weather:ExogenousWeatherJoiner"
     config:
       enabled: true
+      multiply_residuals: false
       latitude: 0.0
       longitude: 0.0
       place: "Anonymous Location"
@@ -327,11 +336,6 @@ exogenous:
       cache_path: "data/weather/weather_cache.parquet"
       feature_columns:
         - snow_depth
-
-# Weight anomaly residuals by an exogenous flow column.
-# Disabled by default so the repo works without exogenous data.
-residual_weighting:
-  enabled: false
 
 tune:
   n_trials: 10

@@ -11,6 +11,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+from spotanomaly2.domain.exogenous.residual_multiplier import find_multiplier_column, multiplier_prefixes
 from spotanomaly2.infrastructure import logging
 
 
@@ -200,7 +201,7 @@ class LiveReportGenerator:
 
     def _get_channel_source_label(self, panel_id: str, column_name: str) -> str:
         """Infer data source label for a plotted channel column."""
-        if column_name.startswith("weather_"):
+        if column_name.startswith("exogenous_weather_"):
             return "Open-Meteo"
 
         if column_name == "temperature":
@@ -1363,14 +1364,12 @@ class LiveReportGenerator:
         else:
             anomaly_times = pd.DatetimeIndex([])
 
-        # Detect exogenous flow column for optional flow-weighted view.
-        # Anomaly scoring multiplies residuals by this flow value, so we let
-        # the user toggle between the raw values and the flow-weighted view
-        # the scorer actually sees.
-        flow_col = next((c for c in df_actual.columns if c.startswith("exogenous_")), None)
-        flow_weighting_enabled = flow_col is not None and self.config.get("residual_weighting", {}).get(
-            "enabled", False
-        )
+        # Detect the residual-multiplier column for the optional multiplied view.
+        # Anomaly scoring multiplies residuals by this column, so we let the user
+        # toggle between the raw values and the multiplied view the scorer sees.
+        weight_suffix = self.config.get("process", {}).get("imputation", {}).get("weight_suffix", "__weight")
+        flow_col = find_multiplier_column(df_actual.columns, multiplier_prefixes(self.config), weight_suffix)
+        flow_weighting_enabled = flow_col is not None
         if flow_weighting_enabled:
             flow_values_arr = df_actual[flow_col].to_numpy()
         else:

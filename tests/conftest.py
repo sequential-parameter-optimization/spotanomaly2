@@ -56,9 +56,9 @@ def sample_config():
         "fetch": {},
         "primary": {"display_name": "Primary"},
         # New plugin-shape: empty list means no exogenous sources run.
-        # Tests that need a source instantiate one explicitly.
+        # Tests that need a source instantiate one explicitly. Per-source
+        # ``multiply_residuals`` replaces the old global residual_weighting flag.
         "exogenous": [],
-        "residual_weighting": {"enabled": False},
         "report": {"enabled": False},
     }
 

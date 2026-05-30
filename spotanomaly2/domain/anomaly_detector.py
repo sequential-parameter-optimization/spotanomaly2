@@ -10,6 +10,7 @@ from spotanomaly2_safe.scoring.pipeline import ForecastingAnomalyDetector
 
 from spotanomaly2.domain.constants import MIN_TRAIN_SIZE, TRAIN_TEST_SPLIT_RATIO
 from spotanomaly2.domain.exceptions import InsufficientDataException, ModelNotFoundException
+from spotanomaly2.domain.exogenous.residual_multiplier import find_multiplier_column, multiplier_prefixes
 from spotanomaly2.domain.spotforecast_adapter import SpotforecastPredictor
 from spotanomaly2.infrastructure import logging, storage
 
@@ -225,9 +226,10 @@ class AnomalyDetector:
     # Flow weighting
     # ------------------------------------------------------------------
 
-    def _apply_flow_weights(
+    def _apply_residual_multiplier(
         self,
         panel_id: str,
+        multiplier_col: str,
         source_fit_df: pd.DataFrame,
         source_eval_df: pd.DataFrame,
         fit_true_df: pd.DataFrame,
@@ -235,28 +237,16 @@ class AnomalyDetector:
         eval_true_df: pd.DataFrame,
         eval_pred_df: pd.DataFrame,
     ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        """Multiply true and pred values by exogenous flow so residuals are flow-weighted."""
-        exog_cols = [c for c in source_fit_df.columns if c.startswith("exogenous_")]
-        if not exog_cols:
-            self.logger.warning(f"Panel {panel_id}: weight_residuals enabled but no exogenous columns found")
-            return fit_true_df, fit_pred_df, eval_true_df, eval_pred_df
+        """Multiply true and pred values by *multiplier_col* so residuals scale with it."""
+        fit_mult = source_fit_df.loc[fit_true_df.index, multiplier_col]
+        eval_mult = source_eval_df.loc[eval_true_df.index, multiplier_col]
 
-        # Use first exogenous column as flow weight (typically one per panel)
-        flow_col = exog_cols[0]
-        if len(exog_cols) > 1:
-            self.logger.info(
-                f"Panel {panel_id}: multiple exogenous columns found, using '{flow_col}' for flow weighting"
-            )
+        fit_true_df = fit_true_df.multiply(fit_mult, axis=0)
+        fit_pred_df = fit_pred_df.multiply(fit_mult, axis=0)
+        eval_true_df = eval_true_df.multiply(eval_mult, axis=0)
+        eval_pred_df = eval_pred_df.multiply(eval_mult, axis=0)
 
-        fit_flow = source_fit_df.loc[fit_true_df.index, flow_col]
-        eval_flow = source_eval_df.loc[eval_true_df.index, flow_col]
-
-        fit_true_df = fit_true_df.multiply(fit_flow, axis=0)
-        fit_pred_df = fit_pred_df.multiply(fit_flow, axis=0)
-        eval_true_df = eval_true_df.multiply(eval_flow, axis=0)
-        eval_pred_df = eval_pred_df.multiply(eval_flow, axis=0)
-
-        self.logger.info(f"Panel {panel_id}: applied flow weighting using '{flow_col}' to residuals")
+        self.logger.info(f"Panel {panel_id}: multiplied residuals by '{multiplier_col}'")
 
         return fit_true_df, fit_pred_df, eval_true_df, eval_pred_df
 
@@ -554,13 +544,16 @@ class AnomalyDetector:
         # Keep unweighted predictions for report visualizations
         report_pred_df = eval_pred_df.copy()
 
-        # Flow-weight residuals: multiply both true and pred by exogenous flow
-        # so that residual = flow*(actual - predicted). This suppresses anomalies
-        # during low-flow periods and amplifies them during high-flow periods.
-        weight_cfg = self.config.get("residual_weighting", {})
-        if weight_cfg.get("enabled", False):
-            fit_true_df, fit_pred_df, eval_true_df, eval_pred_df = self._apply_flow_weights(
+        # Multiply residuals by a multiply_residuals source's column so that
+        # residual = column*(actual - predicted). This suppresses anomalies when
+        # the column is small and amplifies them when it is large.
+        weight_suffix = self.config.get("process", {}).get("imputation", {}).get("weight_suffix", "__weight")
+        mult_prefixes = multiplier_prefixes(self.config)
+        multiplier_col = find_multiplier_column(scorer_fit_df.columns, mult_prefixes, weight_suffix)
+        if multiplier_col is not None:
+            fit_true_df, fit_pred_df, eval_true_df, eval_pred_df = self._apply_residual_multiplier(
                 panel_id=panel_id,
+                multiplier_col=multiplier_col,
                 source_fit_df=scorer_fit_df,
                 source_eval_df=scorer_eval_df,
                 fit_true_df=fit_true_df,

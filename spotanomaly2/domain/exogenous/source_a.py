@@ -538,6 +538,9 @@ class ExogenousAJoiner:
 
         self.cache_dir = Path(source_config.get("cache_dir", "data/exogenous"))
         self.panel_sources: dict[str, list[str]] = source_config.get("panel_sources", {})
+        # YAML source identity, injected by the registry. Columns are prefixed
+        # ``exogenous_<exo_name>_<cache_key>`` so they map back to this source.
+        self.exo_name: str = source_config.get("source_name", "a")
 
     def _load_source_cache(self, source_name: str) -> Optional[pd.DataFrame]:
         cache_path = self.cache_dir / f"{source_name}.parquet"
@@ -556,9 +559,9 @@ class ExogenousAJoiner:
             return None
         df_vals = df[keep].copy()
         if len(keep) == 1:
-            df_vals.columns = [f"exogenous_{source_name}"]
+            df_vals.columns = [f"exogenous_{self.exo_name}_{source_name}"]
         else:
-            df_vals.columns = [f"exogenous_{source_name}_{c}" for c in keep]
+            df_vals.columns = [f"exogenous_{self.exo_name}_{source_name}_{c}" for c in keep]
         return df_vals
 
     def join_into_panels(

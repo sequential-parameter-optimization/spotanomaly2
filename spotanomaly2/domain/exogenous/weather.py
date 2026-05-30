@@ -738,8 +738,8 @@ class ExogenousWeatherJoiner:
     ``ExogenousWeatherFetcher.fetch_and_cache``, computes a rolling
     ``lookback_days`` baseline over ``temperature_2m`` (since the baseline needs
     pre-panel history a per-panel index can't carry), and reindexes
-    ``weather_temperature_baseline`` plus configured ``weather_<feature>``
-    columns onto each panel.
+    ``exogenous_<name>_temperature_baseline`` plus configured
+    ``exogenous_<name>_<feature>`` columns onto each panel.
     """
 
     def __init__(
@@ -751,6 +751,9 @@ class ExogenousWeatherJoiner:
         self.source_config = source_config
         self.parent_config = parent_config
         self.logger = logger or infra_logging.get_logger("ExogenousWeatherJoiner")
+        # YAML source identity, injected by the registry. Columns are prefixed
+        # ``exogenous_<exo_name>_<feature>`` so they map back to this source.
+        self.exo_name: str = source_config.get("source_name", "weather")
 
     def _load_cached_weather(self) -> Optional[pd.DataFrame]:
         cache_path_str = self.source_config.get("cache_path")
@@ -799,7 +802,7 @@ class ExogenousWeatherJoiner:
         resampled_features: dict[str, pd.Series] = {}
         for col in feature_columns:
             if col in weather_df.columns:
-                resampled_features[f"weather_{col}"] = weather_df[col].resample(panel_freq).ffill()
+                resampled_features[f"exogenous_{self.exo_name}_{col}"] = weather_df[col].resample(panel_freq).ffill()
             else:
                 self.logger.warning(f"Configured weather feature_column '{col}' not in cached weather")
 
@@ -810,7 +813,7 @@ class ExogenousWeatherJoiner:
                 continue
             out = df.copy()
             if baseline_full is not None:
-                out["weather_temperature_baseline"] = baseline_full.reindex(df.index, method="ffill")
+                out[f"exogenous_{self.exo_name}_temperature_baseline"] = baseline_full.reindex(df.index, method="ffill")
             for col_name, series in resampled_features.items():
                 out[col_name] = series.reindex(df.index, method="ffill")
             merged[panel_id] = out

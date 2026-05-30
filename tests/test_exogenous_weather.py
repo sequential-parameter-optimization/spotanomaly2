@@ -611,10 +611,10 @@ class TestJoinIntoPanels:
 
         result = joiner.join_into_panels(panel_data)
         merged = result["1"]
-        assert "weather_temperature_baseline" in merged.columns
-        assert "weather_snow_depth" in merged.columns
+        assert "exogenous_weather_temperature_baseline" in merged.columns
+        assert "exogenous_weather_snow_depth" in merged.columns
         # Baseline of a constant 5.0 series stays ~5.0 (rolling mean of constants).
-        assert (merged["weather_temperature_baseline"] - 5.0).abs().max() < 1e-9
+        assert (merged["exogenous_weather_temperature_baseline"] - 5.0).abs().max() < 1e-9
 
     def test_joiner_does_not_hit_network(self, source_cfg, parent_cfg, tmp_path):
         """Joiner is read-only: no HTTP under any circumstance."""
@@ -645,8 +645,8 @@ class TestJoinIntoPanels:
         panel_data = {"1": pd.DataFrame({"temperature": [20.0] * 6}, index=idx)}
         result = joiner.join_into_panels(panel_data)
 
-        assert "weather_temperature_baseline" not in result["1"].columns
-        assert "weather_snow_depth" in result["1"].columns
+        assert "exogenous_weather_temperature_baseline" not in result["1"].columns
+        assert "exogenous_weather_snow_depth" in result["1"].columns
 
     def test_does_not_mutate_original_panel_data(self, source_cfg, parent_cfg, tmp_path):
         cache = tmp_path / "weather.parquet"

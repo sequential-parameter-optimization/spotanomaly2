@@ -318,15 +318,18 @@ def test_temperature_aggregation_ignores_weight_columns(sample_process_config):
 # ----- WeatherAdjustmentStep ------------------------------------------------
 
 
-def test_weather_adjustment_no_temperature_col_passes_through(sample_process_config):
+def test_weather_adjustment_no_temperature_col_drops_baseline(sample_process_config):
+    # No temperature to adjust, but the baseline is an intermediate and must be
+    # dropped so it never reaches training/detection.
     idx = pd.date_range("2025-01-01", periods=10, freq="5min", tz="UTC")
     df = pd.DataFrame(
-        {"value": np.arange(10, dtype=float), "weather_temperature_baseline": np.full(10, 5.0)},
+        {"value": np.arange(10, dtype=float), "exogenous_weather_temperature_baseline": np.full(10, 5.0)},
         index=idx,
     )
     step = WeatherAdjustmentStep(sample_process_config)
     result = step.process(df)
-    pd.testing.assert_frame_equal(result, df)
+    assert "exogenous_weather_temperature_baseline" not in result.columns
+    assert (result["value"] == np.arange(10, dtype=float)).all()
 
 
 def test_weather_adjustment_no_baseline_col_passes_through(sample_process_config):
@@ -337,23 +340,23 @@ def test_weather_adjustment_no_baseline_col_passes_through(sample_process_config
     pd.testing.assert_frame_equal(result, df)
 
 
-def test_weather_adjustment_subtracts_merged_baseline(sample_process_config):
+def test_weather_adjustment_subtracts_then_drops_baseline(sample_process_config):
     idx = pd.date_range("2025-01-01", periods=10, freq="5min", tz="UTC")
     df = pd.DataFrame(
-        {"temperature": np.full(10, 20.0), "weather_temperature_baseline": np.full(10, 5.0)},
+        {"temperature": np.full(10, 20.0), "exogenous_weather_temperature_baseline": np.full(10, 5.0)},
         index=idx,
     )
     step = WeatherAdjustmentStep(sample_process_config)
     result = step.process(df)
     assert (result["temperature"] == 15.0).all()
-    # baseline column is left in place — the merger owns it
-    assert "weather_temperature_baseline" in result.columns
+    # baseline is an intermediate, dropped once it has served the detrend
+    assert "exogenous_weather_temperature_baseline" not in result.columns
 
 
 def test_weather_adjustment_does_not_mutate_input(sample_process_config):
     idx = pd.date_range("2025-01-01", periods=5, freq="5min", tz="UTC")
     df = pd.DataFrame(
-        {"temperature": np.full(5, 20.0), "weather_temperature_baseline": np.full(5, 5.0)},
+        {"temperature": np.full(5, 20.0), "exogenous_weather_temperature_baseline": np.full(5, 5.0)},
         index=idx,
     )
     original = df.copy()

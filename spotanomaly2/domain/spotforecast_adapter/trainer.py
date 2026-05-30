@@ -18,6 +18,7 @@ import numpy as np
 import pandas as pd
 
 from spotanomaly2.application.config import load_panel_channel_config
+from spotanomaly2.domain.exogenous.residual_multiplier import multiplier_prefixes
 from spotanomaly2.infrastructure import logging, storage
 from spotanomaly2.infrastructure.storage import generate_timestamp
 
@@ -134,11 +135,11 @@ class SpotforecastTrainer:
     ) -> tuple[pd.DataFrame, list[str], list[str]]:
         """Split columns into target/exog and apply known-anomaly masking to targets."""
         configured_exog_columns = self.config["train"].get("exog_columns", [])
-        weight_residuals_enabled = self.config.get("residual_weighting", {}).get("enabled", False)
-        if weight_residuals_enabled:
-            self.logger.info("residual_weighting enabled: exogenous columns excluded from model features")
+        mult_prefixes = multiplier_prefixes(self.config)
+        if mult_prefixes:
+            self.logger.info(f"multiply_residuals sources: columns {mult_prefixes} excluded from model features")
         target_cols, exog_columns = _split_panel_columns(
-            panel_data, configured_exog_columns, weight_suffix, weight_residuals_enabled
+            panel_data, configured_exog_columns, weight_suffix, mult_prefixes
         )
 
         known_anomalies = self.config.get("known_anomalies", [])

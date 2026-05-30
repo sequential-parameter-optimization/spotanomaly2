@@ -56,21 +56,23 @@ def _split_panel_columns(
     df: pd.DataFrame,
     configured_exog_columns: list[str],
     weight_suffix: str,
-    weight_residuals_enabled: bool,
+    multiplier_prefixes: list[str],
 ) -> tuple[list[str], list[str]]:
     """Split DataFrame columns into (target_cols, exog_columns).
 
     Mirrors the logic ``SpotforecastTrainer.train_panel`` uses so the tuner sees
-    the same model topology as the training step: ``exogenous_*`` columns are
-    fed in as exog features (unless ``weight_residuals`` consumes them), and
-    they are NOT scored as targets.
+    the same model topology as the training step: ``exogenous_*`` columns are fed
+    in as exog features and are NOT scored as targets. Columns of a source with
+    ``multiply_residuals`` (identified by ``multiplier_prefixes``) are neither —
+    they multiply detection residuals, so they are excluded from features too.
     """
-    if weight_residuals_enabled:
-        prefixed_exog_columns: list[str] = []
-    else:
-        prefixed_exog_columns = [
-            col for col in df.columns if col.startswith("exogenous_") and not col.endswith(weight_suffix)
-        ]
+    prefixed_exog_columns = [
+        col
+        for col in df.columns
+        if col.startswith("exogenous_")
+        and not col.endswith(weight_suffix)
+        and not any(col.startswith(p) for p in multiplier_prefixes)
+    ]
     exog_columns = list(
         dict.fromkeys([col for col in [*configured_exog_columns, *prefixed_exog_columns] if col in df.columns])
     )
