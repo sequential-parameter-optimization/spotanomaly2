@@ -15,8 +15,9 @@ import pandas as pd
 
 from spotanomaly2.infrastructure import logging
 
+from .channel_prep import impute_exog
 from .prediction import _predict_one_step_integrated
-from .preprocessing import _ensure_freq, _interpolate_inplace
+from .preprocessing import _ensure_freq
 
 
 class SpotforecastPredictor:
@@ -105,17 +106,18 @@ class SpotforecastPredictor:
         full_y.name = target_col
         return _ensure_freq(full_y)
 
-    @staticmethod
     def _stitch_exog(
+        self,
         exog_columns: list[str],
         full_y: pd.Series,
         df: pd.DataFrame,
         history_df: pd.DataFrame | None,
     ) -> pd.DataFrame | None:
-        """Concat history+df exog columns aligned to ``full_y.index``; interpolate NaN cells.
+        """Concat history+df exog columns aligned to ``full_y.index``; impute NaN cells.
 
-        Interpolation matches what we do for y — with ``transformer_exog`` active
-        on linear models, NaN cells would otherwise propagate through
+        Gaps are filled with the config's imputation method (matching what the
+        trainer/tuner do for exog) — with ``transformer_exog`` active on linear
+        models, NaN cells would otherwise propagate through
         StandardScaler.transform and crash estimator.predict.
         """
         if not exog_columns:
@@ -128,6 +130,4 @@ class SpotforecastPredictor:
         else:
             exog_full = df[cols_present].copy()
         exog_full = exog_full.loc[full_y.index]
-        if exog_full.isna().any().any():
-            exog_full = _interpolate_inplace(exog_full)
-        return exog_full
+        return impute_exog(self.config, exog_full, cols_present)

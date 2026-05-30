@@ -18,6 +18,7 @@ from typing import Any
 import pandas as pd
 
 from spotanomaly2.domain.exogenous.residual_multiplier import multiplier_prefixes
+from spotanomaly2.domain.imputation_methods import impute_dataframe
 
 from .preprocessing import (
     _apply_known_anomaly_imputation,
@@ -120,6 +121,26 @@ def build_sample_mask(
                 sample_mask = ~anomaly_mask
 
     return sample_mask
+
+
+def impute_exog(config: dict[str, Any], exog_df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    """Fill exog NaN cells using the config's imputation method.
+
+    Uses ``process.imputation.{method,params}`` — the same single source of
+    truth the process stage and known-anomaly masking use — rather than a
+    hard-coded interpolation, so the exog features the trainer, tuner, and
+    predictor see are filled identically. Returns ``exog_df`` unchanged when it
+    has no missing cells.
+    """
+    if not exog_df.isna().any().any():
+        return exog_df
+    imp_cfg = config.get("process", {}).get("imputation", {})
+    return impute_dataframe(
+        exog_df,
+        method=imp_cfg.get("method", "linear_interpolation"),
+        columns=columns,
+        **imp_cfg.get("params", {}),
+    )
 
 
 def attach_weight_func(forecaster, sample_mask: pd.Series | None) -> None:

@@ -21,13 +21,19 @@ from spotanomaly2.application.config import load_panel_channel_config
 from spotanomaly2.infrastructure import logging, storage
 from spotanomaly2.infrastructure.storage import generate_timestamp
 
-from .channel_prep import SKIP_CHANNEL, attach_weight_func, build_sample_mask, get_weight_suffix, prepare_panel
+from .channel_prep import (
+    SKIP_CHANNEL,
+    attach_weight_func,
+    build_sample_mask,
+    get_weight_suffix,
+    impute_exog,
+    prepare_panel,
+)
 from .factory import _create_forecaster
 from .prediction import _difference, _predict_one_step_integrated
 from .preprocessing import (
     _compute_observed_mask,
     _ensure_freq,
-    _interpolate_inplace,
     _time_series_train_test_split,
 )
 
@@ -228,24 +234,23 @@ class SpotforecastTrainer:
 
         return forecaster
 
-    @staticmethod
     def _build_full_exog(
+        self,
         train_df: pd.DataFrame,
         test_df: pd.DataFrame,
         exog_columns: list[str],
     ) -> pd.DataFrame | None:
-        """Concat + interpolate the train+test exog frame once for the panel.
+        """Concat + impute the train+test exog frame once for the panel.
 
         The result is reused across every channel's one-step-ahead test
         prediction. Exog columns don't depend on the target, so rebuilding
-        this per channel is pure waste.
+        this per channel is pure waste. Gaps are filled with the config's
+        imputation method so train sees the same exog features tune does.
         """
         if not exog_columns:
             return None
         full_exog = pd.concat([train_df[exog_columns], test_df[exog_columns]])
-        if full_exog.isna().any().any():
-            full_exog = _interpolate_inplace(full_exog)
-        return full_exog
+        return impute_exog(self.config, full_exog, exog_columns)
 
     def _predict_test_window(
         self,

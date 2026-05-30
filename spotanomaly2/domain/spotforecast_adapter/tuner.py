@@ -19,10 +19,17 @@ import pandas as pd
 
 from spotanomaly2.infrastructure import logging
 
-from .channel_prep import SKIP_CHANNEL, attach_weight_func, build_sample_mask, get_weight_suffix, prepare_panel
+from .channel_prep import (
+    SKIP_CHANNEL,
+    attach_weight_func,
+    build_sample_mask,
+    get_weight_suffix,
+    impute_exog,
+    prepare_panel,
+)
 from .factory import _build_estimator, _create_forecaster
 from .prediction import _difference
-from .preprocessing import _compute_observed_mask, _ensure_freq, _interpolate_inplace
+from .preprocessing import _compute_observed_mask, _ensure_freq
 from .tuning_metrics import (
     _build_nan_safe_metric,
     _build_raw_r2_under_differentiation,
@@ -93,7 +100,7 @@ class SpotforecastTuner:
         # part of the timeline closest to live conditions, so any
         # distribution drift inside the dataset shows up in the metric and
         # constant-mean predictors get exposed instead of tying real models.
-        cv = OneStepAheadFold(initial_train_size=max(1, int(len(tune_df) * 0.8)), verbose=False)
+        cross_validator = OneStepAheadFold(initial_train_size=max(1, int(len(tune_df) * 0.8)), verbose=False)
 
         results: dict[str, dict[str, Any]] = {}
         channel_pbar = tqdm(target_cols, desc=f"Panel {panel_id}", unit="channel", leave=True)
@@ -105,7 +112,7 @@ class SpotforecastTuner:
                 tune_df,
                 exog_columns,
                 weight_suffix,
-                cv,
+                cross_validator,
                 train_settings,
                 search_settings,
                 tune_config,
@@ -212,7 +219,7 @@ class SpotforecastTuner:
         tune_df: pd.DataFrame,
         exog_columns: list[str],
         weight_suffix: str,
-        cv,
+        cross_validator,
         train_settings: dict[str, Any],
         search_settings: dict[str, Any],
         tune_config: dict[str, Any],
@@ -247,8 +254,7 @@ class SpotforecastTuner:
         exog_train = None
         if exog_columns:
             exog_train = tune_df[exog_columns].loc[y_train.index]
-            if exog_train.isna().any().any():
-                exog_train = _interpolate_inplace(exog_train)
+            exog_train = impute_exog(self.config, exog_train, exog_columns)
 
         # Predict Δy[t] just like train_panel will. The tuner must score
         # candidates on the same target the production model will fit
@@ -281,7 +287,7 @@ class SpotforecastTuner:
             y_train=y_train,
             exog_train=exog_train,
             sample_mask=sample_mask if isinstance(sample_mask, pd.Series) else None,
-            cv=cv,
+            cv=cross_validator,
             channel_metric_callable=channel_metric_callable,
             metric=metric,
             models=search_settings["models"],
