@@ -69,7 +69,6 @@ class LiveReportServer:
         self.logger = logger or logging.getLogger("LiveReportServer")
         self.clients = []
         self.observer: Optional[Observer] = None
-        self.server_task = None
         self.loop = None  # Will be set when server starts
 
     async def handle_sse(self, reader, writer):
