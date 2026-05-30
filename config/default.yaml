@@ -241,7 +241,7 @@ exogenous:
     joiner: "spotanomaly2.domain.exogenous.source_a:ExogenousAJoiner"
     config:
       enabled: true
-      multiply_residuals: false
+      multiply_residuals: true
       cache_dir: "data/exogenous"
       display_name: "Source A"
       panel_sources:

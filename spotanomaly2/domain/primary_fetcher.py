@@ -159,7 +159,7 @@ class PrimaryDataFetcher:
         self.logger.info(f"Fetched {len(df)} rows for panel {panel_id}")
         return df
 
-    def run(self, incremental_only: bool = False) -> dict[str, pd.DataFrame]:
+    def run(self, incremental_only: bool = False, ignore_cache: bool = False) -> dict[str, pd.DataFrame]:
         """Run the complete fetch pipeline with incremental loading support.
 
         Checks if existing data covers the requested time range from config.
@@ -168,6 +168,9 @@ class PrimaryDataFetcher:
         Args:
             incremental_only: If True, returns only newly fetched data without merging with existing.
                             If False (default), merges new data with existing data.
+            ignore_cache: If True, ignore any on-disk data for each panel and re-fetch
+                            the full requested range. If False (default), only missing
+                            slices are fetched.
 
         Returns:
             Dictionary mapping panel_id to DataFrame (only new data if incremental_only=True,
@@ -182,7 +185,9 @@ class PrimaryDataFetcher:
 
         panel_data = {}
         for panel_id in panels:
-            panel_data[panel_id] = self._run_panel(panel_id, raw_dir, requested_start, requested_end, incremental_only)
+            panel_data[panel_id] = self._run_panel(
+                panel_id, raw_dir, requested_start, requested_end, incremental_only, ignore_cache
+            )
 
         self.logger.info("Data fetch completed successfully")
         return panel_data
@@ -194,9 +199,12 @@ class PrimaryDataFetcher:
         requested_start: str,
         requested_end: str | None,
         incremental_only: bool,
+        ignore_cache: bool = False,
     ) -> pd.DataFrame:
         """Fetch (incrementally if possible) and combine the data for a single panel."""
-        existing_df = self._load_existing(raw_dir, panel_id)
+        existing_df = None if ignore_cache else self._load_existing(raw_dir, panel_id)
+        if ignore_cache:
+            self.logger.info(f"Panel {panel_id}: ignore_cache set, re-fetching full requested range")
         fetch_ranges = self._plan_fetch_ranges(panel_id, existing_df, requested_start, requested_end)
         fetched_dfs = self._execute_fetch_ranges(panel_id, fetch_ranges)
         return self._combine_panel_data(panel_id, existing_df, fetched_dfs, incremental_only)

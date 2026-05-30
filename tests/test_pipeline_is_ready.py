@@ -1,13 +1,13 @@
 # SPDX-FileCopyrightText: 2026 bartzbeielstein
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Tests for Pipeline.is_ready() — the live-mode readiness gate.
+"""Tests for the live-mode readiness gate: ``data_is_ready`` + ``model_is_ready``.
 
 These tests parametrise over (panel data presence, panel freshness,
 model presence, model freshness) and assert the corresponding verdict.
-They exist because `is_ready()` is the single safeguard that prevents
-``live()`` from scoring against stale models or missing data, and the
-existing test suite only mock-traces around it.
+They exist because this readiness gate is the single safeguard that prevents
+``LiveMonitor.run_once()`` from scoring against stale models or missing data,
+and the existing test suite only mock-traces around it.
 """
 
 import os
@@ -18,6 +18,12 @@ import pytest
 
 from spotanomaly2.application.pipeline import Pipeline
 from spotanomaly2.infrastructure import storage
+
+
+def _ready(config, **kwargs) -> bool:
+    """Combined readiness gate: both processed data and a trained model are fresh."""
+    pipeline = Pipeline(config)
+    return pipeline.data_is_ready(**kwargs) and pipeline.model_is_ready(**kwargs)
 
 
 @pytest.fixture
@@ -55,14 +61,14 @@ def ready_workspace(tmp_path, sample_config):
 class TestIsReadyHappyPath:
     def test_returns_true_when_everything_fresh(self, ready_workspace):
         config, *_ = ready_workspace
-        assert Pipeline(config).is_ready() is True
+        assert _ready(config) is True
 
 
 class TestIsReadyDataPreconditions:
     def test_returns_false_when_panel_parquet_missing(self, ready_workspace):
         config, processed_dir, _, _ = ready_workspace
         (processed_dir / "panel_1.parquet").unlink()
-        assert Pipeline(config).is_ready() is False
+        assert _ready(config) is False
 
     def test_returns_false_when_panel_data_stale(self, ready_workspace):
         """Panel whose latest row is older than max_age_days must fail."""
@@ -72,7 +78,7 @@ class TestIsReadyDataPreconditions:
         idx = pd.date_range(end=old_end, periods=100, freq="5min", tz="UTC")
         df = pd.DataFrame({"sensor_a": range(100)}, index=idx)
         storage.save_panel_parquet(df, processed_dir, "1")
-        assert Pipeline(config).is_ready(max_age_days=7) is False
+        assert _ready(config, max_age_days=7) is False
 
     def test_returns_true_for_panel_data_just_under_threshold(self, ready_workspace):
         config, processed_dir, _, _ = ready_workspace
@@ -80,19 +86,19 @@ class TestIsReadyDataPreconditions:
         idx = pd.date_range(end=recent_end, periods=100, freq="5min", tz="UTC")
         df = pd.DataFrame({"sensor_a": range(100)}, index=idx)
         storage.save_panel_parquet(df, processed_dir, "1")
-        assert Pipeline(config).is_ready(max_age_days=7) is True
+        assert _ready(config, max_age_days=7) is True
 
     def test_returns_false_when_panel_dataframe_empty(self, ready_workspace):
         config, processed_dir, _, _ = ready_workspace
         empty = pd.DataFrame({"sensor_a": []}, index=pd.DatetimeIndex([], tz="UTC"))
         storage.save_panel_parquet(empty, processed_dir, "1")
-        assert Pipeline(config).is_ready() is False
+        assert _ready(config) is False
 
     def test_returns_false_when_any_of_multiple_panels_missing(self, ready_workspace):
         config, processed_dir, _, _ = ready_workspace
         config["panels"]["panel_ids"] = ["1", "2"]
         # Panel 1 exists from fixture; panel 2 does not.
-        assert Pipeline(config).is_ready() is False
+        assert _ready(config) is False
 
 
 class TestIsReadyModelPreconditions:
@@ -105,7 +111,7 @@ class TestIsReadyModelPreconditions:
         for child in sorted(models_dir.glob("*"), reverse=True):
             child.rmdir()
         models_dir.rmdir()
-        assert Pipeline(config).is_ready() is False
+        assert _ready(config) is False
 
     def test_returns_false_when_no_timestamped_dirs(self, ready_workspace):
         config, _, models_dir, _ = ready_workspace
@@ -114,26 +120,26 @@ class TestIsReadyModelPreconditions:
             for f in child.iterdir():
                 f.unlink()
             child.rmdir()
-        assert Pipeline(config).is_ready() is False
+        assert _ready(config) is False
 
     def test_returns_false_when_no_matching_model_files(self, ready_workspace):
         config, _, _, model_file = ready_workspace
         # Rename the model so it no longer matches the expected pattern.
         model_file.rename(model_file.parent / "stale_model.pkl")
-        assert Pipeline(config).is_ready() is False
+        assert _ready(config) is False
 
     def test_returns_false_when_model_file_stale(self, ready_workspace):
         config, _, _, model_file = ready_workspace
         # Backdate the model mtime by 10 days.
         ten_days_ago = time.time() - 10 * 86400
         os.utime(model_file, (ten_days_ago, ten_days_ago))
-        assert Pipeline(config).is_ready(max_age_days=7) is False
+        assert _ready(config, max_age_days=7) is False
 
     def test_returns_true_when_model_just_under_threshold(self, ready_workspace):
         config, _, _, model_file = ready_workspace
         six_days_ago = time.time() - 6 * 86400
         os.utime(model_file, (six_days_ago, six_days_ago))
-        assert Pipeline(config).is_ready(max_age_days=7) is True
+        assert _ready(config, max_age_days=7) is True
 
 
 class TestIsReadyMaxAgeOverride:
@@ -156,4 +162,4 @@ class TestIsReadyMaxAgeOverride:
         ts = time.time() - 4 * 86400
         os.utime(model_file, (ts, ts))
 
-        assert Pipeline(config).is_ready(max_age_days=max_age_days) is expected
+        assert _ready(config, max_age_days=max_age_days) is expected

@@ -220,9 +220,9 @@ class DataManager:
         except FileNotFoundError:
             error_msg = (
                 f"CRITICAL: Cannot verify gaps in live data for panel {panel_id}. "
-                f"Full processed data not found. Run the full pipeline first:\n"
-                f"  spotanomaly2 --config <your_config.yaml> all --skip-download\n"
-                f"Or from Python: pipeline.run_all(skip_download=True)"
+                f"Full processed data not found. Run the pipeline stages first:\n"
+                f"  spotanomaly2 --config <your_config.yaml> process\n"
+                f"Or from Python: pipeline.process()"
             )
             self.logger.error(error_msg)
             raise RuntimeError(error_msg)
@@ -295,8 +295,8 @@ class DataManager:
             error_msg = (
                 f"CRITICAL: Cannot bootstrap live data for panel {panel_id}. "
                 f"No baseline processed data found. Run the full pipeline first:\n"
-                f"  spotanomaly2 --config <your_config.yaml> all\n"
-                f"Or from Python: pipeline.run_all()\n"
+                f"  spotanomaly2 download && spotanomaly2 process && spotanomaly2 train && spotanomaly2 detect\n"
+                f"Or from Python: pipeline.download(); pipeline.process(); pipeline.train(); pipeline.detect()\n"
                 f"This will fetch, process, train models, and create the initial baseline."
             )
             self.logger.error(error_msg)

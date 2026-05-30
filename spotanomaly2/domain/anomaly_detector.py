@@ -1,5 +1,4 @@
 """Anomaly detection service using spotforecast2 forecasting models."""
-
 from pathlib import Path
 from typing import Any
 
@@ -451,7 +450,7 @@ class AnomalyDetector:
         }
 
     def detect_panel(
-        self, panel_id: str, df: pd.DataFrame
+        self, panel_id: str, df: pd.DataFrame, live: bool = False
     ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame | None, dict[str, pd.DataFrame] | None]:
         """Detect anomalies for a single panel."""
         self.logger.info(f"Detecting anomalies for panel {panel_id}...")
@@ -466,7 +465,10 @@ class AnomalyDetector:
         )
 
         hist_window = self.config["detect"]["hist_window"]
-        target_date = self.config["detect"].get("target_date", None)
+        if live:
+            target_date = None
+        else:
+            target_date = self.config["detect"].get("target_date", None)
 
         if target_date:
             test_start_idx, test_end_idx = self._calculate_test_window_with_target_date(
@@ -663,7 +665,7 @@ class AnomalyDetector:
         return scores_df, flags_df, report_pred_df, contributions_df, per_channel_results
 
     def detect_all_panels(
-        self, panel_data: dict[str, pd.DataFrame]
+        self, panel_data: dict[str, pd.DataFrame], live: bool = False
     ) -> dict[
         str,
         tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame | None, dict[str, pd.DataFrame] | None],
@@ -671,18 +673,18 @@ class AnomalyDetector:
         results = {}
         for panel_id, df in panel_data.items():
             self.logger.info(f"Detecting anomalies for panel {panel_id}...")
-            result = self.detect_panel(panel_id, df)
+            result = self.detect_panel(panel_id, df, live)
             results[panel_id] = result
             self.logger.info(f"Completed detection for panel {panel_id}")
         return results
 
     def run(
-        self, panel_data: dict[str, pd.DataFrame]
+        self, panel_data: dict[str, pd.DataFrame], live: bool = False
     ) -> dict[
         str,
         tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame | None, dict[str, pd.DataFrame] | None],
     ]:
         self.logger.info("Starting anomaly detection...")
-        results = self.detect_all_panels(panel_data)
+        results = self.detect_all_panels(panel_data, live)
         self.logger.info("Anomaly detection completed successfully")
         return results

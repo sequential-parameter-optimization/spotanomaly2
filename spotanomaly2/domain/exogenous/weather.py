@@ -529,6 +529,7 @@ class ExogenousWeatherFetcher:
         timezone: str = "UTC",
         max_retries: int = 3,
         fallback_on_failure: bool = True,
+        ignore_cache: bool = False,
     ) -> pd.DataFrame:
         """Get weather data with cache-first strategy, retry logic, and fallback.
 
@@ -544,6 +545,8 @@ class ExogenousWeatherFetcher:
             timezone: Timezone for the data (default: 'UTC').
             max_retries: Maximum number of retry attempts for API calls (default: 3).
             fallback_on_failure: If True, use 24-hour repetition fallback when API fails (default: True).
+            ignore_cache: If True, skip loading any existing cache and re-fetch the
+                full range from the API, overwriting the cache (default: False).
 
         Returns:
             DataFrame with datetime index and weather columns for the requested range.
@@ -573,11 +576,13 @@ class ExogenousWeatherFetcher:
 
         # Try to load from cache
         cached_df = None
-        if cache_path is not None:
+        if cache_path is not None and not ignore_cache:
             try:
                 cached_df = self.load_from_cache(cache_path)
             except FileNotFoundError:
                 self.logger.info("Cache file not found, will fetch from API")
+        elif ignore_cache:
+            self.logger.info("ignore_cache set, bypassing weather cache and re-fetching full range")
 
         # Check if cache covers the requested range
         if cached_df is not None:
@@ -708,12 +713,13 @@ class ExogenousWeatherFetcher:
     # ExogenousFetcher protocol entry point
     # ------------------------------------------------------------------
 
-    def fetch_and_cache(self, start: pd.Timestamp, end: pd.Timestamp) -> None:
+    def fetch_and_cache(self, start: pd.Timestamp, end: pd.Timestamp, ignore_cache: bool = False) -> None:
         """Fetch weather for ``[start - lookback_days, end]`` and persist to ``cache_path``.
 
         The lookback expansion lives here (not in the orchestrator) because the
         baseline column the joiner computes needs ``lookback_days`` of pre-window
-        history.
+        history. When ``ignore_cache`` is True the existing cache is bypassed and
+        the full range is re-fetched.
         """
         lookback_days = self.source_config.get("lookback_days", 14)
         cache_path_str = self.source_config.get("cache_path")
@@ -728,6 +734,7 @@ class ExogenousWeatherFetcher:
             cache_path=cache_path,
             timezone="UTC",
             fallback_on_failure=fallback_on_failure,
+            ignore_cache=ignore_cache,
         )
 
 

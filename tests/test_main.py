@@ -3,9 +3,9 @@
 
 """Tests for the spotanomaly2 CLI entry point (main.py).
 
-These tests aggressively mock Pipeline (and signal/asyncio for live mode) so
-they exercise argparse plumbing, config loading, flag injection, and command
-dispatch without actually running pipeline stages.
+These tests aggressively mock Pipeline and LiveMonitor so they exercise argparse
+plumbing, config loading, flag injection, and command dispatch without actually
+running pipeline stages.
 """
 
 from __future__ import annotations
@@ -16,8 +16,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import yaml
 
-from spotanomaly2 import main as main_module
-from spotanomaly2.main import build_parser, main, run_live_monitoring
+from spotanomaly2.main import build_parser, main
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -45,7 +44,6 @@ def tmp_config_file(tmp_path: Path, sample_config: dict) -> Path:
         ["process"],
         ["train"],
         ["detect"],
-        ["all"],
         ["tune"],
         ["live"],
     ],
@@ -69,7 +67,6 @@ def test_build_parser_top_level_help_exits_zero():
     [
         ["download", "--help"],
         ["detect", "--help"],
-        ["all", "--help"],
         ["tune", "--help"],
         ["live", "--help"],
     ],
@@ -138,31 +135,6 @@ def test_model_flag_injects_into_detect_config(tmp_config_file, sample_config):
         assert passed_config["detect"]["model_timestamp"] == "20251229_172126"
 
 
-def test_model_flag_on_all_subcommand_injects(tmp_config_file, sample_config):
-    """`--model` should also work on the 'all' subcommand."""
-    with (
-        patch("spotanomaly2.main.load_config") as mock_load,
-        patch("spotanomaly2.main.Pipeline") as mock_pipeline,
-    ):
-        mock_load.return_value = dict(sample_config)
-        mock_pipeline.return_value = MagicMock()
-
-        rc = main(
-            [
-                "all",
-                "--config",
-                str(tmp_config_file),
-                "--predict-only",
-                "--model",
-                "20251229_172126",
-            ]
-        )
-
-        assert rc == 0
-        passed_config = mock_pipeline.call_args.args[0]
-        assert passed_config["detect"]["model_timestamp"] == "20251229_172126"
-
-
 # ---------------------------------------------------------------------------
 # (4) --raw-data-version flag override
 # ---------------------------------------------------------------------------
@@ -201,9 +173,7 @@ def test_raw_data_version_on_process(tmp_config_file, sample_config):
         mock_load.return_value = dict(sample_config)
         mock_pipeline.return_value = MagicMock()
 
-        rc = main(
-            ["process", "--config", str(tmp_config_file), "--raw-data-version", "20260101_000000"]
-        )
+        rc = main(["process", "--config", str(tmp_config_file), "--raw-data-version", "20260101_000000"])
 
         assert rc == 0
         passed_config = mock_pipeline.call_args.args[0]
@@ -237,59 +207,6 @@ def test_no_model_flag_leaves_config_detect_untouched(tmp_config_file, sample_co
 
 
 # ---------------------------------------------------------------------------
-# (6) & (7) `all` flags: --predict-only, --skip-download
-# ---------------------------------------------------------------------------
-
-
-def test_all_predict_only_flag_propagates(tmp_config_file, sample_config):
-    """`all --predict-only` must call pipeline.run_all(predict_only=True)."""
-    with (
-        patch("spotanomaly2.main.load_config") as mock_load,
-        patch("spotanomaly2.main.Pipeline") as mock_pipeline_cls,
-    ):
-        mock_load.return_value = dict(sample_config)
-        mock_pipeline = MagicMock()
-        mock_pipeline_cls.return_value = mock_pipeline
-
-        rc = main(["all", "--config", str(tmp_config_file), "--predict-only"])
-
-        assert rc == 0
-        mock_pipeline.run_all.assert_called_once_with(skip_download=False, predict_only=True)
-
-
-def test_all_skip_download_flag_propagates(tmp_config_file, sample_config):
-    """`all --skip-download` must call pipeline.run_all(skip_download=True)."""
-    with (
-        patch("spotanomaly2.main.load_config") as mock_load,
-        patch("spotanomaly2.main.Pipeline") as mock_pipeline_cls,
-    ):
-        mock_load.return_value = dict(sample_config)
-        mock_pipeline = MagicMock()
-        mock_pipeline_cls.return_value = mock_pipeline
-
-        rc = main(["all", "--config", str(tmp_config_file), "--skip-download"])
-
-        assert rc == 0
-        mock_pipeline.run_all.assert_called_once_with(skip_download=True, predict_only=False)
-
-
-def test_all_no_flags_defaults(tmp_config_file, sample_config):
-    """`all` with no flags should call run_all(skip_download=False, predict_only=False)."""
-    with (
-        patch("spotanomaly2.main.load_config") as mock_load,
-        patch("spotanomaly2.main.Pipeline") as mock_pipeline_cls,
-    ):
-        mock_load.return_value = dict(sample_config)
-        mock_pipeline = MagicMock()
-        mock_pipeline_cls.return_value = mock_pipeline
-
-        rc = main(["all", "--config", str(tmp_config_file)])
-
-        assert rc == 0
-        mock_pipeline.run_all.assert_called_once_with(skip_download=False, predict_only=False)
-
-
-# ---------------------------------------------------------------------------
 # Individual stage dispatch
 # ---------------------------------------------------------------------------
 
@@ -303,9 +220,7 @@ def test_all_no_flags_defaults(tmp_config_file, sample_config):
         ("detect", "detect"),
     ],
 )
-def test_stage_dispatch_calls_matching_pipeline_method(
-    tmp_config_file, sample_config, command, method
-):
+def test_stage_dispatch_calls_matching_pipeline_method(tmp_config_file, sample_config, command, method):
     with (
         patch("spotanomaly2.main.load_config") as mock_load,
         patch("spotanomaly2.main.Pipeline") as mock_pipeline_cls,
@@ -383,87 +298,40 @@ def test_tune_n_trials_and_n_initial_inject_into_config(tmp_config_file, sample_
 # ---------------------------------------------------------------------------
 
 
-def test_live_single_shot_calls_pipeline_live(tmp_config_file, sample_config):
-    """`live` with no --interval calls pipeline.live() exactly once."""
+def test_live_single_shot_calls_monitor_run_once(tmp_config_file, sample_config):
+    """`live` with no --interval builds a LiveMonitor and calls run_once() once."""
     with (
         patch("spotanomaly2.main.load_config") as mock_load,
-        patch("spotanomaly2.main.Pipeline") as mock_pipeline_cls,
+        patch("spotanomaly2.main.Pipeline"),
+        patch("spotanomaly2.main.LiveMonitor") as mock_monitor_cls,
     ):
         mock_load.return_value = dict(sample_config)
-        mock_pipeline = MagicMock()
-        mock_pipeline_cls.return_value = mock_pipeline
+        mock_monitor = MagicMock()
+        mock_monitor_cls.return_value = mock_monitor
 
         rc = main(["live", "--config", str(tmp_config_file)])
 
         assert rc == 0
-        mock_pipeline.live.assert_called_once_with()
+        mock_monitor.run_once.assert_called_once_with()
+        mock_monitor.run_monitoring.assert_not_called()
 
 
-def test_live_with_interval_calls_run_live_monitoring(tmp_config_file, sample_config):
-    """`live --interval 5` routes through run_live_monitoring."""
+def test_live_with_interval_calls_run_monitoring(tmp_config_file, sample_config):
+    """`live --interval 5` routes through LiveMonitor.run_monitoring(5)."""
     with (
         patch("spotanomaly2.main.load_config") as mock_load,
-        patch("spotanomaly2.main.Pipeline") as mock_pipeline_cls,
-        patch("spotanomaly2.main.run_live_monitoring") as mock_run_live,
+        patch("spotanomaly2.main.Pipeline"),
+        patch("spotanomaly2.main.LiveMonitor") as mock_monitor_cls,
     ):
         mock_load.return_value = dict(sample_config)
-        mock_pipeline_cls.return_value = MagicMock()
-        mock_run_live.return_value = 0
+        mock_monitor = MagicMock()
+        mock_monitor.run_monitoring.return_value = 0
+        mock_monitor_cls.return_value = mock_monitor
 
         rc = main(["live", "--config", str(tmp_config_file), "--interval", "5"])
 
         assert rc == 0
-        mock_run_live.assert_called_once()
-        # Second positional arg is the interval in minutes.
-        assert mock_run_live.call_args.args[1] == 5
-
-
-def test_run_live_monitoring_rejects_interval_lt_1():
-    """Sanity guard: interval must be at least 1."""
-    logger = MagicMock()
-    pipeline = MagicMock()
-    rc = run_live_monitoring(pipeline, 0, logger)
-    assert rc != 0
-    logger.error.assert_called()
-
-
-def test_run_live_monitoring_loops_until_signal(monkeypatch):
-    """run_live_monitoring should call pipeline.live() at least once and stop cleanly.
-
-    We patch signal.signal, time.sleep, and LiveReportServer to make the loop
-    deterministic and fast. We force the loop to terminate after one iteration
-    by mutating the `running` flag via a side-effect on pipeline.live().
-    """
-    pipeline = MagicMock()
-    pipeline.config = {"paths": {"results_dir": "/tmp/results-test"}, "report": {"enabled": False}}
-    logger = MagicMock()
-
-    # Capture and stub signal handlers (don't really register them).
-    monkeypatch.setattr(main_module.signal, "signal", MagicMock())
-    # Skip real sleeping.
-    monkeypatch.setattr(main_module.time, "sleep", MagicMock())
-
-    # The loop reads `time.time()` to decide when to wake up. Returning a huge
-    # value makes the inner wait loop fall through immediately on first check.
-    real_time = main_module.time.time
-
-    call_count = {"n": 0}
-
-    def fake_time():
-        call_count["n"] += 1
-        # First few calls real, then jump far in the future to break the wait.
-        return real_time() + 10_000 * call_count["n"]
-
-    monkeypatch.setattr(main_module.time, "time", fake_time)
-
-    # Side effect: after first pipeline.live(), raise KeyboardInterrupt so the
-    # outer while-loop exits via its `except KeyboardInterrupt: break`.
-    pipeline.live.side_effect = KeyboardInterrupt()
-
-    rc = run_live_monitoring(pipeline, 1, logger)
-
-    assert rc == 0
-    assert pipeline.live.call_count == 1
+        mock_monitor.run_monitoring.assert_called_once_with(5)
 
 
 # ---------------------------------------------------------------------------

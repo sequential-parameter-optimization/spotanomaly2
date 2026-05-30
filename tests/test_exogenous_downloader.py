@@ -49,7 +49,7 @@ def _ok_fetcher_class(*, instances: list, calls: list, enabled: bool = True):
             instances.append(self)
             self.source_config = source_config
 
-        def fetch_and_cache(self, start, end):
+        def fetch_and_cache(self, start, end, ignore_cache=False):
             calls.append((start, end))
 
     return _OkFetcher
@@ -131,7 +131,7 @@ class TestFailurePaths:
             def __init__(self, source_config, parent_config, logger=None):
                 pass
 
-            def fetch_and_cache(self, start, end):
+            def fetch_and_cache(self, start, end, ignore_cache=False):
                 raise RuntimeError("network down")
 
         _install_fake_module(monkeypatch, "tests._fake_dl_boom", F=_BoomFetcher, J=_noop_joiner_class())
@@ -162,7 +162,7 @@ class TestFailurePaths:
             def __init__(self, source_config, parent_config, logger=None):
                 raise ValueError("missing credentials")
 
-            def fetch_and_cache(self, start, end):
+            def fetch_and_cache(self, start, end, ignore_cache=False):
                 pass  # never reached
 
         _install_fake_module(monkeypatch, "tests._fake_dl_ctor", F=_BadCtorFetcher, J=_noop_joiner_class())

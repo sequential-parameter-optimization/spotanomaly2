@@ -27,16 +27,34 @@ class ReadinessChecker:
         one trained model exists on disk, and both the data and model are
         newer than *max_age_days*.
         """
+        return self.data_is_ready(max_age_days) and self.model_is_ready(max_age_days)
+
+    def data_is_ready(self, max_age_days: float = 7) -> bool:
+        """Return True iff every configured panel has fresh processed data.
+
+        Args:
+            max_age_days: Maximum age (in days) of the processed data before it
+                is considered stale. Defaults to 7.
+        """
         processed_dir = Path(self.config["paths"]["processed_dir"])
-        models_dir = Path(self.config["paths"]["models_dir"])
         panels = self.config["panels"]["panel_ids"]
 
         now = pd.Timestamp.now(tz="UTC")
         max_age = timedelta(days=max_age_days)
 
-        panels_ready = all(self._is_panel_data_ready(panel_id, processed_dir, now, max_age) for panel_id in panels)
-        if not panels_ready:
-            return False
+        return all(self._is_panel_data_ready(panel_id, processed_dir, now, max_age) for panel_id in panels)
+
+    def model_is_ready(self, max_age_days: float = 7) -> bool:
+        """Return True iff at least one fresh trained model exists on disk.
+
+        Args:
+            max_age_days: Maximum age (in days) of the trained model before it
+                is considered stale. Defaults to 7.
+        """
+        models_dir = Path(self.config["paths"]["models_dir"])
+
+        now = pd.Timestamp.now(tz="UTC")
+        max_age = timedelta(days=max_age_days)
 
         return self._is_model_ready(models_dir, now, max_age)
 

@@ -30,13 +30,14 @@ class ExogenousDownloader:
         start: pd.Timestamp,
         end: pd.Timestamp,
         fetch_status: Optional[dict] = None,
+        ignore_cache: bool = False,
     ) -> None:
         for name, src_cfg, FetcherCls, _ in iter_configured_sources(self.config):
             if not FetcherCls.is_enabled(src_cfg):
                 self._set_status(fetch_status, name, "disabled", None)
                 continue
             try:
-                FetcherCls(src_cfg, self.config, self.logger).fetch_and_cache(start, end)
+                FetcherCls(src_cfg, self.config, self.logger).fetch_and_cache(start, end, ignore_cache=ignore_cache)
                 self._set_status(fetch_status, name, "ok", None)
             except Exception as exc:
                 self.logger.warning(f"{name} fetch failed, continuing without it: {exc}")

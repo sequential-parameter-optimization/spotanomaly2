@@ -386,6 +386,7 @@ class ExogenousAFetcher:
         end: str | pd.Timestamp,
         cache_path: Path,
         max_retries: int = 3,
+        ignore_cache: bool = False,
     ) -> pd.DataFrame:
         """Get data for a single source with cache-first strategy.
 
@@ -399,6 +400,7 @@ class ExogenousAFetcher:
             end: Requested end.
             cache_path: Path to the per-source Parquet cache file.
             max_retries: API retry attempts.
+            ignore_cache: If True, skip the cache and re-fetch the full range.
 
         Returns:
             DataFrame covering at least the requested range.
@@ -411,10 +413,13 @@ class ExogenousAFetcher:
             end_ts = end_ts.tz_localize("UTC")
 
         cached_df: Optional[pd.DataFrame] = None
-        try:
-            cached_df = self.load_from_cache(cache_path)
-        except FileNotFoundError:
-            self.logger.info(f"[{name}] No cache found at {cache_path}")
+        if ignore_cache:
+            self.logger.info(f"[{name}] ignore_cache set, bypassing cache and re-fetching full range")
+        else:
+            try:
+                cached_df = self.load_from_cache(cache_path)
+            except FileNotFoundError:
+                self.logger.info(f"[{name}] No cache found at {cache_path}")
 
         if cached_df is not None:
             cache_start = cached_df.index.min()
@@ -467,6 +472,7 @@ class ExogenousAFetcher:
         start: str | pd.Timestamp,
         end: str | pd.Timestamp,
         max_retries: int = 3,
+        ignore_cache: bool = False,
     ) -> dict[str, pd.DataFrame]:
         """Get timeseries for all configured sources using cache-first strategy.
 
@@ -474,6 +480,7 @@ class ExogenousAFetcher:
             start: Start timestamp (ISO-8601 or pd.Timestamp).
             end: End timestamp.
             max_retries: API retry attempts per source.
+            ignore_cache: If True, bypass caches and re-fetch the full range.
 
         Returns:
             Dict mapping source name to DataFrame.
@@ -481,7 +488,9 @@ class ExogenousAFetcher:
         results: dict[str, pd.DataFrame] = {}
         for name, ref_id in self.sources.items():
             cache_path = self.cache_dir / f"{name}.parquet"
-            results[name] = self._get_source_data(name, ref_id, start, end, cache_path, max_retries=max_retries)
+            results[name] = self._get_source_data(
+                name, ref_id, start, end, cache_path, max_retries=max_retries, ignore_cache=ignore_cache
+            )
         return results
 
     def run(
@@ -489,6 +498,7 @@ class ExogenousAFetcher:
         start: str | pd.Timestamp,
         end: str | pd.Timestamp,
         max_retries: int = 3,
+        ignore_cache: bool = False,
     ) -> dict[str, pd.DataFrame]:
         """Run the complete Exogenous data fetch pipeline.
 
@@ -496,12 +506,13 @@ class ExogenousAFetcher:
             start: Start timestamp.
             end: End timestamp.
             max_retries: API retry attempts per source.
+            ignore_cache: If True, bypass caches and re-fetch the full range.
 
         Returns:
             Dict mapping source name to DataFrame.
         """
         self.logger.info("Starting Exogenous data fetch...")
-        data = self.get_data(start=start, end=end, max_retries=max_retries)
+        data = self.get_data(start=start, end=end, max_retries=max_retries, ignore_cache=ignore_cache)
         total_rows = sum(len(df) for df in data.values())
         self.logger.info(f"Exogenous data fetch completed: {total_rows} total rows across {len(data)} sources")
         return data
@@ -510,13 +521,14 @@ class ExogenousAFetcher:
     # ExogenousFetcher protocol entry point
     # ------------------------------------------------------------------
 
-    def fetch_and_cache(self, start: pd.Timestamp, end: pd.Timestamp) -> None:
+    def fetch_and_cache(self, start: pd.Timestamp, end: pd.Timestamp, ignore_cache: bool = False) -> None:
         """Fetch ``[start, end]`` for every configured source and persist to ``cache_dir``.
 
         Side effect only: ``get_data`` writes a parquet per source under
         ``cache_dir``. The downloader doesn't need the returned DataFrames.
+        When ``ignore_cache`` is True the caches are bypassed and overwritten.
         """
-        self.run(start=start, end=end)
+        self.run(start=start, end=end, ignore_cache=ignore_cache)
 
 
 class ExogenousAJoiner:

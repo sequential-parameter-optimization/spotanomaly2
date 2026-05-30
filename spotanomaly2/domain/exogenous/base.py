@@ -29,9 +29,12 @@ class ExogenousFetcher(Protocol):
         """Return True iff this source is configured to run (e.g. has credentials/coords)."""
         ...
 
-    def fetch_and_cache(self, start: pd.Timestamp, end: pd.Timestamp) -> None:
+    def fetch_and_cache(self, start: pd.Timestamp, end: pd.Timestamp, ignore_cache: bool = False) -> None:
         """Fetch ``[start, end]`` (extend internally if a baseline window is needed)
-        and write the result to the source's cache. Idempotent; cache-aware."""
+        and write the result to the source's cache. Idempotent; cache-aware.
+
+        When ``ignore_cache`` is True, any existing cache is ignored and the full
+        range is re-fetched and overwritten."""
         ...
 
 

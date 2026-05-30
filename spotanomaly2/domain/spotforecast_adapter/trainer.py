@@ -18,20 +18,16 @@ import numpy as np
 import pandas as pd
 
 from spotanomaly2.application.config import load_panel_channel_config
-from spotanomaly2.domain.exogenous.residual_multiplier import multiplier_prefixes
 from spotanomaly2.infrastructure import logging, storage
 from spotanomaly2.infrastructure.storage import generate_timestamp
 
+from .channel_prep import SKIP_CHANNEL, attach_weight_func, build_sample_mask, get_weight_suffix, prepare_panel
 from .factory import _create_forecaster
 from .prediction import _difference, _predict_one_step_integrated
 from .preprocessing import (
-    _apply_known_anomaly_imputation,
-    _build_strict_training_sample_mask,
     _compute_observed_mask,
-    _detect_anomalies_via_ridge,
     _ensure_freq,
     _interpolate_inplace,
-    _split_panel_columns,
     _time_series_train_test_split,
 )
 
@@ -42,9 +38,6 @@ class SpotforecastTrainer:
     def __init__(self, config: dict[str, Any], logger=None):
         self.config = config
         self.logger = logger or logging.get_logger("SpotforecastTrainer")
-
-    def _get_weight_suffix(self) -> str:
-        return self.config.get("process", {}).get("imputation", {}).get("weight_suffix", "__weight")
 
     def train_panel(
         self,
@@ -58,19 +51,15 @@ class SpotforecastTrainer:
         model_label = self.config["train"]["fallback_model"]
         n_lags = self.config["train"].get("lags", 24)
         random_seed = self.config["train"].get("random_seed", 42)
-        # Predict Δy[t] = y[t] - y[t-1] instead of y[t]. At inference we
-        # integrate one-step: y_pred[t] = y[t-1] + Δy_pred[t]. Makes the
-        # target stationary so no model — degenerate or not — can win by
-        # collapsing to the training mean. Set 0 to disable.
         diff_order = int(self.config.get("train", {}).get("differentiation", 1))
-        weight_suffix = self._get_weight_suffix()
+        weight_suffix = get_weight_suffix(self.config)
 
         if timestamp is None:
             timestamp = generate_timestamp()
 
         self.logger.info(f"Training spotforecast2 models on {len(panel_data)} rows for panel {panel_id}")
 
-        panel_data, target_cols, exog_columns = self._prepare_panel_data(panel_data, weight_suffix)
+        panel_data, target_cols, exog_columns = prepare_panel(self.config, panel_data, weight_suffix, self.logger)
         train_df, test_df = self._split_train_test(panel_data, train_ratio)
         panel_default_model, panel_default_params, channel_cfg_map = self._load_and_resolve_panel_config(panel_id)
         full_exog = self._build_full_exog(train_df, test_df, exog_columns)
@@ -111,54 +100,24 @@ class SpotforecastTrainer:
         res_df = self._compute_eval_metrics(test_df, target_cols, y_pred_test, weight_suffix)
         self.logger.info(f"Average RMSE: {res_df['rmse'].mean():.4f}")
 
-        model_data = self._build_model_artifact(
-            forecasters=forecasters,
-            target_cols=target_cols,
-            exog_columns=exog_columns,
-            channel_model_specs=channel_model_specs,
-            diff_order=diff_order,
-            n_lags=n_lags,
-            model_label=model_label,
-            train_ratio=train_ratio,
-            train_df=train_df,
-            test_df=test_df,
-            timestamp=timestamp,
-        )
-
         if save_model:
+            model_data = self._build_model_artifact(
+                forecasters=forecasters,
+                target_cols=target_cols,
+                exog_columns=exog_columns,
+                channel_model_specs=channel_model_specs,
+                diff_order=diff_order,
+                n_lags=n_lags,
+                model_label=model_label,
+                train_ratio=train_ratio,
+                train_df=train_df,
+                test_df=test_df,
+                timestamp=timestamp,
+            )
+
             self._save_model_artifact(model_data, panel_id, timestamp)
 
         return res_df, timestamp
-
-    def _prepare_panel_data(
-        self,
-        panel_data: pd.DataFrame,
-        weight_suffix: str,
-    ) -> tuple[pd.DataFrame, list[str], list[str]]:
-        """Split columns into target/exog and apply known-anomaly masking to targets."""
-        configured_exog_columns = self.config["train"].get("exog_columns", [])
-        mult_prefixes = multiplier_prefixes(self.config)
-        if mult_prefixes:
-            self.logger.info(f"multiply_residuals sources: columns {mult_prefixes} excluded from model features")
-        target_cols, exog_columns = _split_panel_columns(
-            panel_data, configured_exog_columns, weight_suffix, mult_prefixes
-        )
-
-        known_anomalies = self.config.get("known_anomalies", [])
-        known_anomaly_buffer = self.config["train"].get("known_anomaly_buffer")
-        if known_anomalies and known_anomaly_buffer:
-            imp_cfg = self.config.get("process", {}).get("imputation", {})
-            panel_data = _apply_known_anomaly_imputation(
-                panel_data,
-                known_anomalies,
-                known_anomaly_buffer,
-                target_cols=target_cols,
-                weight_suffix=weight_suffix,
-                imputation_method=imp_cfg.get("method", "linear_interpolation"),
-                imputation_params=imp_cfg.get("params", {}),
-            )
-
-        return panel_data, target_cols, exog_columns
 
     def _split_train_test(
         self,
@@ -229,51 +188,6 @@ class SpotforecastTrainer:
                 return list(n_lags), int(max(n_lags))
             return n_lags, int(n_lags) if not isinstance(n_lags, (list, tuple)) else 24
 
-    def _build_sample_weights(
-        self,
-        observed_mask: pd.Series,
-        effective_n_lags: int,
-        y_train: pd.Series,
-        target_col: str,
-    ) -> pd.Series | str | None:
-        """Combine strict-imputation mask + optional auto-clean anomaly mask.
-
-        Returns:
-            - ``None`` if no weighting is needed
-            - ``"skip"`` sentinel if the strict mask leaves zero usable samples
-            - ``pd.Series`` of bool weights otherwise
-        """
-        sample_mask: pd.Series | None = None
-        train_cfg = self.config.get("train", {})
-
-        if train_cfg.get("exclude_imputed_training_samples", False):
-            sample_mask = _build_strict_training_sample_mask(observed_mask=observed_mask, n_lags=effective_n_lags)
-            potential = max(len(y_train) - effective_n_lags, 0)
-            kept = int(sample_mask.iloc[effective_n_lags:].sum())
-            self.logger.info(
-                f"    {target_col}: excluding {potential - kept} training sample(s) "
-                f"that contain imputed target/lag values"
-            )
-            if kept == 0:
-                return "skip"
-
-        if train_cfg.get("auto_clean_anomalies", False):
-            anomaly_mask = _detect_anomalies_via_ridge(
-                y_train,
-                n_lags=effective_n_lags,
-                threshold_scale=train_cfg.get("auto_clean_threshold", 4.0),
-                buffer=train_cfg.get("auto_clean_buffer", 3),
-            )
-            n_flagged = int(anomaly_mask.sum())
-            if n_flagged > 0:
-                self.logger.info(f"    {target_col}: auto-cleaning flagged {n_flagged} suspected anomaly points")
-                if sample_mask is not None:
-                    sample_mask = sample_mask & ~anomaly_mask
-                else:
-                    sample_mask = ~anomaly_mask
-
-        return sample_mask
-
     def _fit_channel_forecaster(
         self,
         model_name: str,
@@ -295,12 +209,7 @@ class SpotforecastTrainer:
             logger=self.logger,
         )
 
-        if sample_mask is not None:
-
-            def _weight_func(index, mask=sample_mask):
-                return mask.reindex(index).fillna(False).astype(float).to_numpy()
-
-            forecaster.weight_func = _weight_func
+        attach_weight_func(forecaster, sample_mask)
 
         # Fit on Δy when differentiation > 0. spotforecast2's transformer_y /
         # weight_func still apply normally to the differenced target.
@@ -408,8 +317,8 @@ class SpotforecastTrainer:
             self.logger.warning(f"  Skipping {target_col}: insufficient data ({len(y_train)} rows)")
             return None
 
-        sample_mask = self._build_sample_weights(observed_mask, effective_n_lags, y_train, target_col)
-        if sample_mask == "skip":
+        sample_mask = build_sample_mask(self.config, observed_mask, y_train, target_col, effective_n_lags, self.logger)
+        if sample_mask is SKIP_CHANNEL:
             self.logger.warning(f"  Skipping {target_col}: no fully observed training samples left")
             return None
 

@@ -55,6 +55,23 @@ class TestSpotforecastTrainer:
         assert len(eval_df) == 2  # sensor_a, sensor_b
         assert isinstance(timestamp, str)
 
+    def test_train_panel_completes_with_exclude_imputed_training_samples(self, sample_config, panel_df, tmp_path):
+        """With ``exclude_imputed_training_samples=True`` the sample mask is a
+        pd.Series, so the skip-sentinel check must not compare it element-wise
+        (an old ``sample_mask == "skip"`` raised "truth value is ambiguous")."""
+        config = copy.deepcopy(sample_config)
+        config["paths"]["models_dir"] = str(tmp_path)
+        config["train"]["lags"] = 6
+        config["train"]["exclude_imputed_training_samples"] = True
+        df = panel_df.copy()
+        df["sensor_a__weight"] = 1.0
+        df.loc[df.index[100:140], "sensor_a__weight"] = 0.0  # imputed window, plenty left
+
+        eval_df, _ = SpotforecastTrainer(config).train_panel("test", df)
+
+        assert isinstance(eval_df, pd.DataFrame)
+        assert "sensor_a" in eval_df.index
+
     def test_predict_returns_dataframe(self, adapter, panel_df, tmp_path):
         adapter.config["paths"]["models_dir"] = str(tmp_path)
         _, timestamp = adapter.train_panel("test", panel_df)
