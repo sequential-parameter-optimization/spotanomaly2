@@ -22,15 +22,14 @@ from spotanomaly2.infrastructure import logging, storage
 from spotanomaly2.infrastructure.storage import generate_timestamp
 
 from .channel_prep import (
-    SKIP_CHANNEL,
     attach_weight_func,
-    build_sample_mask,
-    get_weight_suffix,
     impute_exog,
+    prepare_channel,
     prepare_panel,
+    resolve_train_settings,
 )
 from .factory import _create_forecaster
-from .prediction import _difference, _predict_one_step_integrated
+from .prediction import _predict_one_step_integrated
 from .preprocessing import (
     _compute_observed_mask,
     _ensure_freq,
@@ -53,12 +52,13 @@ class SpotforecastTrainer:
         save_model: bool = True,
     ) -> tuple[pd.DataFrame, str]:
         """Train one ForecasterRecursive per target channel for a panel."""
+        knobs = resolve_train_settings(self.config)
         train_ratio = self.config["train"]["train_ratio"]
         model_label = self.config["train"]["fallback_model"]
-        n_lags = self.config["train"].get("lags", 24)
-        random_seed = self.config["train"].get("random_seed", 42)
-        diff_order = int(self.config.get("train", {}).get("differentiation", 1))
-        weight_suffix = get_weight_suffix(self.config)
+        n_lags = knobs.n_lags
+        random_seed = knobs.random_seed
+        diff_order = knobs.diff_order
+        weight_suffix = knobs.weight_suffix
 
         if timestamp is None:
             timestamp = generate_timestamp()
@@ -200,32 +200,27 @@ class SpotforecastTrainer:
         model_params: dict[str, Any],
         effective_lags: int | list[int],
         random_seed: int,
-        y_train: pd.Series,
-        exog_train: pd.DataFrame | None,
+        y_fit: pd.Series,
+        exog_fit: pd.DataFrame | None,
         sample_mask: pd.Series | None,
-        diff_order: int,
     ):
-        """Create forecaster, attach weight_func, fit (with Δy when needed), detach for serialization."""
+        """Create forecaster, attach weight_func, fit, detach for serialization.
+
+        ``y_fit`` / ``exog_fit`` arrive already differenced + aligned from
+        ``prepare_channel``; spotforecast2's transformer_y / weight_func still
+        apply normally to the (possibly differenced) target.
+        """
         forecaster = _create_forecaster(
             model_name,
             model_params,
             n_lags=effective_lags,
             random_seed=random_seed,
-            has_exog=exog_train is not None,
+            has_exog=exog_fit is not None,
             logger=self.logger,
         )
 
         attach_weight_func(forecaster, sample_mask)
-
-        # Fit on Δy when differentiation > 0. spotforecast2's transformer_y /
-        # weight_func still apply normally to the differenced target.
-        if diff_order > 0:
-            y_for_fit = _difference(y_train, diff_order).dropna()
-            exog_for_fit = exog_train.loc[y_for_fit.index] if exog_train is not None else None
-        else:
-            y_for_fit = y_train
-            exog_for_fit = exog_train
-        forecaster.fit(y=y_for_fit, exog=exog_for_fit)
+        forecaster.fit(y=y_fit, exog=exog_fit)
 
         # Detach the closure so joblib can serialise the fitted forecaster.
         if sample_mask is not None:
@@ -311,36 +306,34 @@ class SpotforecastTrainer:
 
         self.logger.info(f"  Training forecaster for: {target_col} (model={channel_model_name})")
 
-        # Process stage + _apply_known_anomaly_imputation together guarantee a
-        # gap-free target with __weight=0 marking every non-real row (process-
-        # imputed or known-anomaly). No re-interpolation needed here.
-        y_train = train_df[target_col].copy()
-        y_train.name = target_col
-
-        observed_mask = _compute_observed_mask(train_df, target_col, weight_suffix)
-        if len(y_train) < effective_n_lags + 10:
-            self.logger.warning(f"  Skipping {target_col}: insufficient data ({len(y_train)} rows)")
+        # Shared per-channel setup (target/exog split is already done; this does
+        # the imputation-flag mask, exog imputation, and optional Δy) so train
+        # and tune fit the exact same inputs. ``None`` => skip this channel.
+        channel = prepare_channel(
+            self.config,
+            train_df,
+            target_col,
+            exog_columns,
+            weight_suffix,
+            n_lags_for_mask=effective_n_lags,
+            diff_order=diff_order,
+            logger=self.logger,
+        )
+        if channel is None:
             return None
 
-        sample_mask = build_sample_mask(self.config, observed_mask, y_train, target_col, effective_n_lags, self.logger)
-        if sample_mask is SKIP_CHANNEL:
-            self.logger.warning(f"  Skipping {target_col}: no fully observed training samples left")
-            return None
-
-        exog_train = train_df[exog_columns].loc[y_train.index] if exog_columns else None
         forecaster = self._fit_channel_forecaster(
             channel_model_name,
             channel_model_params,
             effective_lags,
             random_seed,
-            y_train,
-            exog_train,
-            sample_mask if isinstance(sample_mask, pd.Series) else None,
-            diff_order,
+            channel.y_fit,
+            channel.exog_fit,
+            channel.sample_mask,
         )
 
         channel_preds = self._predict_test_window(
-            forecaster, y_train, test_df, target_col, weight_suffix, full_exog, diff_order
+            forecaster, channel.y_raw, test_df, target_col, weight_suffix, full_exog, diff_order
         )
 
         # Score against real observations only — rows where __weight < 0.5

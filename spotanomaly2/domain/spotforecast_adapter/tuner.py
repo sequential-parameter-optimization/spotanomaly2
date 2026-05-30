@@ -20,16 +20,15 @@ import pandas as pd
 from spotanomaly2.infrastructure import logging
 
 from .channel_prep import (
-    SKIP_CHANNEL,
+    TrainKnobs,
     attach_weight_func,
-    build_sample_mask,
     get_weight_suffix,
-    impute_exog,
+    prepare_channel,
     prepare_panel,
+    resolve_train_settings,
 )
 from .factory import _build_estimator, _create_forecaster
-from .prediction import _difference
-from .preprocessing import _compute_observed_mask, _ensure_freq
+from .preprocessing import _ensure_freq
 from .tuning_metrics import (
     _build_nan_safe_metric,
     _build_raw_r2_under_differentiation,
@@ -67,7 +66,7 @@ class SpotforecastTuner:
         from spotforecast2.model_selection import OneStepAheadFold
         from tqdm.auto import tqdm
 
-        train_settings = self._train_settings()
+        train_settings = resolve_train_settings(self.config)
         search_settings = self._search_settings(tune_config)
 
         # Match SpotforecastTrainer.train_panel exactly: include `exogenous_*`
@@ -125,30 +124,6 @@ class SpotforecastTuner:
     # ------------------------------------------------------------------
     # Settings resolution
     # ------------------------------------------------------------------
-
-    def _train_settings(self) -> dict[str, Any]:
-        """Resolve the train-side knobs the tuner must mirror (lags, seed, Δy)."""
-        train_cfg = self.config.get("train", {})
-        n_lags = train_cfg.get("lags", 24)
-        # Conservative cap for the strict-sample mask: must cover the longest
-        # lag the search may pick, so use the global config value as an upper
-        # bound (search-space lag lists override per trial).
-        if isinstance(n_lags, (list, tuple)) and n_lags:
-            n_lags_max = int(max(n_lags))
-        else:
-            try:
-                n_lags_max = int(n_lags)
-            except (TypeError, ValueError):
-                n_lags_max = 24
-        return {
-            "n_lags": n_lags,
-            "n_lags_max": n_lags_max,
-            "random_seed": train_cfg.get("random_seed", 42),
-            # Tune on Δy too — must match what train_panel fits, otherwise the
-            # winning hyperparameters won't be optimal for the actual estimator
-            # that ends up in production.
-            "diff_order": int(train_cfg.get("differentiation", 1)),
-        }
 
     def _search_settings(self, tune_config: dict[str, Any]) -> dict[str, Any]:
         """Resolve the SpotOptim search knobs (budget, metric, candidate models)."""
@@ -220,7 +195,7 @@ class SpotforecastTuner:
         exog_columns: list[str],
         weight_suffix: str,
         cross_validator,
-        train_settings: dict[str, Any],
+        train_settings: TrainKnobs,
         search_settings: dict[str, Any],
         tune_config: dict[str, Any],
     ) -> dict[str, Any] | None:
@@ -231,52 +206,39 @@ class SpotforecastTuner:
         a ``model_scores`` sub-dict (or an ``{"error": ...}`` dict if every model
         failed).
         """
-        n_lags = train_settings["n_lags"]
-        n_lags_max = train_settings["n_lags_max"]
-        random_seed = train_settings["random_seed"]
-        diff_order = train_settings["diff_order"]
+        n_lags = train_settings.n_lags
+        n_lags_max = train_settings.n_lags_max
+        random_seed = train_settings.random_seed
+        diff_order = train_settings.diff_order
 
-        # Match train: respect imputation `__weight` flags so imputed rows
-        # don't masquerade as observations during the search. Targets are
-        # already gap-free (process stage + _apply_known_anomaly_imputation).
-        observed_mask = _compute_observed_mask(tune_df, target_col, weight_suffix)
-        y_train = tune_df[target_col].copy()
-        y_train.name = target_col
-        if len(y_train) < n_lags_max + 10:
-            self.logger.warning(f"  Skipping {target_col}: insufficient data ({len(y_train)} rows)")
+        # Shared per-channel setup so the tuner scores candidates on the exact
+        # inputs train_panel will fit: imputation-flag mask, exog imputation,
+        # and Δy. ``n_lags_max`` (search-space upper bound) bounds the mask
+        # width. ``None`` => skip this channel.
+        channel = prepare_channel(
+            self.config,
+            tune_df,
+            target_col,
+            exog_columns,
+            weight_suffix,
+            n_lags_for_mask=n_lags_max,
+            diff_order=diff_order,
+            logger=self.logger,
+        )
+        if channel is None:
             return None
+        y_train = channel.y_fit
+        exog_train = channel.exog_fit
+        sample_mask = channel.sample_mask
 
-        sample_mask = build_sample_mask(self.config, observed_mask, y_train, target_col, n_lags_max, self.logger)
-        if sample_mask is SKIP_CHANNEL:
-            self.logger.warning(f"  Skipping {target_col}: no fully observed training samples left")
-            return None
-
-        exog_train = None
-        if exog_columns:
-            exog_train = tune_df[exog_columns].loc[y_train.index]
-            exog_train = impute_exog(self.config, exog_train, exog_columns)
-
-        # Predict Δy[t] just like train_panel will. The tuner must score
-        # candidates on the same target the production model will fit
-        # against, otherwise the winning hyperparameters are optimal
-        # for a different objective.
+        # Under differentiation only R² needs rescaling back to raw-y space so
+        # the leaderboard number matches production — MAE/MSE/RMSE residuals are
+        # identical in Δ and raw space. The metric looks up raw values by
+        # timestamp inside the val window via the pre-difference series.
         metric = search_settings["metric"]
         channel_metric_callable = search_settings["metric_callable"]
-        if diff_order > 0:
-            # Capture the raw (pre-difference) series — the R² metric
-            # looks up actual raw values by timestamp inside the val
-            # window so the leaderboard number matches production.
-            y_train_raw_pre_diff = y_train.copy()
-            y_train = _difference(y_train, diff_order).dropna()
-            if exog_train is not None:
-                exog_train = exog_train.loc[y_train.index]
-            if sample_mask is not None:
-                sample_mask = sample_mask.reindex(y_train.index).fillna(False)
-            # Only R² needs the raw-space rescaling — MAE/MSE/RMSE
-            # numerators are the same residuals in either space, so
-            # they already match production without modification.
-            if isinstance(metric, str) and metric.lower() in ("r2", "r2_score") and diff_order == 1:
-                channel_metric_callable = _build_raw_r2_under_differentiation(y_train_raw_pre_diff)
+        if diff_order == 1 and isinstance(metric, str) and metric.lower() in ("r2", "r2_score"):
+            channel_metric_callable = _build_raw_r2_under_differentiation(channel.y_raw)
 
         channel_n_trials, channel_n_initial = self._channel_trial_budget(
             tune_config, panel_id, target_col, search_settings["n_trials"], search_settings["n_initial"]
@@ -286,7 +248,7 @@ class SpotforecastTuner:
             target_col=target_col,
             y_train=y_train,
             exog_train=exog_train,
-            sample_mask=sample_mask if isinstance(sample_mask, pd.Series) else None,
+            sample_mask=sample_mask,
             cv=cross_validator,
             channel_metric_callable=channel_metric_callable,
             metric=metric,

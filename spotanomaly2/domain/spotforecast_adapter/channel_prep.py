@@ -13,6 +13,7 @@ tuner stay independent orchestrators that *call a service*, mirroring the rest
 of the adapter's functional helper modules (``preprocessing``, ``factory`` …).
 """
 
+from dataclasses import dataclass
 from typing import Any
 
 import pandas as pd
@@ -20,9 +21,11 @@ import pandas as pd
 from spotanomaly2.domain.exogenous.residual_multiplier import multiplier_prefixes
 from spotanomaly2.domain.imputation_methods import impute_dataframe
 
+from .prediction import _difference
 from .preprocessing import (
     _apply_known_anomaly_imputation,
     _build_strict_training_sample_mask,
+    _compute_observed_mask,
     _detect_anomalies_via_ridge,
     _split_panel_columns,
 )
@@ -30,6 +33,68 @@ from .preprocessing import (
 # Sentinel returned by ``build_sample_mask`` when the strict-imputation mask
 # leaves zero usable training samples — the caller should skip the channel.
 SKIP_CHANNEL = "skip"
+
+
+@dataclass(frozen=True)
+class TrainKnobs:
+    """Train-side knobs the trainer fits with and the tuner must mirror.
+
+    Resolved once from ``config['train']`` (+ the imputation weight suffix) so
+    the trainer and tuner can't read different defaults for the same setting.
+    ``n_lags`` is the configured lag spec (int or list); ``n_lags_max`` is the
+    integer upper bound used for sufficiency checks and the strict-sample mask
+    width — the tuner needs this because its search may pick any lag up to the
+    largest in the search space.
+    """
+
+    n_lags: int | list[int]
+    n_lags_max: int
+    random_seed: int
+    diff_order: int
+    weight_suffix: str
+
+
+def resolve_train_settings(config: dict[str, Any]) -> TrainKnobs:
+    """Resolve the shared train-side knobs (lags, seed, Δy order, weight suffix).
+
+    Single source of truth for the settings the trainer fits with and the tuner
+    optimises against — see :class:`TrainKnobs`.
+    """
+    train_cfg = config.get("train", {})
+    n_lags = train_cfg.get("lags", 24)
+    if isinstance(n_lags, (list, tuple)) and n_lags:
+        n_lags_max = int(max(n_lags))
+    else:
+        try:
+            n_lags_max = int(n_lags)
+        except (TypeError, ValueError):
+            n_lags_max = 24
+    return TrainKnobs(
+        n_lags=n_lags,
+        n_lags_max=n_lags_max,
+        random_seed=train_cfg.get("random_seed", 42),
+        # Δy order — must match what train_panel fits, otherwise the tuner's
+        # winning hyperparameters aren't optimal for the production estimator.
+        diff_order=int(train_cfg.get("differentiation", 1)),
+        weight_suffix=get_weight_suffix(config),
+    )
+
+
+@dataclass
+class ChannelData:
+    """One channel's prepared fit inputs, identical for trainer and tuner.
+
+    ``y_fit`` is what the forecaster fits against (Δy with leading NaNs dropped
+    when ``diff_order > 0``, otherwise the raw series). ``y_raw`` is the
+    pre-difference series — the trainer needs it to build its one-step-ahead
+    test window and the tuner needs it to rescale R² back to raw space.
+    ``exog_fit`` and ``sample_mask`` are imputed/aligned to ``y_fit.index``.
+    """
+
+    y_fit: pd.Series
+    y_raw: pd.Series
+    exog_fit: pd.DataFrame | None
+    sample_mask: pd.Series | None
 
 
 def get_weight_suffix(config: dict[str, Any]) -> str:
@@ -157,3 +222,64 @@ def attach_weight_func(forecaster, sample_mask: pd.Series | None) -> None:
         return mask.reindex(index).fillna(False).astype(float).to_numpy()
 
     forecaster.weight_func = _weight_func
+
+
+def prepare_channel(
+    config: dict[str, Any],
+    df: pd.DataFrame,
+    target_col: str,
+    exog_columns: list[str],
+    weight_suffix: str,
+    n_lags_for_mask: int,
+    diff_order: int,
+    logger=None,
+) -> ChannelData | None:
+    """Build one channel's fit inputs (target, exog, sample mask, Δy) for both paths.
+
+    The single source of truth for per-channel setup so the trainer and tuner
+    can't diverge on target extraction, sufficiency thresholds, imputation-flag
+    masking, exog imputation, or differentiation. Returns ``None`` when the
+    channel must be skipped — too few rows, or the strict-imputation mask leaves
+    zero usable samples.
+
+    ``n_lags_for_mask`` is the lag count used for the sufficiency check and the
+    strict-sample mask width: the trainer passes the channel's resolved (max)
+    lag, the tuner passes the search-space upper bound.
+    """
+    y = df[target_col].copy()
+    y.name = target_col
+
+    observed_mask = _compute_observed_mask(df, target_col, weight_suffix)
+    if len(y) < n_lags_for_mask + 10:
+        if logger is not None:
+            logger.warning(f"  Skipping {target_col}: insufficient data ({len(y)} rows)")
+        return None
+
+    sample_mask = build_sample_mask(config, observed_mask, y, target_col, n_lags_for_mask, logger)
+    if sample_mask is SKIP_CHANNEL:
+        if logger is not None:
+            logger.warning(f"  Skipping {target_col}: no fully observed training samples left")
+        return None
+
+    exog_fit: pd.DataFrame | None = None
+    if exog_columns:
+        exog_fit = df[exog_columns].loc[y.index]
+        exog_fit = impute_exog(config, exog_fit, exog_columns)
+
+    # Fit on Δy when differentiation is on (matches train_panel). The raw series
+    # is kept for the trainer's test window and the tuner's raw-space R².
+    y_raw = y.copy()
+    y_fit = y
+    if diff_order > 0:
+        y_fit = _difference(y, diff_order).dropna()
+        if exog_fit is not None:
+            exog_fit = exog_fit.loc[y_fit.index]
+        if isinstance(sample_mask, pd.Series):
+            sample_mask = sample_mask.reindex(y_fit.index).fillna(False)
+
+    return ChannelData(
+        y_fit=y_fit,
+        y_raw=y_raw,
+        exog_fit=exog_fit,
+        sample_mask=sample_mask if isinstance(sample_mask, pd.Series) else None,
+    )
