@@ -1,9 +1,56 @@
 """Configuration loading and management."""
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+
+@dataclass(frozen=True)
+class DataSplit:
+    """Disjoint train / test / score percentages of the processed data.
+
+    Three contiguous windows that partition the data 100%:
+
+    - ``train``: forecaster fits here.
+    - ``test``: trainer's eval window AND tuner's CV val window. Held out from
+      the forecaster's fit so the trainer-reported RMSE/MAE and the tuner's
+      leaderboard are out-of-sample.
+    - ``score``: scorer's territory. **Never** seen by the trainer or tuner —
+      this is what closes the hyperparameter-selection leakage the older
+      ``train_ratio`` design had.
+
+    Values are integer percentages and must sum to 100.
+    """
+
+    train: int
+    test: int
+    score: int
+
+    def __post_init__(self) -> None:
+        total = self.train + self.test + self.score
+        if total != 100:
+            raise ValueError(
+                f"train.split percentages must sum to 100, got "
+                f"train={self.train} + test={self.test} + score={self.score} = {total}"
+            )
+        if min(self.train, self.test, self.score) <= 0:
+            raise ValueError(
+                f"train.split percentages must all be positive, got "
+                f"train={self.train}, test={self.test}, score={self.score}"
+            )
+
+
+def resolve_data_split(config: dict[str, Any]) -> DataSplit:
+    """Read ``config['train']['split']`` into a :class:`DataSplit` (validates sum)."""
+    raw = config.get("train", {}).get("split", {})
+    return DataSplit(
+        train=int(raw.get("train", 80)),
+        test=int(raw.get("test", 10)),
+        score=int(raw.get("score", 10)),
+    )
+
 
 # The bundled default config lives at ``<repo>/config/default.yaml`` — that is,
 # alongside the ``spotanomaly2`` package, not inside it. Resolving relative to
@@ -87,6 +134,9 @@ def load_config(config_path: Path, base_dir: Path | None = None) -> dict[str, An
         base_dir = Path.cwd()
 
     _resolve_config_paths(config, Path(base_dir))
+    # Validate train.split sums to 100. Done at load so a misconfigured split
+    # surfaces immediately, not deep inside the trainer/tuner.
+    resolve_data_split(config)
     return config
 
 

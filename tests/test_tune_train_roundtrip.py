@@ -53,7 +53,7 @@ def test_tune_writes_config_that_train_consumes(sample_config, tmp_path):
         },
     }
     cfg["panels"]["panel_ids"] = ["1"]
-    cfg["train"]["train_ratio"] = 0.8
+    cfg["train"]["split"] = {"train": 70, "test": 15, "score": 15}
     cfg["train"]["lags"] = 6
     channel_yaml = tmp_path / "panel_1.yaml"
     cfg["train"]["channel_config_files"] = {"1": str(channel_yaml)}

@@ -27,6 +27,7 @@ from .preprocessing import (
     _build_strict_training_sample_mask,
     _compute_observed_mask,
     _detect_anomalies_via_ridge,
+    _ensure_freq,
     _split_panel_columns,
 )
 
@@ -114,7 +115,9 @@ def prepare_panel(
     ``multiply_residuals`` columns become exog features, never tuning/training
     targets. Known-anomaly windows are blanked and re-imputed with the same
     method the process stage used, with ``__weight`` merged so downstream
-    observed-mask logic treats them as "not real" uniformly.
+    observed-mask logic treats them as "not real" uniformly. The DataFrame's
+    ``index.freq`` is set via ``_ensure_freq`` so the returned panel can be
+    used directly by spotforecast2 (which requires a frequency-aware index).
     """
     configured_exog_columns = config["train"].get("exog_columns", [])
     mult_prefixes = multiplier_prefixes(config)
@@ -135,6 +138,9 @@ def prepare_panel(
             imputation_method=imp_cfg.get("method", "linear_interpolation"),
             imputation_params=imp_cfg.get("params", {}),
         )
+
+    fallback_freq = config.get("process", {}).get("resample", {}).get("freq", "5min")
+    df = _ensure_freq(df, fallback_freq)
 
     return df, target_cols, exog_columns
 

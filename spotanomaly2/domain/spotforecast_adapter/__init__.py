@@ -45,7 +45,6 @@ from .preprocessing import (
     _interpolate_inplace,
     _mask_known_anomalies,
     _split_panel_columns,
-    _time_series_train_test_split,
 )
 from .trainer import SpotforecastTrainer
 from .tuner import SpotforecastTuner
@@ -83,6 +82,5 @@ __all__ = [
     "_one_step_ahead_predict",
     "_predict_one_step_integrated",
     "_split_panel_columns",
-    "_time_series_train_test_split",
     "_yaml_search_space_to_dict",
 ]

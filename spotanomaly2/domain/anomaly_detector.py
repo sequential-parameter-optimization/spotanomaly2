@@ -1,4 +1,5 @@
 """Anomaly detection service using spotforecast2 forecasting models."""
+
 from pathlib import Path
 from typing import Any
 
@@ -166,60 +167,94 @@ class AnomalyDetector:
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
         """Return (history_df, unseen_df) to avoid scorer leakage.
 
-        The scorer must not be trained on rows that were used to train the
-        forecasting model. This helper removes the forecaster training period
-        from the scoring dataset.
+        The scorer must not be fit on rows the trainer OR tuner saw, otherwise
+        hyperparameters chosen on those rows bias the residual distribution
+        the scorer learns. The boundary the scorer cares about is the start of
+        the configured ``train.split.score`` window — everything before is
+        "seen by the pipeline", everything from there on is "unseen".
+
+        Lookup precedence:
+          1. ``score_start_timestamp`` (preferred — written by current trainer)
+          2. ``train_end_timestamp`` (legacy — points at the old train/test
+             boundary; less strict because the tuner also CV'd on test%, but
+             still the best signal an older artifact carries)
+          3. ``train_size`` (older still)
+          4. Config-based fallback using ``train.split`` percentages.
         """
         if len(df) == 0:
             return df.iloc[0:0], df
 
-        # Preferred: explicit timestamp boundary persisted with the model.
+        # Preferred: explicit score-window boundary persisted with the model.
+        score_start_timestamp = model_data.get("score_start_timestamp")
+        if score_start_timestamp and isinstance(df.index, pd.DatetimeIndex):
+            cutoff = self._align_timestamp_to_index(pd.Timestamp(score_start_timestamp), df)
+            history_df = df.loc[df.index < cutoff]
+            unseen_df = df.loc[df.index >= cutoff]
+            if len(unseen_df) == 0:
+                raise InsufficientDataException(
+                    f"Panel {panel_id}: no unseen rows at or after the score boundary "
+                    f"({cutoff}). Need new data beyond the score window for scoring."
+                )
+            self.logger.info(
+                f"Panel {panel_id}: leakage guard active using score_start={cutoff}. "
+                f"Excluded {len(history_df)} pipeline-seen row(s); "
+                f"{len(unseen_df)} unseen row(s) remain for scoring."
+            )
+            return history_df, unseen_df
+
+        # Legacy: older artifacts predate the score-window split; the strictest
+        # boundary they carry is the trainer's old train_end.
         train_end_timestamp = model_data.get("train_end_timestamp")
         if train_end_timestamp and isinstance(df.index, pd.DatetimeIndex):
-            cutoff = pd.Timestamp(train_end_timestamp)
-            if cutoff.tzinfo is None and df.index.tz is not None:
-                cutoff = cutoff.tz_localize(df.index.tz)
-            elif cutoff.tzinfo is not None and df.index.tz is None:
-                cutoff = cutoff.tz_convert("UTC").tz_localize(None)
-
+            cutoff = self._align_timestamp_to_index(pd.Timestamp(train_end_timestamp), df)
             history_df = df.loc[df.index <= cutoff]
             unseen_df = df.loc[df.index > cutoff]
-
             if len(unseen_df) == 0:
                 raise InsufficientDataException(
                     f"Panel {panel_id}: no unseen rows after model train end "
                     f"({cutoff}). Need new data beyond training period for leakage-free scoring."
                 )
-
-            self.logger.info(
-                f"Panel {panel_id}: leakage guard active using train_end={cutoff}. "
-                f"Excluded {len(history_df)} seen row(s); {len(unseen_df)} unseen row(s) remain for scoring."
+            self.logger.warning(
+                f"Panel {panel_id}: model has no score_start_timestamp; using legacy "
+                f"train_end={cutoff} as boundary. Re-train to get the stricter split-based boundary."
             )
             return history_df, unseen_df
 
-        # Fallback for older model files without timestamp metadata.
         train_size = model_data.get("train_size")
         if isinstance(train_size, int) and 0 < train_size < len(df):
             history_df = df.iloc[:train_size]
             unseen_df = df.iloc[train_size:]
             self.logger.warning(
-                f"Panel {panel_id}: model has no train_end_timestamp; using train_size={train_size} "
-                "as leakage boundary fallback. Re-train models once to persist precise timestamps."
+                f"Panel {panel_id}: model has no timestamp metadata; using train_size={train_size} "
+                "as leakage boundary fallback. Re-train models to persist precise timestamps."
             )
             return history_df, unseen_df
 
-        # Last-resort fallback using current config ratio.
-        train_ratio = self.config.get("train", {}).get("train_ratio", 0.9)
-        cutoff_pos = int(len(df) * float(train_ratio))
+        # Last-resort: derive from current config's train.split.
+        from spotanomaly2.application.config import resolve_data_split
+
+        split = resolve_data_split(self.config)
+        cutoff_pos = int(len(df) * (split.train + split.test) / 100)
         cutoff_pos = max(1, min(cutoff_pos, len(df) - 1))
         history_df = df.iloc[:cutoff_pos]
         unseen_df = df.iloc[cutoff_pos:]
         self.logger.warning(
             f"Panel {panel_id}: model lacks training boundary metadata; "
-            f"using ratio-based fallback ({train_ratio:.3f}). "
+            f"using config split fallback (train={split.train}%, test={split.test}%). "
             "Re-train models to persist precise leakage boundary."
         )
         return history_df, unseen_df
+
+    @staticmethod
+    def _align_timestamp_to_index(ts: pd.Timestamp, df: pd.DataFrame) -> pd.Timestamp:
+        """Align a persisted timestamp's tz to ``df.index`` for safe comparison."""
+        if not isinstance(df.index, pd.DatetimeIndex):
+            return ts
+        if ts.tzinfo is None and df.index.tz is not None:
+            return ts.tz_localize(df.index.tz)
+        if ts.tzinfo is not None and df.index.tz is None:
+            return ts.tz_convert("UTC").tz_localize(None)
+        return ts
 
     # ------------------------------------------------------------------
     # Flow weighting

@@ -70,9 +70,10 @@ def e2e_config(sample_config, tmp_path):
     config["paths"]["models_dir"] = str(tmp_path / "models")
     config["paths"]["results_dir"] = str(tmp_path / "results")
     config["panels"]["panel_ids"] = ["1"]
-    # Leave ~30% of the series unseen after training so the scorer fit/eval
-    # split (hist_window) fits comfortably inside the post-training window.
-    config["train"]["train_ratio"] = 0.7
+    # Reserve ~30% of the series as the scorer's unseen window (the configured
+    # ``score`` slice) so the scorer fit/eval split (hist_window) fits
+    # comfortably inside it. train + test = 70% is seen by trainer/tuner.
+    config["train"]["split"] = {"train": 60, "test": 10, "score": 30}
     config["train"]["lags"] = 6
     config["detect"]["hist_window"] = 40
     return config
@@ -301,9 +302,9 @@ def test_fully_imputed_channel_is_skipped(e2e_config):
 
 def test_detect_without_enough_unseen_data_raises_typed_error(e2e_config):
     """Too little post-training data must raise the typed InsufficientDataException."""
-    # train_ratio 0.95 on 300 rows leaves ~15 unseen rows, far short of
+    # A 5% score window on 300 rows leaves ~15 unseen rows, far short of
     # hist_window=40 — detection cannot form a valid window.
-    e2e_config["train"]["train_ratio"] = 0.95
+    e2e_config["train"]["split"] = {"train": 85, "test": 10, "score": 5}
     DataManager(e2e_config).save_processed_data({"1": _make_processed_panel(n=300)})
 
     pipeline = Pipeline(e2e_config)
