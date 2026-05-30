@@ -169,9 +169,9 @@ detect:
   target_date: null
   high_quantile: 0.995
   fail_on_nan_inputs: true
-  # Default chosen from the scorer benchmark (docs/scorer_benchmark.md):
-  # NormScorer with ord=4 was the highest-PR-AUC scorer across 5 seeds and
-  # is two orders of magnitude faster to fit than the clustering scorers.
+  # NormScorer with ord=4 was the highest-PR-AUC scorer across 5 seeds in an
+  # offline scorer benchmark, and is two orders of magnitude faster to fit
+  # than the clustering scorers.
   # Switch to "KMeansScorer", "IsolationForestScorer", or "GMMScorer" if you
   # want a different scoring style — the params block below carries
   # per-scorer kwargs and pipeline.py whitelists them per scorer.
@@ -226,78 +226,6 @@ detect:
     #   "1":
     #     channel_1_orp_mv: 0.9997
     #     channel_3_turbidity: 0.999
-
-evaluate:
-  results_timestamp: null
-  include_maintenance: true
-  synthetic:
-    enabled: false
-    n_point: 12
-    n_contextual: 8
-    n_collective: 4
-    random_seed: 42
-    # Where to inject anomalies. "series" (default) injects pre-forecast on
-    # the test split — realistic, exposes which anomaly types survive
-    # forecaster smoothing. "residuals" injects directly on residuals as a
-    # diagnostic that isolates scorer behavior from forecaster behavior.
-    target: "series"
-    # Magnitudes (in column-std units). Tightened from the module defaults
-    # (8 / 4 / 3) so tuning has signal to optimise against — at the module
-    # defaults all strong scorers saturate at PR-AUC ≈ 1.0 and tuning is
-    # indistinguishable from noise. At these values KMeans/Norm/GMM land
-    # mid-0.9s, IsolationForest mid-0.7s, leaving a couple of PR-AUC
-    # points for the optimiser to work with.
-    point_sigma: 2.5
-    contextual_sigma: 1.5
-    collective_sigma: 0.9
-    contextual_window: 24
-    collective_length: 12
-    # Sweep prevalence to defuse class-imbalance distortion of the metrics.
-    prevalence_levels: [0.005, 0.01, 0.05]
-
-# Scorer benchmarking & tuning (research/, not used by detect/live).
-# Each search_space entry follows the spotoptim convention: 2-tuple
-# [low, high] for numeric, 3-tuple [low, high, "log10"] for log-scale,
-# list of strings for categorical factors.
-benchmark:
-  n_trials: 30
-  n_initial: 8
-  random_state: 42
-  # Pinned operating threshold across every scorer to neutralise the
-  # IsolationForest auto-quantile bump (which only fires when high_quantile
-  # equals exactly 0.99).
-  pinned_high_quantile: 0.995
-  search_spaces:
-    KMeansScorer:
-      n_clusters: [2, 12]
-    NormScorer:
-      ord: [1, 4]
-    IsolationForestScorer:
-      n_estimators: [50, 500]
-      contamination: [0.001, 0.05, "log10"]
-      max_samples: [64, 512]
-    GMMScorer:
-      n_components: [1, 8]
-      covariance_type: ["full", "tied", "diag", "spherical"]
-      selection_criterion: ["fixed", "bic", "aic"]
-  # Defaults used when --no-tune is passed. NormScorer.ord=4 mirrors the
-  # tuning finding (every seed picked it). IsolationForest.contamination=0.001
-  # mirrors the same — the sklearn default of 0.01 is too aggressive for
-  # this regime.
-  defaults:
-    KMeansScorer:
-      n_clusters: 3
-      auto_select_k: false
-    NormScorer:
-      ord: 4
-    IsolationForestScorer:
-      n_estimators: 100
-      contamination: 0.001
-      random_state: 42
-    GMMScorer:
-      n_components: 3
-      covariance_type: "full"
-      selection_criterion: "fixed"
 
 primary:
   display_name: "Primary"

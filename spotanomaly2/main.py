@@ -153,11 +153,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run continuously with this interval in minutes. If not provided, runs once and exits.",
     )
 
-    # Benchmark command (research harness — compare/tune scorers offline)
-    from spotanomaly2.research.cli import add_benchmark_subparser
-
-    add_benchmark_subparser(subparsers)
-
     return parser
 
 
@@ -341,10 +336,6 @@ def main(argv=None) -> int:
             else:
                 # Single run mode
                 pipeline.live()
-        elif args.command == "benchmark":
-            from spotanomaly2.research.cli import run as run_benchmark
-
-            return run_benchmark(args, config, logger)
         else:
             logger.error(f"Unknown command: {args.command}")
             return 1

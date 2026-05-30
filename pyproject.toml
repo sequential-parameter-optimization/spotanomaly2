@@ -41,7 +41,6 @@ dependencies = [
     "scikit-learn>=1.3.0",
     "joblib>=1.3.0",
     "typing_extensions>=4.5.0",
-    "matplotlib>=3.7.0",
     "watchdog>=3.0.0",
     "spotanomaly2_safe",
     "spotforecast2",

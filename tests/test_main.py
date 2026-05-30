@@ -48,7 +48,6 @@ def tmp_config_file(tmp_path: Path, sample_config: dict) -> Path:
         ["all"],
         ["tune"],
         ["live"],
-        ["benchmark"],
     ],
 )
 def test_build_parser_accepts_subcommands(argv):
@@ -377,43 +376,6 @@ def test_tune_n_trials_and_n_initial_inject_into_config(tmp_config_file, sample_
         passed_config = mock_pipeline_cls.call_args.args[0]
         assert passed_config["tune"]["n_trials"] == 11
         assert passed_config["tune"]["n_initial"] == 3
-
-
-# ---------------------------------------------------------------------------
-# (9) benchmark subcommand dispatch
-# ---------------------------------------------------------------------------
-
-
-def test_benchmark_dispatches_to_research_run(tmp_config_file, sample_config):
-    """`benchmark` should call spotanomaly2.research.cli.run and return its exit code."""
-    with (
-        patch("spotanomaly2.main.load_config") as mock_load,
-        patch("spotanomaly2.main.Pipeline") as mock_pipeline_cls,
-        patch("spotanomaly2.research.cli.run") as mock_run_benchmark,
-    ):
-        mock_load.return_value = dict(sample_config)
-        mock_pipeline_cls.return_value = MagicMock()
-        mock_run_benchmark.return_value = 0
-
-        rc = main(["benchmark", "--config", str(tmp_config_file)])
-
-        assert rc == 0
-        mock_run_benchmark.assert_called_once()
-
-
-def test_benchmark_propagates_nonzero_exit_code(tmp_config_file, sample_config):
-    with (
-        patch("spotanomaly2.main.load_config") as mock_load,
-        patch("spotanomaly2.main.Pipeline") as mock_pipeline_cls,
-        patch("spotanomaly2.research.cli.run") as mock_run_benchmark,
-    ):
-        mock_load.return_value = dict(sample_config)
-        mock_pipeline_cls.return_value = MagicMock()
-        mock_run_benchmark.return_value = 7
-
-        rc = main(["benchmark", "--config", str(tmp_config_file)])
-
-        assert rc == 7
 
 
 # ---------------------------------------------------------------------------
