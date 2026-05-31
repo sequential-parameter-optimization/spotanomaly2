@@ -234,3 +234,7 @@ config/channel_models/*
 catboost_info
 CLAUDE.md
 .claude
+/notebooks/.ipynb_checkpoints
+/notebooks/261_22158_340-pycharm-support-libs
+/data/benchmarks
+/data/entsoe

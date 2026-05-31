@@ -11,9 +11,11 @@ import pytest
 from spotanomaly2.domain.spotforecast_adapter import (
     _NAN_PENALTY,
     KernelRidgeApprox,
+    SpotforecastPredictor,
     SpotforecastTrainer,
     SpotforecastTuner,
     SVRApprox,
+    _apply_known_anomaly_imputation,
     _build_estimator,
     _build_nan_safe_metric,
     _create_forecaster,
@@ -54,16 +56,34 @@ class TestSpotforecastTrainer:
         assert len(eval_df) == 2  # sensor_a, sensor_b
         assert isinstance(timestamp, str)
 
+    def test_train_panel_completes_with_exclude_imputed_training_samples(self, sample_config, panel_df, tmp_path):
+        """With ``exclude_imputed_training_samples=True`` the sample mask is a
+        pd.Series, so the skip-sentinel check must not compare it element-wise
+        (an old ``sample_mask == "skip"`` raised "truth value is ambiguous")."""
+        config = copy.deepcopy(sample_config)
+        config["paths"]["models_dir"] = str(tmp_path)
+        config["train"]["lags"] = 6
+        config["train"]["exclude_imputed_training_samples"] = True
+        df = panel_df.copy()
+        df["sensor_a__weight"] = 1.0
+        df.loc[df.index[100:140], "sensor_a__weight"] = 0.0  # imputed window, plenty left
+
+        eval_df, _ = SpotforecastTrainer(config).train_panel("test", df)
+
+        assert isinstance(eval_df, pd.DataFrame)
+        assert "sensor_a" in eval_df.index
+
     def test_predict_returns_dataframe(self, adapter, panel_df, tmp_path):
         adapter.config["paths"]["models_dir"] = str(tmp_path)
         _, timestamp = adapter.train_panel("test", panel_df)
 
-        model_path = Path(tmp_path) / timestamp / "LightGBM_fc_model_panel_test.pkl"
+        model_path = Path(tmp_path) / timestamp / "fc_model_panel_test.pkl"
         model_data = joblib.load(model_path)
 
         test_slice = panel_df.iloc[-30:]
         history_slice = panel_df.iloc[:-30]
-        pred_df = adapter.predict(model_data, test_slice, history_df=history_slice)
+        predictor = SpotforecastPredictor(adapter.config)
+        pred_df = predictor.predict(model_data, test_slice, history_df=history_slice)
 
         assert isinstance(pred_df, pd.DataFrame)
         assert len(pred_df) == 30
@@ -74,7 +94,7 @@ class TestSpotforecastTrainer:
         adapter.config["paths"]["models_dir"] = str(tmp_path)
         _, timestamp = adapter.train_panel("test", panel_df)
 
-        model_path = Path(tmp_path) / timestamp / "LightGBM_fc_model_panel_test.pkl"
+        model_path = Path(tmp_path) / timestamp / "fc_model_panel_test.pkl"
         model_data = joblib.load(model_path)
 
         for key in ("forecasters", "n_lags", "target_cols", "exog_columns", "model_type"):
@@ -134,7 +154,7 @@ class TestSpotforecastTrainer:
 
         _, timestamp = adapter.train_panel("test", panel_df)
 
-        model_path = Path(tmp_path) / timestamp / "LightGBM_fc_model_panel_test.pkl"
+        model_path = Path(tmp_path) / timestamp / "fc_model_panel_test.pkl"
         model_data = joblib.load(model_path)
 
         assert model_data["model_type"] == "spotforecast2_multi"
@@ -292,16 +312,18 @@ class TestSpotforecastTuner:
         assert "exogenous_zulauf" not in results, "exogenous_* columns must be exog features, not tuning targets"
 
     def test_tune_uses_full_data_no_outer_holdout(self, sample_config):
-        """The tuner must use ALL the rows it's given — no outer 90/10 split
-        that quietly discards the most recent timeline window. The discarded
-        slice is exactly where distribution drift toward live conditions
-        shows up; chopping it off makes the CV blind to that drift and lets
-        constant-mean predictors tie real models.
+        """The tuner's CV must:
 
-        Sentinel check: tune on N rows and assert the configured CV holdout
-        matches what production code uses. If a future change re-introduces
-        the outer split, the CV won't see the latest N×20% rows and this
-        test will catch it.
+        - Slice off the ``train.split.score`` percentage entirely (those rows
+          belong to the scorer; the tuner must never see them).
+        - Inside the train+test portion, split at the train/test boundary so
+          CV-train mirrors what the trainer fits on and CV-val mirrors the
+          trainer's test window.
+
+        Sentinel check: with the standard 80/10/10 split, on N rows the CV
+        ``initial_train_size`` must be ``int(N * 0.80)`` (NOT ``int((N*0.9) * 0.8)``).
+        If a future change re-introduces a percentage-of-available split inside
+        CV (e.g. 80% of the 90% pool), this test will catch it.
         """
         rng = np.random.default_rng(0)
         n = 400
@@ -340,13 +362,15 @@ class TestSpotforecastTuner:
         finally:
             OneStepAheadFold.__init__ = real_init
 
-        # initial_train_size should be 80% of the FULL n, not 70% of an outer-
-        # split 90%. The val window is therefore the last 20% of df.
-        assert captured["initial_train_size"] == int(n * 0.8), (
+        # CV train size is ``int(N * split.train / 100)``, computed against the
+        # FULL N rows, not against the (train + test) sub-pool. The score window
+        # is sliced off before CV runs.
+        split = config["train"]["split"]
+        expected = int(n * split["train"] / 100)
+        assert captured["initial_train_size"] == expected, (
             f"Tuner CV is splitting the wrong number of rows. Expected "
-            f"initial_train_size={int(n * 0.8)} (80% of all {n} rows); got "
-            f"{captured['initial_train_size']}. A regressed outer 90/10 split "
-            "would yield ~252 instead, hiding the latest timeline from CV."
+            f"initial_train_size={expected} ({split['train']}% of all {n} rows); "
+            f"got {captured['initial_train_size']}."
         )
 
     def test_tune_uses_one_step_ahead_cv_on_autocorrelated_data(self, sample_config):
@@ -539,15 +563,15 @@ class TestSpotforecastTuner:
             cfg["paths"]["models_dir"] = str(tmp_path / f"models_diff{diff_order}")
             cfg["train"]["channel_config_files"] = {"test": str(degenerate_yaml)}
             cfg["train"]["differentiation"] = diff_order
-            cfg["train"]["train_ratio"] = 0.9
             cfg["train"]["lags"] = 6
             trainer = SpotforecastTrainer(cfg)
             _, ts = trainer.train_panel("test", df)
-            model_data = joblib.load(Path(cfg["paths"]["models_dir"]) / ts / "LightGBM_fc_model_panel_test.pkl")
+            model_data = joblib.load(Path(cfg["paths"]["models_dir"]) / ts / "fc_model_panel_test.pkl")
             n_local = len(df)
             test_slice = df.iloc[int(n_local * 0.9) :]
             history = df.iloc[: int(n_local * 0.9)]
-            preds = trainer.predict(model_data, test_slice, history_df=history)
+            predictor = SpotforecastPredictor(cfg)
+            preds = predictor.predict(model_data, test_slice, history_df=history)
             pred = preds["sensor_a"].dropna()
             truth = test_slice["sensor_a"].reindex(pred.index).dropna()
             pred = pred.reindex(truth.index)
@@ -570,10 +594,15 @@ class TestSpotforecastTuner:
             f"Differentiation should pin the live floor near the lag-1 baseline (R² ≫ 0), but got {r2_diff:+.3f}"
         )
 
-    def test_tune_skips_imputed_rows_via_weight_func(self, sample_config, panel_df_with_exogenous):
-        """When `exclude_imputed_training_samples=True`, tune must zero out
-        imputed rows during the search just like train does, so the tuned
-        score reflects the same effective training set."""
+    def test_tune_handles_imputed_rows_when_exclusion_enabled(self, sample_config, panel_df_with_exogenous):
+        """Row-level imputed-sample exclusion is a TRAIN-ONLY feature (audit C2):
+        SpotforecastTrainer applies it via forecaster.weight_func, but the
+        one-step-ahead tuning objective fits the bare estimator and ignores
+        weight_func, so tuning cannot drop individual imputed rows. This test pins
+        the honest contract: with `exclude_imputed_training_samples=True` and
+        imputed rows present, the search still completes and yields a finite metric
+        (imputed rows are interpolated for lag context, and the observed mask only
+        gates channel skipping)."""
         df = panel_df_with_exogenous.copy()
         df["sensor_a__weight"] = 1.0
         # Mark a window of rows as imputed.
@@ -586,8 +615,6 @@ class TestSpotforecastTuner:
         tuner = SpotforecastTuner(config)
         results = tuner.tune_panel("test", df, self._tune_config())
 
-        # Search must complete (no skip) and produce a finite metric — meaning
-        # the masked rows shrank the effective set without breaking SpotOptim.
         assert "sensor_a" in results
         assert "error" not in results["sensor_a"]
         assert results["sensor_a"]["best_metric"] is not None
@@ -742,3 +769,133 @@ class TestNanSafeMetric:
         spotforecast2 can resolve them itself."""
         out = _build_nan_safe_metric("custom_unknown_metric")
         assert out == "custom_unknown_metric"
+
+
+class TestSpotforecastPredictor:
+    """Inference against a trained model artifact, separate from training."""
+
+    def test_predict_returns_dataframe_indexed_to_input(self, adapter, panel_df, tmp_path):
+        adapter.config["paths"]["models_dir"] = str(tmp_path)
+        _, timestamp = adapter.train_panel("test", panel_df)
+        model_data = joblib.load(Path(tmp_path) / timestamp / "fc_model_panel_test.pkl")
+
+        test_slice = panel_df.iloc[-30:]
+        history_slice = panel_df.iloc[:-30]
+        predictor = SpotforecastPredictor(adapter.config)
+        pred_df = predictor.predict(model_data, test_slice, history_df=history_slice)
+
+        assert list(pred_df.index) == list(test_slice.index)
+        assert set(pred_df.columns) == set(model_data["target_cols"])
+
+    def test_predict_without_history_still_returns_finite_predictions(self, adapter, panel_df, tmp_path):
+        """``history_df=None`` is the supported live-mode signature; the
+        predictor should fall back to using ``df`` as its own history."""
+        adapter.config["paths"]["models_dir"] = str(tmp_path)
+        _, timestamp = adapter.train_panel("test", panel_df)
+        model_data = joblib.load(Path(tmp_path) / timestamp / "fc_model_panel_test.pkl")
+
+        predictor = SpotforecastPredictor(adapter.config)
+        pred_df = predictor.predict(model_data, panel_df.iloc[-50:])
+        # At least some predictions should resolve - the recursive lag block at
+        # the front is NaN, but the bulk of the window should be finite.
+        assert pred_df.notna().any().all()
+
+    def test_missing_forecaster_yields_nan_column(self, adapter, panel_df, tmp_path):
+        """If a target column's forecaster is missing from the artifact
+        (e.g. trainer skipped it), the predictor returns an all-NaN column
+        instead of raising — keeps detection alive on partial models."""
+        adapter.config["paths"]["models_dir"] = str(tmp_path)
+        _, timestamp = adapter.train_panel("test", panel_df)
+        model_data = joblib.load(Path(tmp_path) / timestamp / "fc_model_panel_test.pkl")
+        # Drop one channel's forecaster but keep the column in target_cols
+        # so the predictor still iterates over it.
+        del model_data["forecasters"]["sensor_a"]
+
+        predictor = SpotforecastPredictor(adapter.config)
+        pred_df = predictor.predict(model_data, panel_df.iloc[-30:], history_df=panel_df.iloc[:-30])
+
+        assert pred_df["sensor_a"].isna().all()
+        assert pred_df["sensor_b"].notna().any()
+
+
+class TestTrainerHelpers:
+    """Pure, side-effect-free helpers exposed for unit testing."""
+
+    def test_resolve_channel_lags_passes_through_int(self):
+        eff, n = SpotforecastTrainer._resolve_channel_lags({}, 24)
+        assert eff == 24
+        assert n == 24
+
+    def test_resolve_channel_lags_prefers_best_lags_list_over_default(self):
+        eff, n = SpotforecastTrainer._resolve_channel_lags({"best_lags": [1, 3, 7, 24]}, 12)
+        assert eff == [1, 3, 7, 24]
+        assert n == 24  # max of the list — used for sufficiency checks
+
+    def test_resolve_channel_lags_best_lags_scalar_overrides_default(self):
+        eff, n = SpotforecastTrainer._resolve_channel_lags({"best_lags": 6}, 24)
+        assert eff == 6
+        assert n == 6
+
+    def test_resolve_channel_lags_invalid_best_lags_falls_back_to_default(self):
+        eff, n = SpotforecastTrainer._resolve_channel_lags({"best_lags": "not-a-number"}, 24)
+        assert eff == 24
+        assert n == 24
+
+    def test_resolve_channel_model_spec_channel_overrides_panel_default(self):
+        name, params = SpotforecastTrainer._resolve_channel_model_spec(
+            channel_cfg={"model": "Ridge", "params": {"alpha": 0.5}},
+            panel_default_model="LightGBM",
+            panel_default_params={"num_leaves": 31},
+            model_label="LightGBM",
+        )
+        assert name == "Ridge"
+        # Panel defaults must NOT bleed into the channel when the channel
+        # picks a different model — those defaults belong to LightGBM.
+        assert params == {"alpha": 0.5}
+
+    def test_resolve_channel_model_spec_inherits_panel_default_params_when_models_match(self):
+        name, params = SpotforecastTrainer._resolve_channel_model_spec(
+            channel_cfg={"params": {"num_leaves": 63}},  # override one knob
+            panel_default_model="LightGBM",
+            panel_default_params={"num_leaves": 31, "learning_rate": 0.05},
+            model_label="Ridge",
+        )
+        assert name == "LightGBM"
+        # Channel params override panel defaults key-by-key, others inherited.
+        assert params == {"num_leaves": 63, "learning_rate": 0.05}
+
+    def test_resolve_channel_model_spec_falls_back_to_fallback_model(self):
+        name, params = SpotforecastTrainer._resolve_channel_model_spec(
+            channel_cfg={},
+            panel_default_model=None,
+            panel_default_params={},
+            model_label="LightGBM",
+        )
+        assert name == "LightGBM"
+        assert params == {}
+
+
+def test_apply_known_anomaly_imputation_falls_back_to_linear_for_psm():
+    # Regression: 'psm' is now a registered strategy, but it must NOT be used to
+    # re-impute the small interior cells produced by known-anomaly masking (PSM
+    # needs a freq-bearing DatetimeIndex and would otherwise raise). The helper
+    # must transparently fall back to linear interpolation.
+    # Build a DatetimeIndex with NO freq set: PSM would raise on it, linear won't.
+    idx = pd.DatetimeIndex(pd.date_range("2025-01-01", periods=10, freq="5min", tz="UTC").values, tz="UTC")
+    assert idx.freq is None  # the condition that makes PSM raise but linear cope
+    df = pd.DataFrame({"channel_1_ph": np.arange(10, dtype=float)}, index=idx)
+    known_anomalies = [{"start": "2025-01-01 00:20", "end": "2025-01-01 00:25"}]
+
+    out = _apply_known_anomaly_imputation(
+        df,
+        known_anomalies=known_anomalies,
+        buffer="0min",
+        target_cols=["channel_1_ph"],
+        weight_suffix="__weight",
+        imputation_method="psm",
+    )
+
+    # The masked cells were re-imputed (no NaNs, no PSM crash) ...
+    assert out["channel_1_ph"].isna().sum() == 0
+    # ... and flagged as not-real in the weight column.
+    assert (out["channel_1_ph__weight"] == 0).any()

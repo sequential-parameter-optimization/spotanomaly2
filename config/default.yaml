@@ -57,6 +57,7 @@ paths:
   raw_dir: "data/raw"
   processed_dir: "data/processed"
   models_dir: "data/models"
+  tuning_dir: "data/tuning_results"
   results_dir: "data/results"
   evaluations_dir: "data/evaluations"
   credentials_file: ".env"
@@ -138,22 +139,20 @@ process:
   flow_columns_pattern: "flow"
   temperature_columns_pattern: "temperature"
   median_filter_kernel: 3
-  weather:
-    enabled: true
-    latitude: 0.0
-    longitude: 0.0
-    place: "Anonymous Location"
-    use_forecast: true
-    fallback_on_failure: true
-    lookback_days: 14
-    cache_path: "data/weather/weather_cache.parquet"
-    feature_columns:
-      - snow_depth
 
 train:
-  train_ratio: 0.9
+  # Three disjoint windows of the processed data — must sum to 100.
+  # - train: forecaster fits here.
+  # - test:  trainer's eval window AND tuner's CV val window. Held out from
+  #          the forecaster's fit.
+  # - score: scorer's territory. NEVER seen by trainer or tuner — this closes
+  #          the hyperparameter-selection leakage older designs had.
+  split:
+    train: 80
+    test: 10
+    score: 10
   random_seed: 42
-  model: "LightGBM"  # "LightGBM" or "XGBoost" (used by spotforecast2 adapter)
+  fallback_model: "LightGBM"  # used when no per-channel/per-panel model is set in channel_config_files
   lags: 6  # Number of autoregressive lags for ForecasterRecursive
   exclude_imputed_training_samples: true
   # Predict Δy = y[t] - y[t-1] instead of y[t]; integrate one-step at
@@ -161,8 +160,10 @@ train:
   # "predict the training mean" trivial-minimum that kept letting
   # degenerate tree configs win the tuner. Set 0 to disable.
   differentiation: 1
-  exog_columns:
-    - weather_snow_depth
+  # Escape hatch for non-``exogenous_``-prefixed exog features. All exogenous
+  # sources now emit ``exogenous_<name>_*`` columns, which are auto-detected as
+  # model features, so this is normally empty.
+  exog_columns: []
   known_anomaly_buffer: "1d"
   # Optional: panel-specific YAMLs with per-channel model and parameter selection
   # Each file can define:
@@ -178,9 +179,17 @@ detect:
   target_date: null
   high_quantile: 0.995
   fail_on_nan_inputs: true
-  fc_model_name: "LightGBM"
-  scorer_name: "KMeansScorer"  # "KMeansScorer", "NormScorer", "IsolationForestScorer", "GMMScorer"
+  # NormScorer with ord=4 was the highest-PR-AUC scorer across 5 seeds in an
+  # offline scorer benchmark, and is two orders of magnitude faster to fit
+  # than the clustering scorers.
+  # Switch to "KMeansScorer", "IsolationForestScorer", or "GMMScorer" if you
+  # want a different scoring style — the params block below carries
+  # per-scorer kwargs and pipeline.py whitelists them per scorer.
+  scorer_name: "NormScorer"
   scorer_params:
+    # NormScorer
+    ord: 4
+    # KMeansScorer params (used when scorer_name is KMeansScorer)
     window: 1
     n_clusters: 3
     auto_select_k: true
@@ -191,6 +200,8 @@ detect:
     max_iter: 300
     component_wise: false
     # IsolationForest params (used when scorer_name is IsolationForestScorer)
+    # — note: tuning consistently picks contamination ≈ 0.001 across seeds;
+    # the production default below mirrors that finding.
     contamination: 0.001
     n_estimators: 1000
     max_samples: "auto"
@@ -226,32 +237,36 @@ detect:
     #     channel_1_orp_mv: 0.9997
     #     channel_3_turbidity: 0.999
 
-evaluate:
-  results_timestamp: null
-  include_maintenance: true
-  synthetic:
-    enabled: false
-    n_point: 5
-    n_contextual: 3
-    n_collective: 2
-    random_seed: 42
-
+# The primary data source is pluggable: set ``fetcher`` to a "module:ClassName"
+# spec implementing the primary-fetcher contract. spotanomaly2 ships no built-in
+# primary source — the public ENTSO-E reference is
+# ``spotanomaly2.examples.entsoe_fetcher:EntsoePrimaryFetcher`` (see the runnable
+# ``config/entsoe_example.yaml``); point this at your own data source otherwise.
 primary:
   display_name: "Primary"
+  # fetcher: "your_package.your_module:YourPrimaryFetcher"
 
+# Each source's joiner emits ``exogenous_<name>_<measurement>`` columns, which
+# are auto-detected as model exog features. Set ``multiply_residuals: true`` on a
+# source instead to make its column(s) multiply detection residuals
+# (residual = column * (actual - predicted)) rather than feed the model — useful
+# for e.g. a flow signal that should scale anomaly sensitivity.
 exogenous:
-  enabled: true
-  cache_dir: "data/exogenous"
-  display_name: "Exogenous"
-  panel_sources:
-    "1":
-      - "source_a"
-    "2":
-      - "source_b"
-  # Weight anomaly residuals by exogenous flow values.
-  # Disabled by default so the repo works without exogenous data.
-  weight_residuals:
-    enabled: false
+  - name: "weather"
+    fetcher: "spotanomaly2.domain.exogenous.weather:ExogenousWeatherFetcher"
+    joiner: "spotanomaly2.domain.exogenous.weather:ExogenousWeatherJoiner"
+    config:
+      enabled: true
+      multiply_residuals: false
+      latitude: 0.0
+      longitude: 0.0
+      place: "Anonymous Location"
+      use_forecast: true
+      fallback_on_failure: true
+      lookback_days: 14
+      cache_path: "data/weather/weather_cache.parquet"
+      feature_columns:
+        - snow_depth
 
 tune:
   n_trials: 10
@@ -261,7 +276,12 @@ tune:
   # targets (e.g. pH, turbidity). Higher is better; the adapter negates
   # internally so SpotOptim's minimiser still works.
   metric: "r2"
-  output_dir: "data/tuning_results"
+  # OneStepAheadFold splits at ``train.split.train`` / ``train.split.test``:
+  # CV-train on the train% rows, CV-val on the test% rows. The score% window
+  # is sliced off before CV so the tuner physically cannot leak into the
+  # scorer's territory.
+  # Output dir for tuning result YAMLs is read from ``paths.tuning_dir``;
+  # ``tune.output_dir`` is honored as a fallback for existing user configs.
   lags:
     - "[1, 2, 3, 11, 12, 22, 23, 24, 47, 48, 167, 168]"
     - "48"

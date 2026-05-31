@@ -1,17 +1,13 @@
 """Command-line interface for event detection system."""
 
 import argparse
-import signal
 import sys
-import threading
-import time
 import warnings
-from datetime import datetime
 from pathlib import Path
 
 from spotanomaly2.application.config import get_default_config_path, load_config
 from spotanomaly2.application.pipeline import Pipeline
-from spotanomaly2.domain.constants import LIVE_REPORT_SERVER_PORT
+from spotanomaly2.dashboard import LiveMonitor
 from spotanomaly2.infrastructure import logging
 
 # Suppress warnings
@@ -82,28 +78,6 @@ def build_parser() -> argparse.ArgumentParser:
         help=("Raw data version timestamp (e.g. 20260105_174531). Default: most recent version."),
     )
 
-    # All command
-    all_parser = subparsers.add_parser("all", help="Run all steps sequentially")
-    add_config_argument(all_parser)
-    all_parser.add_argument("--skip-download", action="store_true", help="Skip the download step")
-    all_parser.add_argument(
-        "--predict-only",
-        action="store_true",
-        help="Skip training and only run detection (uses most recent model)",
-    )
-    all_parser.add_argument(
-        "--model",
-        type=str,
-        default=None,
-        help="Specific model timestamp to use (e.g., 20250115_143022). If not provided, uses the most recent model.",
-    )
-    all_parser.add_argument(
-        "--raw-data-version",
-        type=str,
-        default=None,
-        help=("Raw data version timestamp (e.g. 20260105_174531). Default: most recent version."),
-    )
-
     # Tune command
     tune_parser = subparsers.add_parser(
         "tune", help="Tune forecaster hyperparameters per channel per panel using SpotOptim"
@@ -154,119 +128,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     return parser
-
-
-def run_live_monitoring(pipeline: Pipeline, interval_minutes: int, logger) -> int:
-    """Run live monitoring in a loop.
-
-    Args:
-        pipeline: Pipeline instance
-        interval_minutes: Time between predictions in minutes
-        logger: Logger instance
-
-    Returns:
-        Exit code (0 for success, non-zero for error)
-    """
-    if interval_minutes < 1:
-        logger.error("Interval must be at least 1 minute")
-        return 1
-
-    interval_seconds = interval_minutes * 60
-    iteration = 0
-    running = True
-    server_thread = None
-
-    def signal_handler(signum, frame):
-        nonlocal running
-        logger.info(f"\nReceived signal {signum}. Shutting down gracefully...")
-        running = False
-
-    # Setup signal handlers
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
-    # Start live report server in background
-    report_enabled = pipeline.config.get("report", {}).get("enabled", True)
-    if report_enabled:
-        try:
-            from spotanomaly2.infrastructure.report_server import LiveReportServer
-
-            results_dir = Path(pipeline.config["paths"]["results_dir"]) / "live"
-            results_dir.mkdir(parents=True, exist_ok=True)
-
-            server = LiveReportServer(results_dir, port=LIVE_REPORT_SERVER_PORT, logger=logger)
-
-            def run_server():
-                import asyncio
-
-                try:
-                    asyncio.run(server.start())
-                except Exception as e:
-                    logger.error(f"Server error: {e}", exc_info=True)
-
-            server_thread = threading.Thread(target=run_server, daemon=True)
-            server_thread.start()
-            logger.info(f"Live report server listening on 0.0.0.0:{LIVE_REPORT_SERVER_PORT} (all network interfaces)")
-            logger.info(
-                f"Open http://localhost:{LIVE_REPORT_SERVER_PORT} on this machine, "
-                "or this host's IP from another device"
-            )
-        except Exception as e:
-            logger.warning(f"Could not start live report server: {e}")
-            logger.info("Continuing without live server (reports will still be generated)")
-
-    logger.info("=" * 70)
-    logger.info("LIVE MONITORING STARTED")
-    logger.info("=" * 70)
-    logger.info(f"Interval: {interval_minutes} minutes")
-    logger.info("Press Ctrl+C to stop")
-    logger.info("=" * 70)
-
-    while running:
-        iteration += 1
-        start_time = datetime.now()
-
-        try:
-            logger.info("")
-            logger.info("=" * 70)
-            logger.info(f"ITERATION {iteration} - {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-            logger.info("=" * 70)
-
-            pipeline.live()
-
-            end_time = datetime.now()
-            duration = (end_time - start_time).total_seconds()
-            logger.info(f"Iteration {iteration} completed in {duration:.1f} seconds")
-
-        except KeyboardInterrupt:
-            logger.info("\nKeyboard interrupt received. Stopping...")
-            break
-        except Exception as e:
-            logger.error(f"Error in iteration {iteration}: {e}", exc_info=True)
-            logger.info("Continuing to next iteration...")
-
-        # Wait for next iteration
-        if running:
-            next_run = time.time() + interval_seconds
-            while running and time.time() < next_run:
-                remaining = int(next_run - time.time())
-                if remaining <= 0:
-                    break
-
-                # Show countdown every 30 seconds or for last 10 seconds
-                if remaining % 30 == 0 or remaining <= 10:
-                    mins, secs = divmod(remaining, 60)
-                    logger.info(f"Next iteration in {mins}m {secs}s...")
-
-                # Sleep in small increments for quick shutdown
-                time.sleep(min(1, remaining))
-
-    logger.info("=" * 70)
-    logger.info("LIVE MONITORING STOPPED")
-    logger.info(f"Total iterations completed: {iteration}")
-    logger.info("=" * 70)
-
-    return 0
 
 
 def main(argv=None) -> int:
@@ -327,15 +188,14 @@ def main(argv=None) -> int:
             if args.n_initial is not None:
                 config.setdefault("tune", {})["n_initial"] = args.n_initial
             pipeline.tune(panel_id=args.panel, channel=args.channel)
-        elif args.command == "all":
-            pipeline.run_all(skip_download=args.skip_download, predict_only=args.predict_only)
         elif args.command == "live":
+            monitor = LiveMonitor(config, logger)
             if args.interval:
                 # Continuous monitoring mode
-                return run_live_monitoring(pipeline, args.interval, logger)
+                return monitor.run_monitoring(args.interval)
             else:
                 # Single run mode
-                pipeline.live()
+                monitor.run_once()
         else:
             logger.error(f"Unknown command: {args.command}")
             return 1

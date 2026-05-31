@@ -31,7 +31,7 @@ import pandas as pd
 from spotanomaly2.application.config import load_config
 from spotanomaly2.application.data_manager import DataManager
 from spotanomaly2.domain.anomaly_detector import AnomalyDetector
-from spotanomaly2.domain.spotforecast_adapter import SpotforecastTrainer
+from spotanomaly2.domain.spotforecast_adapter import SpotforecastPredictor
 from spotanomaly2.infrastructure import logging
 from spotanomaly2.infrastructure.storage import generate_timestamp
 from spotanomaly2_safe.scoring.pipeline import ForecastingAnomalyDetector
@@ -92,12 +92,12 @@ def _get_panel_matrices(
     train_df = unseen_df.iloc[:test_start_idx]
     test_df = unseen_df.iloc[test_start_idx:test_end_idx]
 
-    adapter = SpotforecastTrainer(cfg, detector.logger)
+    predictor = SpotforecastPredictor(cfg, detector.logger)
     history_for_train_pred = history_df if len(history_df) > 0 else None
-    train_pred_df = adapter.predict(model_data, train_df, history_df=history_for_train_pred)
+    train_pred_df = predictor.predict(model_data, train_df, history_df=history_for_train_pred)
 
     test_history_df = pd.concat([history_df, train_df]) if len(history_df) > 0 else train_df
-    test_pred_df = adapter.predict(model_data, test_df, history_df=test_history_df)
+    test_pred_df = predictor.predict(model_data, test_df, history_df=test_history_df)
 
     target_cols = train_pred_df.columns
     train_true_df = train_df.loc[train_pred_df.index, target_cols]

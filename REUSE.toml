@@ -85,6 +85,12 @@ SPDX-FileCopyrightText = "2026 bartzbeielstein"
 SPDX-License-Identifier = "AGPL-3.0-or-later"
 
 [[annotations]]
+path = "config/**"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 bartzbeielstein"
+SPDX-License-Identifier = "AGPL-3.0-or-later"
+
+[[annotations]]
 path = "pyproject.toml"
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 bartzbeielstein"

@@ -1,4 +1,8 @@
-"""Imputation utilities for filling missing values in time series data."""
+"""Partial Subsequence Matching (PSM) internals for time-series imputation.
+
+These free functions implement gap detection, sliding-window distance, and the
+PSM fill algorithm. They are wrapped as a strategy in :mod:`.psm`.
+"""
 
 import numpy as np
 import pandas as pd

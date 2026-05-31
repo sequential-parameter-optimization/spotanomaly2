@@ -10,7 +10,8 @@ from spotanomaly2_safe.scoring.pipeline import ForecastingAnomalyDetector
 
 from spotanomaly2.domain.constants import MIN_TRAIN_SIZE, TRAIN_TEST_SPLIT_RATIO
 from spotanomaly2.domain.exceptions import InsufficientDataException, ModelNotFoundException
-from spotanomaly2.domain.spotforecast_adapter import SpotforecastTrainer
+from spotanomaly2.domain.exogenous.residual_multiplier import find_multiplier_column, multiplier_prefixes
+from spotanomaly2.domain.spotforecast_adapter import SpotforecastPredictor
 from spotanomaly2.infrastructure import logging, storage
 
 
@@ -25,9 +26,8 @@ class AnomalyDetector:
     def load_forecasting_model(self, panel_id: str) -> dict[str, Any]:
         """Load trained spotforecast2 model for a panel."""
         models_dir = Path(self.config["paths"]["models_dir"])
-        fc_model_name = self.config["detect"]["fc_model_name"]
 
-        model_filename = f"{fc_model_name}_fc_model_panel_{panel_id}.pkl"
+        model_filename = f"fc_model_panel_{panel_id}.pkl"
 
         try:
             model_file = storage.find_latest_model(
@@ -167,68 +167,103 @@ class AnomalyDetector:
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
         """Return (history_df, unseen_df) to avoid scorer leakage.
 
-        The scorer must not be trained on rows that were used to train the
-        forecasting model. This helper removes the forecaster training period
-        from the scoring dataset.
+        The scorer must not be fit on rows the trainer OR tuner saw, otherwise
+        hyperparameters chosen on those rows bias the residual distribution
+        the scorer learns. The boundary the scorer cares about is the start of
+        the configured ``train.split.score`` window — everything before is
+        "seen by the pipeline", everything from there on is "unseen".
+
+        Lookup precedence:
+          1. ``score_start_timestamp`` (preferred — written by current trainer)
+          2. ``train_end_timestamp`` (legacy — points at the old train/test
+             boundary; less strict because the tuner also CV'd on test%, but
+             still the best signal an older artifact carries)
+          3. ``train_size`` (older still)
+          4. Config-based fallback using ``train.split`` percentages.
         """
         if len(df) == 0:
             return df.iloc[0:0], df
 
-        # Preferred: explicit timestamp boundary persisted with the model.
+        # Preferred: explicit score-window boundary persisted with the model.
+        score_start_timestamp = model_data.get("score_start_timestamp")
+        if score_start_timestamp and isinstance(df.index, pd.DatetimeIndex):
+            cutoff = self._align_timestamp_to_index(pd.Timestamp(score_start_timestamp), df)
+            history_df = df.loc[df.index < cutoff]
+            unseen_df = df.loc[df.index >= cutoff]
+            if len(unseen_df) == 0:
+                raise InsufficientDataException(
+                    f"Panel {panel_id}: no unseen rows at or after the score boundary "
+                    f"({cutoff}). Need new data beyond the score window for scoring."
+                )
+            self.logger.info(
+                f"Panel {panel_id}: leakage guard active using score_start={cutoff}. "
+                f"Excluded {len(history_df)} pipeline-seen row(s); "
+                f"{len(unseen_df)} unseen row(s) remain for scoring."
+            )
+            return history_df, unseen_df
+
+        # Legacy: older artifacts predate the score-window split; the strictest
+        # boundary they carry is the trainer's old train_end.
         train_end_timestamp = model_data.get("train_end_timestamp")
         if train_end_timestamp and isinstance(df.index, pd.DatetimeIndex):
-            cutoff = pd.Timestamp(train_end_timestamp)
-            if cutoff.tzinfo is None and df.index.tz is not None:
-                cutoff = cutoff.tz_localize(df.index.tz)
-            elif cutoff.tzinfo is not None and df.index.tz is None:
-                cutoff = cutoff.tz_convert("UTC").tz_localize(None)
-
+            cutoff = self._align_timestamp_to_index(pd.Timestamp(train_end_timestamp), df)
             history_df = df.loc[df.index <= cutoff]
             unseen_df = df.loc[df.index > cutoff]
-
             if len(unseen_df) == 0:
                 raise InsufficientDataException(
                     f"Panel {panel_id}: no unseen rows after model train end "
                     f"({cutoff}). Need new data beyond training period for leakage-free scoring."
                 )
-
-            self.logger.info(
-                f"Panel {panel_id}: leakage guard active using train_end={cutoff}. "
-                f"Excluded {len(history_df)} seen row(s); {len(unseen_df)} unseen row(s) remain for scoring."
+            self.logger.warning(
+                f"Panel {panel_id}: model has no score_start_timestamp; using legacy "
+                f"train_end={cutoff} as boundary. Re-train to get the stricter split-based boundary."
             )
             return history_df, unseen_df
 
-        # Fallback for older model files without timestamp metadata.
         train_size = model_data.get("train_size")
         if isinstance(train_size, int) and 0 < train_size < len(df):
             history_df = df.iloc[:train_size]
             unseen_df = df.iloc[train_size:]
             self.logger.warning(
-                f"Panel {panel_id}: model has no train_end_timestamp; using train_size={train_size} "
-                "as leakage boundary fallback. Re-train models once to persist precise timestamps."
+                f"Panel {panel_id}: model has no timestamp metadata; using train_size={train_size} "
+                "as leakage boundary fallback. Re-train models to persist precise timestamps."
             )
             return history_df, unseen_df
 
-        # Last-resort fallback using current config ratio.
-        train_ratio = self.config.get("train", {}).get("train_ratio", 0.9)
-        cutoff_pos = int(len(df) * float(train_ratio))
+        # Last-resort: derive from current config's train.split.
+        from spotanomaly2.application.config import resolve_data_split
+
+        split = resolve_data_split(self.config)
+        cutoff_pos = int(len(df) * (split.train + split.test) / 100)
         cutoff_pos = max(1, min(cutoff_pos, len(df) - 1))
         history_df = df.iloc[:cutoff_pos]
         unseen_df = df.iloc[cutoff_pos:]
         self.logger.warning(
             f"Panel {panel_id}: model lacks training boundary metadata; "
-            f"using ratio-based fallback ({train_ratio:.3f}). "
+            f"using config split fallback (train={split.train}%, test={split.test}%). "
             "Re-train models to persist precise leakage boundary."
         )
         return history_df, unseen_df
+
+    @staticmethod
+    def _align_timestamp_to_index(ts: pd.Timestamp, df: pd.DataFrame) -> pd.Timestamp:
+        """Align a persisted timestamp's tz to ``df.index`` for safe comparison."""
+        if not isinstance(df.index, pd.DatetimeIndex):
+            return ts
+        if ts.tzinfo is None and df.index.tz is not None:
+            return ts.tz_localize(df.index.tz)
+        if ts.tzinfo is not None and df.index.tz is None:
+            return ts.tz_convert("UTC").tz_localize(None)
+        return ts
 
     # ------------------------------------------------------------------
     # Flow weighting
     # ------------------------------------------------------------------
 
-    def _apply_flow_weights(
+    def _apply_residual_multiplier(
         self,
         panel_id: str,
+        multiplier_col: str,
         source_fit_df: pd.DataFrame,
         source_eval_df: pd.DataFrame,
         fit_true_df: pd.DataFrame,
@@ -236,28 +271,16 @@ class AnomalyDetector:
         eval_true_df: pd.DataFrame,
         eval_pred_df: pd.DataFrame,
     ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        """Multiply true and pred values by exogenous flow so residuals are flow-weighted."""
-        exog_cols = [c for c in source_fit_df.columns if c.startswith("exogenous_")]
-        if not exog_cols:
-            self.logger.warning(f"Panel {panel_id}: weight_residuals enabled but no exogenous columns found")
-            return fit_true_df, fit_pred_df, eval_true_df, eval_pred_df
+        """Multiply true and pred values by *multiplier_col* so residuals scale with it."""
+        fit_mult = source_fit_df.loc[fit_true_df.index, multiplier_col]
+        eval_mult = source_eval_df.loc[eval_true_df.index, multiplier_col]
 
-        # Use first exogenous column as flow weight (typically one per panel)
-        flow_col = exog_cols[0]
-        if len(exog_cols) > 1:
-            self.logger.info(
-                f"Panel {panel_id}: multiple exogenous columns found, using '{flow_col}' for flow weighting"
-            )
+        fit_true_df = fit_true_df.multiply(fit_mult, axis=0)
+        fit_pred_df = fit_pred_df.multiply(fit_mult, axis=0)
+        eval_true_df = eval_true_df.multiply(eval_mult, axis=0)
+        eval_pred_df = eval_pred_df.multiply(eval_mult, axis=0)
 
-        fit_flow = source_fit_df.loc[fit_true_df.index, flow_col]
-        eval_flow = source_eval_df.loc[eval_true_df.index, flow_col]
-
-        fit_true_df = fit_true_df.multiply(fit_flow, axis=0)
-        fit_pred_df = fit_pred_df.multiply(fit_flow, axis=0)
-        eval_true_df = eval_true_df.multiply(eval_flow, axis=0)
-        eval_pred_df = eval_pred_df.multiply(eval_flow, axis=0)
-
-        self.logger.info(f"Panel {panel_id}: applied flow weighting using '{flow_col}' to residuals")
+        self.logger.info(f"Panel {panel_id}: multiplied residuals by '{multiplier_col}'")
 
         return fit_true_df, fit_pred_df, eval_true_df, eval_pred_df
 
@@ -462,13 +485,12 @@ class AnomalyDetector:
         }
 
     def detect_panel(
-        self, panel_id: str, df: pd.DataFrame
+        self, panel_id: str, df: pd.DataFrame, live: bool = False
     ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame | None, dict[str, pd.DataFrame] | None]:
         """Detect anomalies for a single panel."""
         self.logger.info(f"Detecting anomalies for panel {panel_id}...")
 
         model_data = self.load_forecasting_model(panel_id)
-        model_type = model_data.get("model_type", "unknown")
 
         history_df, unseen_df = self._split_unseen_scoring_data(
             panel_id=panel_id,
@@ -477,7 +499,10 @@ class AnomalyDetector:
         )
 
         hist_window = self.config["detect"]["hist_window"]
-        target_date = self.config["detect"].get("target_date", None)
+        if live:
+            target_date = None
+        else:
+            target_date = self.config["detect"].get("target_date", None)
 
         if target_date:
             test_start_idx, test_end_idx = self._calculate_test_window_with_target_date(
@@ -501,24 +526,15 @@ class AnomalyDetector:
         self.logger.info(f"Scorer fit window: {len(scorer_fit_df)}, Scorer eval window: {len(scorer_eval_df)}")
 
         # Generate predictions via spotforecast2 adapter
-        channel_models = model_data.get("channel_models") or {}
-        if channel_models:
-            from collections import Counter
-
-            counts = Counter(spec.get("model", "?") for spec in channel_models.values())
-            breakdown = ", ".join(f"{m}×{n}" for m, n in counts.most_common())
-            self.logger.info(f"Generating predictions ({model_type}; channels: {breakdown})...")
-        else:
-            self.logger.info(f"Generating predictions using {model_type} model...")
-        adapter = SpotforecastTrainer(self.config, self.logger)
+        predictor = SpotforecastPredictor(self.config, self.logger)
         history_for_fit_pred = history_df if len(history_df) > 0 else None
-        fit_pred_df = adapter.predict(
+        fit_pred_df = predictor.predict(
             model_data,
             scorer_fit_df,
             history_df=history_for_fit_pred,
         )
         eval_history_df = pd.concat([history_df, scorer_fit_df]) if len(history_df) > 0 else scorer_fit_df
-        eval_pred_df = adapter.predict(model_data, scorer_eval_df, history_df=eval_history_df)
+        eval_pred_df = predictor.predict(model_data, scorer_eval_df, history_df=eval_history_df)
 
         # Align true values with predictions
         target_cols = fit_pred_df.columns
@@ -555,13 +571,16 @@ class AnomalyDetector:
         # Keep unweighted predictions for report visualizations
         report_pred_df = eval_pred_df.copy()
 
-        # Flow-weight residuals: multiply both true and pred by exogenous flow
-        # so that residual = flow*(actual - predicted). This suppresses anomalies
-        # during low-flow periods and amplifies them during high-flow periods.
-        weight_cfg = self.config.get("exogenous", {}).get("weight_residuals", {})
-        if weight_cfg.get("enabled", False):
-            fit_true_df, fit_pred_df, eval_true_df, eval_pred_df = self._apply_flow_weights(
+        # Multiply residuals by a multiply_residuals source's column so that
+        # residual = column*(actual - predicted). This suppresses anomalies when
+        # the column is small and amplifies them when it is large.
+        weight_suffix = self.config.get("process", {}).get("imputation", {}).get("weight_suffix", "__weight")
+        mult_prefixes = multiplier_prefixes(self.config)
+        multiplier_col = find_multiplier_column(scorer_fit_df.columns, mult_prefixes, weight_suffix)
+        if multiplier_col is not None:
+            fit_true_df, fit_pred_df, eval_true_df, eval_pred_df = self._apply_residual_multiplier(
                 panel_id=panel_id,
+                multiplier_col=multiplier_col,
                 source_fit_df=scorer_fit_df,
                 source_eval_df=scorer_eval_df,
                 fit_true_df=fit_true_df,
@@ -671,7 +690,7 @@ class AnomalyDetector:
         return scores_df, flags_df, report_pred_df, contributions_df, per_channel_results
 
     def detect_all_panels(
-        self, panel_data: dict[str, pd.DataFrame]
+        self, panel_data: dict[str, pd.DataFrame], live: bool = False
     ) -> dict[
         str,
         tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame | None, dict[str, pd.DataFrame] | None],
@@ -679,18 +698,18 @@ class AnomalyDetector:
         results = {}
         for panel_id, df in panel_data.items():
             self.logger.info(f"Detecting anomalies for panel {panel_id}...")
-            result = self.detect_panel(panel_id, df)
+            result = self.detect_panel(panel_id, df, live)
             results[panel_id] = result
             self.logger.info(f"Completed detection for panel {panel_id}")
         return results
 
     def run(
-        self, panel_data: dict[str, pd.DataFrame]
+        self, panel_data: dict[str, pd.DataFrame], live: bool = False
     ) -> dict[
         str,
         tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame | None, dict[str, pd.DataFrame] | None],
     ]:
         self.logger.info("Starting anomaly detection...")
-        results = self.detect_all_panels(panel_data)
+        results = self.detect_all_panels(panel_data, live)
         self.logger.info("Anomaly detection completed successfully")
         return results

@@ -6,7 +6,23 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
+import numpy as np
 import pandas as pd
+
+
+def make_yaml_serializable(obj: Any) -> Any:
+    """Recursively convert numpy types to native Python for YAML/JSON serialization."""
+    if isinstance(obj, dict):
+        return {str(k): make_yaml_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, (list, tuple)):
+        return [make_yaml_serializable(x) for x in obj]
+    return obj
 
 
 def ensure_dir(path: Path) -> Path:
@@ -93,7 +109,7 @@ def find_latest_model(models_dir: Path, model_filename: str, model_timestamp: Op
 
     Args:
         models_dir: Base models directory containing timestamped subdirectories
-        model_filename: Model filename (e.g., "LightGBM_fc_model_panel_1.pkl")
+        model_filename: Model filename (e.g., "fc_model_panel_1.pkl")
         model_timestamp: Optional specific timestamp to use
 
     Returns:

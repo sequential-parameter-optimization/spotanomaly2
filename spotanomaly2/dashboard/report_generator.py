@@ -11,6 +11,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+from spotanomaly2.domain.exogenous.residual_multiplier import find_multiplier_column, multiplier_prefixes
 from spotanomaly2.infrastructure import logging
 
 
@@ -152,7 +153,23 @@ class LiveReportGenerator:
 
         # Load provider display names from config
         self.primary_name = config.get("primary", {}).get("display_name", "Primary")
-        self.exogenous_name = config.get("exogenous", {}).get("display_name", "Exogenous")
+        self.exogenous_name = self._first_non_weather_display_name() or "Exogenous"
+
+    def _exogenous_source_config(self, source_name: str) -> dict:
+        """Return the ``config:`` sub-block for a named entry in ``config['exogenous']``."""
+        for entry in self.config.get("exogenous", []) or []:
+            if isinstance(entry, dict) and entry.get("name") == source_name:
+                return entry.get("config", {}) or {}
+        return {}
+
+    def _first_non_weather_display_name(self) -> str | None:
+        for entry in self.config.get("exogenous", []) or []:
+            if not isinstance(entry, dict) or entry.get("name") == "weather":
+                continue
+            src_cfg = entry.get("config", {}) or {}
+            if "display_name" in src_cfg:
+                return src_cfg["display_name"]
+        return None
 
     def _resolve_timezone(self, timezone_name: str):
         """Resolve configured timezone name to a tzinfo object.
@@ -184,11 +201,11 @@ class LiveReportGenerator:
 
     def _get_channel_source_label(self, panel_id: str, column_name: str) -> str:
         """Infer data source label for a plotted channel column."""
-        if column_name.startswith("weather_"):
+        if column_name.startswith("exogenous_weather_"):
             return "Open-Meteo"
 
         if column_name == "temperature":
-            weather_cfg = self.config.get("process", {}).get("weather", {})
+            weather_cfg = self._exogenous_source_config("weather")
             lat = weather_cfg.get("latitude")
             lon = weather_cfg.get("longitude")
             place = weather_cfg.get("place") or weather_cfg.get("location")
@@ -367,7 +384,6 @@ class LiveReportGenerator:
         """
         self.logger.info(f"Generating HTML report for panels: {panel_ids}")
 
-        fc_model_name = self.config["detect"]["fc_model_name"]
         timestamp = datetime.now(self._timezone)
 
         # Load results for each panel
@@ -379,9 +395,9 @@ class LiveReportGenerator:
             self.logger.info(f"Processing panel {panel_id}...")
 
             # Load CSVs
-            scores_file = results_dir / f"{fc_model_name}_panel_{panel_id}_scores.csv"
-            flags_file = results_dir / f"{fc_model_name}_panel_{panel_id}_flags.csv"
-            forecast_file = results_dir / f"{fc_model_name}_panel_{panel_id}_forecast.csv"
+            scores_file = results_dir / f"panel_{panel_id}_scores.csv"
+            flags_file = results_dir / f"panel_{panel_id}_flags.csv"
+            forecast_file = results_dir / f"panel_{panel_id}_forecast.csv"
 
             if not all(f.exists() for f in [scores_file, flags_file, forecast_file]):
                 self.logger.warning(f"Missing result files for panel {panel_id}, skipping...")
@@ -489,7 +505,7 @@ class LiveReportGenerator:
                     data_age_seconds=panel_age,
                 )
                 # Load scorer-aligned contributions if available
-                contrib_file = results_dir / f"{fc_model_name}_panel_{panel_id}_contributions.parquet"
+                contrib_file = results_dir / f"panel_{panel_id}_contributions.parquet"
                 df_contributions = None
                 if contrib_file.exists():
                     try:
@@ -528,10 +544,10 @@ class LiveReportGenerator:
                 )
 
                 # --- Per-channel anomaly detection results ---
-                pc_scores_file = results_dir / f"{fc_model_name}_panel_{panel_id}_per_channel_scores.csv"
-                pc_flags_file = results_dir / f"{fc_model_name}_panel_{panel_id}_per_channel_flags.csv"
-                pc_thresholds_file = results_dir / f"{fc_model_name}_panel_{panel_id}_per_channel_thresholds.csv"
-                pc_combined_file = results_dir / f"{fc_model_name}_panel_{panel_id}_per_channel_flags_combined.csv"
+                pc_scores_file = results_dir / f"panel_{panel_id}_per_channel_scores.csv"
+                pc_flags_file = results_dir / f"panel_{panel_id}_per_channel_flags.csv"
+                pc_thresholds_file = results_dir / f"panel_{panel_id}_per_channel_thresholds.csv"
+                pc_combined_file = results_dir / f"panel_{panel_id}_per_channel_flags_combined.csv"
 
                 if all(f.exists() for f in [pc_scores_file, pc_flags_file, pc_thresholds_file, pc_combined_file]):
                     try:
@@ -772,102 +788,6 @@ class LiveReportGenerator:
                 borderwidth=1,
                 borderpad=6,
             )
-
-        return fig
-
-    def _create_contribution_plot(
-        self,
-        panel_id: str,
-        df_actual: pd.DataFrame,
-        df_forecast: pd.DataFrame,
-        df_scores: pd.DataFrame,
-        df_contributions: pd.DataFrame | None = None,
-    ) -> go.Figure:
-        """Create score contribution estimation plot.
-
-        When *df_contributions* (scorer-aligned, from ``explain()``) is
-        available its fractional contributions are used directly.  Otherwise
-        falls back to the z-score-of-actuals heuristic.
-
-        Args:
-            panel_id: Panel identifier
-            df_actual: DataFrame with actual values
-            df_forecast: DataFrame with forecast values
-            df_scores: DataFrame with anomaly scores
-            df_contributions: Optional scorer-aligned per-channel contributions
-
-        Returns:
-            Plotly figure
-        """
-        if df_contributions is not None and not df_contributions.empty:
-            score_col = "anomaly_score" if "anomaly_score" in df_scores.columns else df_scores.columns[0]
-            feature_score_contributions = df_contributions.mul(
-                df_scores[score_col].reindex(df_contributions.index).values, axis=0
-            )
-            avg_score_contribution = feature_score_contributions.mean().sort_values(ascending=False)
-        else:
-            common_cols = df_actual.columns.intersection(df_forecast.columns)
-            if len(common_cols) == 0:
-                fig = go.Figure()
-                fig.add_annotation(
-                    text="No matching columns between actual and forecast data",
-                    xref="paper",
-                    yref="paper",
-                    x=0.5,
-                    y=0.5,
-                    showarrow=False,
-                )
-                return fig
-
-            df_residuals = df_actual[common_cols] - df_forecast[common_cols]
-            feature_stds = df_actual[common_cols].std().replace(0, 1.0)
-            df_normalized_residuals = df_residuals.div(feature_stds, axis=1)
-            df_squared_normalized_residuals = df_normalized_residuals**2
-            total_squared_residuals = df_squared_normalized_residuals.sum(axis=1).replace(0, np.nan)
-            feature_contributions_pct = df_squared_normalized_residuals.div(total_squared_residuals, axis=0)
-
-            score_col = (
-                "anomaly_score"
-                if "anomaly_score" in df_scores.columns
-                else (
-                    "anomaly_score_normalized"
-                    if "anomaly_score_normalized" in df_scores.columns
-                    else df_scores.columns[0]
-                )
-            )
-            feature_score_contributions = feature_contributions_pct.mul(df_scores[score_col].values, axis=0)
-            avg_score_contribution = feature_score_contributions.mean().sort_values(ascending=False)
-
-        # Create horizontal bar chart
-        fig = go.Figure()
-
-        # Convert to list to avoid binary serialization issues with numpy arrays
-        fig.add_trace(
-            go.Bar(
-                x=avg_score_contribution.values.tolist(),
-                y=avg_score_contribution.index.tolist(),
-                orientation="h",
-                marker=dict(color=COLORS["line"]),
-                hovertemplate="<b>%{y}</b><br>Average Contribution: %{x:.4f}<extra></extra>",
-            )
-        )
-
-        fig.update_layout(
-            title={
-                "text": f"Panel {panel_id}: Estimated Average Contribution to Anomaly Score by Feature",
-                "x": 0.5,
-                "xanchor": "center",
-                "font": {"size": 18, "color": COLORS["line"]},
-            },
-            xaxis_title="Average Score Contribution",
-            yaxis_title="Feature",
-            height=max(400, len(avg_score_contribution) * 40),
-            plot_bgcolor=COLORS["background"],
-            paper_bgcolor=COLORS["background"],
-            font=dict(color="white"),
-            xaxis=dict(gridcolor="rgba(128, 128, 128, 0.15)", linecolor=COLORS["border"]),
-            yaxis=dict(gridcolor="rgba(128, 128, 128, 0.15)", linecolor=COLORS["border"]),
-        )
 
         return fig
 
@@ -1348,14 +1268,12 @@ class LiveReportGenerator:
         else:
             anomaly_times = pd.DatetimeIndex([])
 
-        # Detect exogenous flow column for optional flow-weighted view.
-        # Anomaly scoring multiplies residuals by this flow value, so we let
-        # the user toggle between the raw values and the flow-weighted view
-        # the scorer actually sees.
-        flow_col = next((c for c in df_actual.columns if c.startswith("exogenous_")), None)
-        flow_weighting_enabled = flow_col is not None and self.config.get("exogenous", {}).get(
-            "weight_residuals", {}
-        ).get("enabled", False)
+        # Detect the residual-multiplier column for the optional multiplied view.
+        # Anomaly scoring multiplies residuals by this column, so we let the user
+        # toggle between the raw values and the multiplied view the scorer sees.
+        weight_suffix = self.config.get("process", {}).get("imputation", {}).get("weight_suffix", "__weight")
+        flow_col = find_multiplier_column(df_actual.columns, multiplier_prefixes(self.config), weight_suffix)
+        flow_weighting_enabled = flow_col is not None
         if flow_weighting_enabled:
             flow_values_arr = df_actual[flow_col].to_numpy()
         else:
@@ -1809,13 +1727,13 @@ class LiveReportGenerator:
             {
                 "primary": self.primary_name,
                 "exogenous": self.exogenous_name,
-                "openmeteo": "Open-Meteo",
+                "weather": "Open-Meteo",
             }
         )
 
         # Build weather source/place label for header
-        weather_cfg = self.config.get("process", {}).get("weather", {})
-        weather_enabled = weather_cfg.get("enabled", False)
+        weather_cfg = self._exogenous_source_config("weather")
+        weather_enabled = weather_cfg.get("enabled", True) and weather_cfg.get("latitude") is not None
         weather_lat = weather_cfg.get("latitude")
         weather_lon = weather_cfg.get("longitude")
         weather_place = weather_cfg.get("place") or weather_cfg.get("location")
@@ -2361,7 +2279,7 @@ class LiveReportGenerator:
 
         // Data source status rendering
         const SOURCE_LABELS = {source_labels_js};
-        const SOURCE_ORDER = ['primary', 'exogenous', 'openmeteo'];
+        const SOURCE_ORDER = ['primary', 'exogenous', 'weather'];
 
         function renderDataSourceStatus(fetchStatus) {
             const container = document.getElementById('data-source-cards');

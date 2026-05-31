@@ -1,204 +1,246 @@
-#!/usr/bin/env python3
-"""
-Quick test script for imputation methods.
-
-Usage:
-    python test_imputation_methods.py --method linear_interpolation --data-path path/to/data.csv
-"""
-
-import argparse
-from pathlib import Path
+# SPDX-FileCopyrightText: 2026 bartzbeielstein
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""Tests for spotanomaly2.domain.imputation_methods (strategy registry)."""
 
 import numpy as np
 import pandas as pd
+import pytest
 
-from spotanomaly2.domain import imputation_methods
+from spotanomaly2.domain.imputation import (
+    IMPUTATION_METHODS,
+    BackwardFillImputation,
+    ForwardFillImputation,
+    ImputationMethod,
+    IterativeImputation,
+    KNNSklearnImputation,
+    KNNTemporalImputation,
+    LinearInterpolationImputation,
+    MeanNeighborImputation,
+    RollingMeanImputation,
+    SeasonalImputation,
+    SplineInterpolationImputation,
+    get_imputation_method,
+    impute_dataframe,
+    impute_series,
+    impute_series_with_weight,
+)
 
 
-def create_synthetic_test_data(size: int = 1000, seed: int = 42) -> pd.Series:
-    """Create synthetic water quality data with missing values."""
-    np.random.seed(seed)
-
-    # Create synthetic daily pattern
-    t = np.arange(size)
-    daily_pattern = 50 + 10 * np.sin(2 * np.pi * t / 288)  # 24h cycle at 5min intervals
-    noise = np.random.normal(0, 2, size)
-    trend = np.linspace(0, 20, size)
-
-    series = daily_pattern + noise + trend
-
-    # Add some missing values
-    series = pd.Series(series, index=pd.date_range("2025-01-01", periods=size, freq="5min"))
-    missing_indices = np.random.choice(len(series), size=int(0.05 * len(series)), replace=False)
-    series.iloc[missing_indices] = np.nan
-
+def _make_series_with_nans(n=300, missing_ratio=0.05, seed=42):
+    """Synthetic seasonal series with a few NaNs sprinkled in."""
+    rng = np.random.default_rng(seed)
+    idx = pd.date_range("2025-01-01", periods=n, freq="5min")
+    t = np.arange(n)
+    values = 50.0 + 10.0 * np.sin(2 * np.pi * t / 50) + rng.standard_normal(n) * 0.5
+    series = pd.Series(values, index=idx)
+    n_missing = int(missing_ratio * n)
+    missing_idx = rng.choice(n, size=n_missing, replace=False)
+    series.iloc[missing_idx] = np.nan
     return series
 
 
-def load_real_data(data_path: str) -> pd.Series:
-    """Load real data from CSV."""
-    df = pd.read_csv(data_path, index_col=0, parse_dates=[0])
-    # Get first numeric column
-    numeric_cols = df.select_dtypes(include=[np.number]).columns
-    if len(numeric_cols) == 0:
-        raise ValueError("No numeric columns found in data")
-    return df[numeric_cols[0]].iloc[:1000]  # Use first 1000 samples
+# ----- Base + happy-path coverage of every registered method -----------------
 
 
-def evaluate_imputation_method(series: pd.Series, method: str, **params) -> dict:
-    """Run a single imputation method and return metrics.
+@pytest.mark.parametrize(
+    "method_name,kwargs",
+    [
+        ("mean", {}),
+        ("forward_fill", {}),
+        ("backward_fill", {}),
+        ("linear_interpolation", {}),
+        ("spline_interpolation", {}),
+        ("knn_temporal", {"n_neighbors": 3}),
+        ("seasonal", {"period": 50}),
+        ("rolling_mean", {"window": 5}),
+        ("iterative", {"max_iter": 3}),
+        ("knn_sklearn", {"n_neighbors": 3}),
+    ],
+)
+def test_method_fills_nans(method_name, kwargs):
+    series = _make_series_with_nans()
+    n_missing_before = int(series.isna().sum())
+    assert n_missing_before > 0
 
-    Returns:
-        Dict with imputation result and performance metrics
-    """
-    import time
+    method = get_imputation_method(method_name, **kwargs)
+    out = method.impute(series)
 
-    # Skip if already imputed (for baseline)
-    has_missing = series.isna().sum()
-    if has_missing == 0:
-        return {"method": method, "success": False, "error": "No missing values in series", "time_ms": 0}
-
-    try:
-        # Time the imputation
-        start = time.time()
-        imputed = imputation_methods.impute_series(series, method=method, **params)
-        elapsed = time.time() - start
-
-        # Check result
-        remaining_nan = imputed.isna().sum()
-
-        return {
-            "method": method,
-            "success": True,
-            "missing_before": has_missing,
-            "missing_after": remaining_nan,
-            "time_ms": elapsed * 1000,
-            "imputed_series": imputed,
-        }
-
-    except Exception as e:
-        return {"method": method, "success": False, "error": str(e), "time_ms": 0}
+    assert isinstance(out, pd.Series)
+    assert out.shape == series.shape
+    # Output must have no NaNs (since the input has at least one non-NaN)
+    assert int(out.isna().sum()) == 0
 
 
-def compare_all_methods(series: pd.Series) -> pd.DataFrame:
-    """Compare all available imputation methods."""
-    print("Testing all imputation methods...\n")
-
-    results = []
-
-    methods = {
-        "mean": {},
-        "forward_fill": {},
-        "backward_fill": {},
-        "linear_interpolation": {},
-        "spline_interpolation": {},
-        "knn_temporal": {"n_neighbors": 5},
-        "seasonal": {"period": 288},
-        "rolling_mean": {"window": 10},
-    }
-
-    for method_name, params in methods.items():
-        result = evaluate_imputation_method(series, method_name, **params)
-        results.append(result)
-
-        if result["success"]:
-            status = "✓"
-            msg = f"Missing: {result['missing_before']} → {result['missing_after']}, Time: {result['time_ms']:.2f}ms"
-        else:
-            status = "✗"
-            msg = f"Error: {result['error'][:50]}"
-
-        print(f"{status} {method_name:20} {msg}")
-
-    # Add optional methods
-    try:
-        result = evaluate_imputation_method(series, "iterative", max_iter=10)
-        results.append(result)
-        if result["success"]:
-            mb, ma, tm = result["missing_before"], result["missing_after"], result["time_ms"]
-            print(f"✓ {'iterative':20} Missing: {mb} → {ma}, Time: {tm:.2f}ms")
-        else:
-            print(f"✗ {'iterative':20} {result['error'][:50]}")
-    except Exception:
-        print(f"⊘ {'iterative':20} Skipped (sklearn not available)")
-
-    try:
-        result = evaluate_imputation_method(series, "knn_sklearn", n_neighbors=5)
-        results.append(result)
-        if result["success"]:
-            mb, ma, tm = result["missing_before"], result["missing_after"], result["time_ms"]
-            print(f"✓ {'knn_sklearn':20} Missing: {mb} → {ma}, Time: {tm:.2f}ms")
-        else:
-            print(f"✗ {'knn_sklearn':20} {result['error'][:50]}")
-    except Exception:
-        print(f"⊘ {'knn_sklearn':20} Skipped (sklearn not available)")
-
-    # Create DataFrame from successful results
-    df_results = pd.DataFrame([r for r in results if r["success"]])
-
-    if len(df_results) > 0:
-        df_results = df_results.sort_values("time_ms")
-
-    return df_results
+def test_base_class_raises_not_implemented():
+    with pytest.raises(NotImplementedError):
+        ImputationMethod().impute(pd.Series([1.0]))
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Test imputation methods")
-    parser.add_argument("--method", type=str, default=None, help="Test specific method")
-    parser.add_argument("--data-path", type=str, default=None, help="Path to CSV data file")
-    parser.add_argument(
-        "--synthetic", action="store_true", default=True, help="Use synthetic test data (default: True)"
-    )
-    parser.add_argument("--compare-all", action="store_true", default=False, help="Compare all methods")
-
-    args = parser.parse_args()
-
-    # Load data
-    if args.data_path and Path(args.data_path).exists():
-        print(f"Loading data from {args.data_path}...")
-        series = load_real_data(args.data_path)
-        print(f"Loaded {len(series)} samples\n")
-    else:
-        print("Using synthetic test data...")
-        series = create_synthetic_test_data()
-        print(f"Created {len(series)} synthetic samples\n")
-
-    print(f"Data: {series.isna().sum()} missing values ({series.isna().sum() / len(series) * 100:.1f}%)\n")
-
-    # Test methods
-    if args.compare_all:
-        df_results = compare_all_methods(series)
-        print("\n" + "=" * 80)
-        print("SUMMARY")
-        print("=" * 80)
-        print(df_results.to_string(index=False))
-
-    elif args.method:
-        print(f"Testing method: {args.method}\n")
-        result = evaluate_imputation_method(series, args.method)
-
-        if result["success"]:
-            print("✓ Success!")
-            print(f"  Missing before: {result['missing_before']}")
-            print(f"  Missing after: {result['missing_after']}")
-            print(f"  Time: {result['time_ms']:.2f}ms")
-
-            imputed = result["imputed_series"]
-            print("\n  Statistics:")
-            print(f"    Mean: {imputed.mean():.2f}")
-            print(f"    Std: {imputed.std():.2f}")
-            print(f"    Min: {imputed.min():.2f}")
-            print(f"    Max: {imputed.max():.2f}")
-        else:
-            print(f"✗ Failed: {result['error']}")
-
-    else:
-        print("Available methods:")
-        for method in sorted(imputation_methods.IMPUTATION_METHODS.keys()):
-            print(f"  - {method}")
-        print("\nUse --method <name> to test a specific method")
-        print("Use --compare-all to compare all methods")
+# ----- get_imputation_method / registry --------------------------------------
 
 
-if __name__ == "__main__":
-    main()
+def test_get_imputation_method_returns_instance():
+    inst = get_imputation_method("linear_interpolation")
+    assert isinstance(inst, LinearInterpolationImputation)
+
+
+def test_get_imputation_method_unknown_raises():
+    with pytest.raises(ValueError, match="Unknown imputation method"):
+        get_imputation_method("does_not_exist")
+
+
+def test_get_imputation_method_passes_kwargs():
+    inst = get_imputation_method("knn_temporal", n_neighbors=7)
+    assert isinstance(inst, KNNTemporalImputation)
+    assert inst.n_neighbors == 7
+
+
+def test_get_imputation_method_psm_fills_multi_point_gap():
+    from spotanomaly2.domain.imputation import PSMImputation
+
+    idx = pd.date_range("2025-01-01", periods=100, freq="5min")
+    base = np.sin(2 * np.pi * np.arange(100) / 10) * 10 + 50
+    base += np.random.default_rng(0).standard_normal(100) * 0.01  # tiny noise so windows differ
+    series = pd.Series(base, index=idx)
+    series.iloc[40:43] = np.nan  # 3-point gap (PSM territory, not single-gap)
+
+    method = get_imputation_method("psm")
+
+    assert isinstance(method, PSMImputation)
+    out = method.impute(series)
+    assert not out.iloc[40:43].isna().any()
+
+
+def test_registry_keys_match_classes():
+    assert IMPUTATION_METHODS["mean"] is MeanNeighborImputation
+    assert IMPUTATION_METHODS["forward_fill"] is ForwardFillImputation
+    assert IMPUTATION_METHODS["backward_fill"] is BackwardFillImputation
+    assert IMPUTATION_METHODS["linear_interpolation"] is LinearInterpolationImputation
+    assert IMPUTATION_METHODS["spline_interpolation"] is SplineInterpolationImputation
+    assert IMPUTATION_METHODS["knn_temporal"] is KNNTemporalImputation
+    assert IMPUTATION_METHODS["seasonal"] is SeasonalImputation
+    assert IMPUTATION_METHODS["rolling_mean"] is RollingMeanImputation
+    assert IMPUTATION_METHODS["iterative"] is IterativeImputation
+    assert IMPUTATION_METHODS["knn_sklearn"] is KNNSklearnImputation
+
+
+# ----- impute_series / impute_series_with_weight / impute_dataframe ---------
+
+
+def test_impute_series_convenience():
+    series = _make_series_with_nans()
+    out = impute_series(series, method="linear_interpolation")
+    assert isinstance(out, pd.Series)
+    assert out.isna().sum() == 0
+
+
+def test_impute_series_with_weight_returns_pair():
+    series = _make_series_with_nans()
+    imputed, weight = impute_series_with_weight(series, method="linear_interpolation")
+    assert imputed.shape == series.shape
+    assert weight.shape == series.shape
+    # weight=1 where original was non-NaN, 0 where imputed
+    np.testing.assert_array_equal(weight.values, (~series.isna()).astype(int).values)
+    assert imputed.isna().sum() == 0
+
+
+def test_impute_dataframe_default_numeric():
+    series_a = _make_series_with_nans(seed=1)
+    series_b = _make_series_with_nans(seed=2)
+    df = pd.DataFrame({"a": series_a, "b": series_b, "label": ["x"] * len(series_a)})
+    out = impute_dataframe(df, method="linear_interpolation")
+    # Only numeric columns are imputed
+    assert out["a"].isna().sum() == 0
+    assert out["b"].isna().sum() == 0
+    # Non-numeric column unchanged
+    assert (out["label"] == "x").all()
+
+
+def test_impute_dataframe_explicit_columns():
+    series_a = _make_series_with_nans(seed=1)
+    series_b = _make_series_with_nans(seed=2)
+    df = pd.DataFrame({"a": series_a, "b": series_b})
+    out = impute_dataframe(df, method="linear_interpolation", columns=["a"])
+    assert out["a"].isna().sum() == 0
+    # 'b' was not requested
+    assert out["b"].isna().sum() == df["b"].isna().sum()
+
+
+# ----- Specific method properties --------------------------------------------
+
+
+def test_mean_neighbor_fills_isolated_singles():
+    series = pd.Series([1.0, 2.0, np.nan, 4.0, 5.0])
+    out = MeanNeighborImputation().impute(series)
+    assert out.iloc[2] == pytest.approx(3.0)
+    assert out.isna().sum() == 0
+
+
+def test_forward_fill_propagates_forward():
+    series = pd.Series([1.0, np.nan, np.nan, 4.0])
+    out = ForwardFillImputation().impute(series)
+    assert out.iloc[1] == 1.0
+    assert out.iloc[2] == 1.0
+    assert out.iloc[3] == 4.0
+
+
+def test_backward_fill_propagates_backward():
+    series = pd.Series([1.0, np.nan, np.nan, 4.0])
+    out = BackwardFillImputation().impute(series)
+    assert out.iloc[1] == 4.0
+    assert out.iloc[2] == 4.0
+
+
+def test_linear_interpolation_value():
+    series = pd.Series([0.0, np.nan, np.nan, 3.0])
+    out = LinearInterpolationImputation().impute(series)
+    # Linear: 0, 1, 2, 3
+    assert out.iloc[1] == pytest.approx(1.0)
+    assert out.iloc[2] == pytest.approx(2.0)
+
+
+def test_spline_interpolation_fills():
+    series = _make_series_with_nans()
+    out = SplineInterpolationImputation(order=2).impute(series)
+    assert out.isna().sum() == 0
+
+
+def test_knn_temporal_with_no_valid_values_returns_unchanged():
+    # Series entirely NaN -- nothing to use as neighbour
+    series = pd.Series([np.nan, np.nan, np.nan])
+    out = KNNTemporalImputation(n_neighbors=3).impute(series)
+    assert out.isna().all()
+
+
+def test_seasonal_with_no_period_falls_back_to_neighbors_then_mean():
+    # Period larger than series → seasonal lookups always fail → falls back to neighbours, then mean
+    series = pd.Series([1.0, 2.0, np.nan, 4.0, 5.0])
+    out = SeasonalImputation(period=10000).impute(series)
+    # Neighbour fallback fills index 2 with (2 + 4) / 2 = 3.0
+    assert out.iloc[2] == pytest.approx(3.0)
+
+
+def test_rolling_mean_window():
+    series = pd.Series([1.0, 2.0, np.nan, 4.0, 5.0])
+    out = RollingMeanImputation(window=2).impute(series)
+    # Window of 2 around idx 2 looks at idx 0..4 → mean of {1,2,4,5} = 3.0
+    assert out.iloc[2] == pytest.approx(3.0)
+
+
+# ----- sklearn-backed methods (available=True path; mock the unavailable) ----
+
+
+def test_iterative_imputation_when_unavailable_raises(monkeypatch):
+    impu = IterativeImputation()
+    monkeypatch.setattr(impu, "available", False)
+    series = _make_series_with_nans()
+    with pytest.raises(ImportError, match="scikit-learn"):
+        impu.impute(series)
+
+
+def test_knn_sklearn_imputation_when_unavailable_raises(monkeypatch):
+    impu = KNNSklearnImputation()
+    monkeypatch.setattr(impu, "available", False)
+    series = _make_series_with_nans()
+    with pytest.raises(ImportError, match="scikit-learn"):
+        impu.impute(series)

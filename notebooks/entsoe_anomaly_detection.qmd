@@ -1,0 +1,207 @@
+---
+title: "Anomaly Detection on Live ENTSO-E Power Consumption"
+format:
+  html:
+    embed-resources: true
+    code-fold: false
+    toc: true
+    fig-width: 14
+    fig-height: 4.5
+jupyter: python3
+---
+
+This is a **real, always-live** end-to-end example of the SpotAnomaly stack on
+public data. Every run:
+
+1. **Primary loader** — pulls German electricity **load** from the
+   [ENTSO-E Transparency Platform](https://transparency.entsoe.eu) via the
+   pluggable `EntsoePrimaryFetcher`.
+2. **Weather exogenous** — pulls Open-Meteo weather (temperature, cloud cover,
+   wind) for Berlin and feeds it to the forecaster as exogenous features.
+3. **Detection** — trains a one-step-ahead forecaster and flags timestamps whose
+   forecast residuals are anomalous.
+
+There is **no synthetic data and no injected/known anomalies** — anomalies are
+discovered purely from the live series.
+
+> **Prerequisite:** a free ENTSO-E security token in `ENTSOE_API_KEY` (env or
+> `.env`). Register at <https://transparency.entsoe.eu> → *Account Settings →
+> Web API*. Open-Meteo requires no key.
+
+```{python}
+#| label: setup
+#| warning: false
+#| message: false
+
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import pandas as pd
+from dotenv import load_dotenv
+
+from spotanomaly2.application.config import load_config
+from spotanomaly2.application.pipeline import Pipeline
+
+load_dotenv()
+
+# Resolve the repo root whether this renders from the repo root or notebooks/.
+repo_root = Path.cwd()
+if not (repo_root / "config" / "entsoe_example.yaml").exists():
+    repo_root = repo_root.parent
+
+# base_dir anchors the config's relative data/entsoe/* paths to the repo root.
+config = load_config(repo_root / "config" / "entsoe_example.yaml", base_dir=repo_root)
+PANEL_ID = config["panels"]["panel_ids"][0]
+TARGET_COL = f"channel_0_{config['primary']['config']['channel_name']}"
+
+pipeline = Pipeline(config)
+print(f"Panel: {PANEL_ID}  |  target column: {TARGET_COL}")
+```
+
+## Download + process
+
+`download()` fetches the ENTSO-E load window (primary) and the Open-Meteo weather
+(exogenous) in one step; `process()` resamples to an hourly grid, imputes gaps,
+and joins the weather features as `exogenous_weather_*` columns.
+
+```{python}
+#| label: download-process
+#| warning: false
+
+if not pipeline.data_is_ready():
+    pipeline.download()
+
+processed = pipeline.process()
+panel = processed[PANEL_ID]
+exog_cols = [c for c in panel.columns if c.startswith("exogenous_") and not c.endswith("__weight")]
+print(f"Processed {len(panel)} hourly rows: {panel.index.min()} → {panel.index.max()}")
+print(f"Exogenous weather features fed to the model: {exog_cols}")
+panel[[TARGET_COL, *exog_cols]].tail()
+```
+
+## Tune hyperparameters (SpotOptim)
+
+`pipeline.tune()` runs spotanomaly2's per-channel Bayesian hyperparameter search
+(SpotOptim, integrated through the `spotforecast2` adapter). The winning model,
+parameters, and lags are written back into the panel's channel-model config
+(`config/channel_models/entsoe_DE.yaml`), so the next `train()` picks them up.
+
+It is kept small here (a handful of trials, LightGBM only — see the `tune` block
+in `config/entsoe_example.yaml`) so the example stays quick; widen `n_trials` and
+add models for a real search.
+
+```{python}
+#| label: tune
+#| warning: false
+
+tune_results = pipeline.tune(panel_id=PANEL_ID)
+best = tune_results[PANEL_ID][TARGET_COL]
+if "error" in best:
+    print(f"Tuning failed: {best['error']}")
+else:
+    print(f"Best model:  {best['best_model']}")
+    print(f"Best lags:   {best['best_lags']}")
+    print(f"Best metric (r2): {best['best_metric']:.4f}")
+    print("Best params:")
+    for k, v in best.get("best_params", {}).items():
+        print(f"  {k} = {v}")
+```
+
+## Train
+
+A one-step-ahead `ForecasterRecursive` is trained per panel on the historical
+window, with the weather features as exogenous inputs. We retrain unconditionally
+here so the just-tuned hyperparameters take effect (training one channel of
+hourly data is fast).
+
+```{python}
+#| label: train
+#| warning: false
+
+pipeline.train()
+print("Model trained with the tuned hyperparameters.")
+```
+
+## Detect anomalies
+
+Detection scores forecast residuals on the **unseen** tail of the series (after
+the model's training period) and flags timestamps whose residual exceeds the
+learned threshold.
+
+```{python}
+#| label: detect
+#| warning: false
+
+results = pipeline.detect()
+scores_df, flags_df, pred_df, _contrib, per_channel = results[PANEL_ID]
+
+n_flagged = int(flags_df["anomaly_flag"].sum())
+print(f"Scored {len(scores_df)} timestamps; flagged {n_flagged} anomaly(ies).")
+flagged_times = flags_df.index[flags_df["anomaly_flag"] == 1]
+if n_flagged:
+    print("Flagged timestamps:")
+    for ts in flagged_times:
+        print(f"  {ts}  score={scores_df.loc[ts, 'anomaly_score']:.3f}")
+```
+
+## Visualize
+
+Actual vs. forecast load over the evaluation window, with flagged anomalies
+marked. The forecast is conditioned on real lagged load and live weather.
+
+```{python}
+#| label: plot-load
+#| warning: false
+
+actual = panel.loc[pred_df.index, TARGET_COL]
+predicted = pred_df[TARGET_COL]
+
+fig, ax = plt.subplots()
+ax.plot(actual.index, actual.values, label="actual load", color="#1f77b4", lw=1.0)
+ax.plot(predicted.index, predicted.values, label="forecast", color="#ff7f0e", lw=1.0, alpha=0.8)
+if n_flagged:
+    ax.scatter(
+        flagged_times,
+        actual.reindex(flagged_times).values,
+        color="red",
+        zorder=5,
+        label="anomaly",
+    )
+ax.set_title(f"ENTSO-E {PANEL_ID} load — actual vs. forecast (evaluation window)")
+ax.set_ylabel("Load (MW)")
+ax.legend(loc="upper left")
+fig.autofmt_xdate()
+plt.show()
+```
+
+The normalized anomaly score is anchored so that `1.0` is exactly the detection
+threshold: points at or above the dashed line are flagged.
+
+```{python}
+#| label: plot-score
+#| warning: false
+
+fig, ax = plt.subplots()
+ax.plot(
+    scores_df.index,
+    scores_df["anomaly_score_normalized"],
+    color="#2ca02c",
+    lw=1.0,
+    label="normalized score",
+)
+ax.axhline(1.0, color="red", ls="--", lw=1.0, label="anomaly threshold")
+ax.set_title(f"ENTSO-E {PANEL_ID} — normalized anomaly score")
+ax.set_ylabel("normalized score")
+ax.legend(loc="upper left")
+fig.autofmt_xdate()
+plt.show()
+```
+```{python}
+#| label: per-channel
+#| warning: false
+
+if per_channel is not None:
+    combined = per_channel["flags_combined"]["per_channel_anomaly_flag"]
+    print(f"Per-channel detector flagged {int(combined.sum())} timestamp(s).")
+    display(per_channel["thresholds"])
+```

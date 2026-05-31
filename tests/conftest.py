@@ -35,12 +35,11 @@ def sample_config():
             "flow_columns_pattern": "flow",
             "temperature_columns_pattern": "temperature",
             "median_filter_kernel": 3,
-            "weather": {"enabled": False},
         },
         "train": {
-            "train_ratio": 0.9,
+            "split": {"train": 80, "test": 10, "score": 10},
             "random_seed": 42,
-            "model": "LightGBM",
+            "fallback_model": "LightGBM",
             "lags": 6,
             "exog_columns": [],
         },
@@ -48,7 +47,6 @@ def sample_config():
             "hist_window": 100,
             "target_date": None,
             "high_quantile": 0.99,
-            "fc_model_name": "LightGBM",
             "scorer_name": "KMeansScorer",
             "scorer_params": {"n_clusters": 3, "window": 1},
             "normalize_scores": True,
@@ -57,7 +55,10 @@ def sample_config():
         "known_anomalies": [],
         "fetch": {},
         "primary": {"display_name": "Primary"},
-        "exogenous": {"enabled": False, "display_name": "Exogenous"},
+        # New plugin-shape: empty list means no exogenous sources run.
+        # Tests that need a source instantiate one explicitly. Per-source
+        # ``multiply_residuals`` replaces the old global residual_weighting flag.
+        "exogenous": [],
         "report": {"enabled": False},
     }
 

@@ -16,17 +16,21 @@ load_dotenv(ROOT / ".env")
 
 from spotanomaly2.application.config import load_default_config  # noqa: E402
 from spotanomaly2.application.pipeline import Pipeline  # noqa: E402
+from spotanomaly2.dashboard import LiveMonitor  # noqa: E402
 
 config = load_default_config()
 pipeline = Pipeline(config)
 
-if not pipeline.is_ready():
+if not (pipeline.data_is_ready() and pipeline.model_is_ready()):
     print("Baseline data/models missing or older than 7 days — running full pipeline...")
     print("This may take a few minutes.\n")
-    pipeline.run_all()
+    pipeline.download()
+    pipeline.process()
+    pipeline.train()
+    pipeline.detect()
     print("\nBaseline created. Switching to live mode...\n")
 
-results = pipeline.live()
+results = LiveMonitor(config).run_once()
 
 for panel_id, (scores_df, flags_df, forecast_df, _contrib, per_channel) in results.items():
     status = "anomaly detected" if flags_df.iloc[-1].any() else "all clear"

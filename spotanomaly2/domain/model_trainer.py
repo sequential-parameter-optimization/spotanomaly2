@@ -1,5 +1,6 @@
 """Model training service using spotforecast2."""
 
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -19,20 +20,25 @@ class ModelTrainer:
     def train_panel(
         self,
         panel_id: str,
-        df: pd.DataFrame,
-        timestamp: str = None,
+        panel_data: pd.DataFrame,
+        timestamp: str,
         save_model: bool = True,
-        panel_specific_params: dict = None,
-        channel_specific_params: dict = None,
     ) -> tuple[pd.DataFrame, str]:
-        return self.trainer.train_panel(
+        eval_df, timestamp = self.trainer.train_panel(
             panel_id,
-            df,
+            panel_data,
             timestamp=timestamp,
             save_model=save_model,
-            panel_specific_params=panel_specific_params,
-            channel_specific_params=channel_specific_params,
         )
+
+        base_models_dir = Path(self.config["paths"]["models_dir"])
+        models_dir = base_models_dir / str(timestamp)
+        eval_filename = f"fc_model_panel_{panel_id}_eval.csv"
+        eval_path = models_dir / eval_filename
+        eval_df.to_csv(eval_path)
+        self.logger.info(f"Saved evaluation results to {eval_path}")
+
+        return eval_df, timestamp
 
     def train_all_panels(self, panel_data: dict[str, pd.DataFrame]) -> dict[str, tuple[pd.DataFrame, str]]:
         return self.trainer.train_all_panels(panel_data)
