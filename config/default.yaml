@@ -143,14 +143,15 @@ process:
 train:
   # Three disjoint windows of the processed data — must sum to 100.
   # - train: forecaster fits here.
-  # - test:  trainer's eval window AND tuner's CV val window. Held out from
-  #          the forecaster's fit.
-  # - score: scorer's territory. NEVER seen by trainer or tuner — this closes
-  #          the hyperparameter-selection leakage older designs had.
+  # - val:   tuner's CV validation window AND the trainer's tuning-fold eval
+  #          metric. Held out from the fit, but selected against — biased.
+  # - test:  held out from BOTH fit and tuning. Calibrates the scorer at detect
+  #          time and gives the unbiased monitoring baseline. NEVER selected on
+  #          — this closes the hyperparameter-selection leakage older designs had.
   split:
     train: 80
+    val: 10
     test: 10
-    score: 10
   random_seed: 42
   fallback_model: "LightGBM"  # used when no per-channel/per-panel model is set in channel_config_files
   lags: 6  # Number of autoregressive lags for ForecasterRecursive

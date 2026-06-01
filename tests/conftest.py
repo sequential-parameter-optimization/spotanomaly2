@@ -37,7 +37,7 @@ def sample_config():
             "median_filter_kernel": 3,
         },
         "train": {
-            "split": {"train": 80, "test": 10, "score": 10},
+            "split": {"train": 80, "val": 10, "test": 10},
             "random_seed": 42,
             "fallback_model": "LightGBM",
             "lags": 6,

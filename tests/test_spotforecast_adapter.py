@@ -51,10 +51,23 @@ class TestSpotforecastTrainer:
         eval_df, timestamp = adapter.train_panel("test", panel_df)
 
         assert isinstance(eval_df, pd.DataFrame)
-        assert "rmse" in eval_df.columns
-        assert "mae" in eval_df.columns
+        assert "val_rmse" in eval_df.columns
+        assert "val_mae" in eval_df.columns
         assert len(eval_df) == 2  # sensor_a, sensor_b
         assert isinstance(timestamp, str)
+
+    def test_train_panel_reports_held_out_test_metric(self, adapter, panel_df, tmp_path):
+        """The eval frame carries a tuning-independent baseline on the held-out
+        ``test`` split, alongside the optimistic tuning-fold ``val_rmse``/``val_mae``."""
+        adapter.config["paths"]["models_dir"] = str(tmp_path)
+        eval_df, _ = adapter.train_panel("test", panel_df)
+
+        assert "test_rmse" in eval_df.columns
+        assert "test_mae" in eval_df.columns
+        # 300 rows @ 80/10/10 → ~30-row test window, so the metric is real (not NaN).
+        assert eval_df["test_rmse"].notna().all()
+        assert eval_df["test_mae"].notna().all()
+        assert (eval_df["test_rmse"] >= 0).all()
 
     def test_train_panel_completes_with_exclude_imputed_training_samples(self, sample_config, panel_df, tmp_path):
         """With ``exclude_imputed_training_samples=True`` the sample mask is a
@@ -128,7 +141,7 @@ class TestSpotforecastTrainer:
         adapter = SpotforecastTrainer(config)
         eval_df, _ = adapter.train_panel("test", df)
 
-        mae = float(eval_df.loc["sensor_a", "mae"])
+        mae = float(eval_df.loc["sensor_a", "val_mae"])
         # One-step-ahead on this signal should land near the ~5 noise floor;
         # recursive predict over 200 steps would drift far beyond 30.
         assert mae < 15.0, f"Train eval MAE looks recursive (got {mae:.3f})"
@@ -314,11 +327,11 @@ class TestSpotforecastTuner:
     def test_tune_uses_full_data_no_outer_holdout(self, sample_config):
         """The tuner's CV must:
 
-        - Slice off the ``train.split.score`` percentage entirely (those rows
-          belong to the scorer; the tuner must never see them).
-        - Inside the train+test portion, split at the train/test boundary so
+        - Slice off the ``train.split.test`` percentage entirely (those rows
+          are the held-out test split; the tuner must never see them).
+        - Inside the train+val portion, split at the train/val boundary so
           CV-train mirrors what the trainer fits on and CV-val mirrors the
-          trainer's test window.
+          trainer's val window.
 
         Sentinel check: with the standard 80/10/10 split, on N rows the CV
         ``initial_train_size`` must be ``int(N * 0.80)`` (NOT ``int((N*0.9) * 0.8)``).
@@ -363,7 +376,7 @@ class TestSpotforecastTuner:
             OneStepAheadFold.__init__ = real_init
 
         # CV train size is ``int(N * split.train / 100)``, computed against the
-        # FULL N rows, not against the (train + test) sub-pool. The score window
+        # FULL N rows, not against the (train + val) sub-pool. The test window
         # is sliced off before CV runs.
         split = config["train"]["split"]
         expected = int(n * split["train"] / 100)

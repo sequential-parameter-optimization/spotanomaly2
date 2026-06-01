@@ -75,11 +75,11 @@ class SpotforecastTuner:
         weight_suffix = train_settings.weight_suffix
         df, target_cols, exog_columns = prepare_panel(self.config, df, weight_suffix, self.logger)
 
-        # Carve off the score% rows BEFORE CV — they are the scorer's territory
-        # and must never influence hyperparameter selection. The tuner CV's
-        # available window is the first ``train + test`` percentages of data.
+        # Carve off the test% rows BEFORE CV — they are the held-out split and
+        # must never influence hyperparameter selection. The tuner CV's
+        # available window is the first ``train + val`` percentages of data.
         n_full = len(df)
-        tune_available = int(n_full * (split.train + split.test) / 100)
+        tune_available = int(n_full * (split.train + split.val) / 100)
         df = df.iloc[:tune_available]
 
         if channels is not None:
@@ -101,8 +101,8 @@ class SpotforecastTuner:
         )
 
         # OneStepAheadFold's train/val boundary lines up with the trainer's
-        # train/test boundary: CV-train on the first ``train`` rows, CV-val
-        # on the ``test`` rows. The ``score`` rows were already sliced off
+        # train/val boundary: CV-train on the first ``train`` rows, CV-validate
+        # on the ``val`` rows. The ``test`` rows were already sliced off
         # above, so the tuner physically cannot see them — closes the
         # hyperparameter-selection leakage the old ``train_ratio`` design had.
         cv_train_size = max(1, int(n_full * split.train / 100))

@@ -38,8 +38,8 @@ def test_load_config_train_section():
     assert "fallback_model" in train
     assert "lags" in train
     split = train["split"]
-    assert {"train", "test", "score"} <= set(split)
-    assert split["train"] + split["test"] + split["score"] == 100
+    assert {"train", "val", "test"} <= set(split)
+    assert split["train"] + split["val"] + split["test"] == 100
 
 
 def test_load_config_detect_section():

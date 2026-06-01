@@ -170,13 +170,13 @@ class AnomalyDetector:
         The scorer must not be fit on rows the trainer OR tuner saw, otherwise
         hyperparameters chosen on those rows bias the residual distribution
         the scorer learns. The boundary the scorer cares about is the start of
-        the configured ``train.split.score`` window — everything before is
+        the configured ``train.split.test`` window — everything before is
         "seen by the pipeline", everything from there on is "unseen".
 
         Lookup precedence:
-          1. ``score_start_timestamp`` (preferred — written by current trainer)
+          1. ``test_start_timestamp`` (preferred — written by current trainer)
           2. ``train_end_timestamp`` (legacy — points at the old train/test
-             boundary; less strict because the tuner also CV'd on test%, but
+             boundary; less strict because the tuner also CV'd on val%, but
              still the best signal an older artifact carries)
           3. ``train_size`` (older still)
           4. Config-based fallback using ``train.split`` percentages.
@@ -184,25 +184,25 @@ class AnomalyDetector:
         if len(df) == 0:
             return df.iloc[0:0], df
 
-        # Preferred: explicit score-window boundary persisted with the model.
-        score_start_timestamp = model_data.get("score_start_timestamp")
-        if score_start_timestamp and isinstance(df.index, pd.DatetimeIndex):
-            cutoff = self._align_timestamp_to_index(pd.Timestamp(score_start_timestamp), df)
+        # Preferred: explicit test-window boundary persisted with the model.
+        test_start_timestamp = model_data.get("test_start_timestamp")
+        if test_start_timestamp and isinstance(df.index, pd.DatetimeIndex):
+            cutoff = self._align_timestamp_to_index(pd.Timestamp(test_start_timestamp), df)
             history_df = df.loc[df.index < cutoff]
             unseen_df = df.loc[df.index >= cutoff]
             if len(unseen_df) == 0:
                 raise InsufficientDataException(
-                    f"Panel {panel_id}: no unseen rows at or after the score boundary "
-                    f"({cutoff}). Need new data beyond the score window for scoring."
+                    f"Panel {panel_id}: no unseen rows at or after the test boundary "
+                    f"({cutoff}). Need new data beyond the test window for scoring."
                 )
             self.logger.info(
-                f"Panel {panel_id}: leakage guard active using score_start={cutoff}. "
+                f"Panel {panel_id}: leakage guard active using test_start={cutoff}. "
                 f"Excluded {len(history_df)} pipeline-seen row(s); "
                 f"{len(unseen_df)} unseen row(s) remain for scoring."
             )
             return history_df, unseen_df
 
-        # Legacy: older artifacts predate the score-window split; the strictest
+        # Legacy: older artifacts predate the held-out test split; the strictest
         # boundary they carry is the trainer's old train_end.
         train_end_timestamp = model_data.get("train_end_timestamp")
         if train_end_timestamp and isinstance(df.index, pd.DatetimeIndex):
@@ -215,7 +215,7 @@ class AnomalyDetector:
                     f"({cutoff}). Need new data beyond training period for leakage-free scoring."
                 )
             self.logger.warning(
-                f"Panel {panel_id}: model has no score_start_timestamp; using legacy "
+                f"Panel {panel_id}: model has no test_start_timestamp; using legacy "
                 f"train_end={cutoff} as boundary. Re-train to get the stricter split-based boundary."
             )
             return history_df, unseen_df
@@ -234,13 +234,13 @@ class AnomalyDetector:
         from spotanomaly2.application.config import resolve_data_split
 
         split = resolve_data_split(self.config)
-        cutoff_pos = int(len(df) * (split.train + split.test) / 100)
+        cutoff_pos = int(len(df) * (split.train + split.val) / 100)
         cutoff_pos = max(1, min(cutoff_pos, len(df) - 1))
         history_df = df.iloc[:cutoff_pos]
         unseen_df = df.iloc[cutoff_pos:]
         self.logger.warning(
             f"Panel {panel_id}: model lacks training boundary metadata; "
-            f"using config split fallback (train={split.train}%, test={split.test}%). "
+            f"using config split fallback (train={split.train}%, val={split.val}%). "
             "Re-train models to persist precise leakage boundary."
         )
         return history_df, unseen_df
