@@ -33,6 +33,13 @@ SPDX-FileCopyrightText = "2026 bartzbeielstein"
 SPDX-License-Identifier = "AGPL-3.0-or-later"
 
 [[annotations]]
+path = [".releaserc.json", "CHANGELOG.md"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 bartzbeielstein"
+SPDX-License-Identifier = "AGPL-3.0-or-later"
+SPDX-FileComment = "semantic-release config and its generated changelog (no inline-comment support)."
+
+[[annotations]]
 path = "PREPROCESSING_ISSUES.md"
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 bartzbeielstein"
