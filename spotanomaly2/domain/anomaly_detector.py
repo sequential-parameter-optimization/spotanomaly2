@@ -159,6 +159,33 @@ class AnomalyDetector:
             )
         return test_start_idx, test_end_idx
 
+    def _resolve_scorer_fit_scope(self) -> str:
+        """Resolve which rows the scorer is allowed to learn its baseline from.
+
+        Controlled by ``detect.scorer_fit_scope``:
+
+        - ``"unseen"`` (default): leakage-guarded. The scorer fits only on data
+          held out from BOTH the forecaster's training and the tuner's
+          hyperparameter selection — i.e. the configured ``train.split.test``
+          window. Forecast residuals there are genuine out-of-sample, so the
+          learned "normal" distribution is unbiased and detection rates are
+          honest.
+        - ``"all"``: the scorer fits on the entire dataset (train + val + test).
+          Residuals over the forecaster's training rows are optimistically
+          small (in-sample fit), which shrinks the learned "normal" spread and
+          can mask true anomalies. Use for comparison/diagnostics only, not
+          production monitoring.
+
+        ``"test"`` and ``"held_out"`` are accepted aliases for ``"unseen"``;
+        ``"full"`` is an alias for ``"all"``.
+        """
+        raw = str(self.config.get("detect", {}).get("scorer_fit_scope", "unseen")).strip().lower()
+        if raw in ("unseen", "test", "held_out", "held-out"):
+            return "unseen"
+        if raw in ("all", "full"):
+            return "all"
+        raise ValueError(f"detect.scorer_fit_scope must be 'unseen' or 'all', got {raw!r}")
+
     def _split_unseen_scoring_data(
         self,
         panel_id: str,
@@ -173,7 +200,11 @@ class AnomalyDetector:
         the configured ``train.split.test`` window — everything before is
         "seen by the pipeline", everything from there on is "unseen".
 
-        Lookup precedence:
+        When ``detect.scorer_fit_scope`` is ``"all"`` the leakage guard is
+        disabled: the whole dataset is returned as "unseen" so the scorer can
+        learn from train + val + test data (see :meth:`_resolve_scorer_fit_scope`).
+
+        Lookup precedence (``"unseen"`` scope only):
           1. ``test_start_timestamp`` (preferred — written by current trainer)
           2. ``train_end_timestamp`` (legacy — points at the old train/test
              boundary; less strict because the tuner also CV'd on val%, but
@@ -182,6 +213,18 @@ class AnomalyDetector:
           4. Config-based fallback using ``train.split`` percentages.
         """
         if len(df) == 0:
+            return df.iloc[0:0], df
+
+        # Scope "all": skip the leakage guard entirely and let the scorer fit on
+        # every row. history_df is empty so detect_panel treats the full dataset
+        # as the scorer-fit/eval pool.
+        if self._resolve_scorer_fit_scope() == "all":
+            self.logger.warning(
+                f"Panel {panel_id}: detect.scorer_fit_scope='all' — leakage guard DISABLED. "
+                f"Scorer fits on all {len(df)} row(s), including forecaster-training data. "
+                f"The normal-residual baseline is optimistically biased; use for "
+                f"comparison/diagnostics only, not production monitoring."
+            )
             return df.iloc[0:0], df
 
         # Preferred: explicit test-window boundary persisted with the model.

@@ -176,9 +176,9 @@ train:
     "2": "config/channel_models/panel_2_default.yaml"
 
 detect:
-  hist_window: 2016
+  hist_window: 8640
   target_date: null
-  high_quantile: 0.995
+  high_quantile: 0.9999
   fail_on_nan_inputs: true
   # NormScorer with ord=4 was the highest-PR-AUC scorer across 5 seeds in an
   # offline scorer benchmark, and is two orders of magnitude faster to fit
@@ -187,14 +187,24 @@ detect:
   # want a different scoring style — the params block below carries
   # per-scorer kwargs and pipeline.py whitelists them per scorer.
   scorer_name: "NormScorer"
+  # Which rows the scorer learns its "normal residual" baseline from.
+  #   "unseen" (default): leakage-guarded — the scorer fits ONLY on the held-out
+  #            test split (data unseen by both the forecaster trainer and the
+  #            tuner). Residuals there are genuine out-of-sample, so the baseline
+  #            is unbiased and detection rates are honest.
+  #   "all":   the scorer fits on the entire dataset (train + val + test).
+  #            Residuals over the forecaster's training rows are optimistically
+  #            small (in-sample fit), which shrinks the learned spread and can
+  #            mask anomalies. Use for comparison/diagnostics only.
+  scorer_fit_scope: "unseen"
   scorer_params:
     # NormScorer
     ord: 4
     # KMeansScorer params (used when scorer_name is KMeansScorer)
     window: 1
-    n_clusters: 3
+    n_clusters: 2
     auto_select_k: true
-    k_min: 2
+    k_min: 1
     k_max: 10
     elbow_method: "silhouette"  # "second_derivative", "silhouette", "kneedle"
     n_init: 10

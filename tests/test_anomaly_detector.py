@@ -248,6 +248,39 @@ class TestSplitUnseenScoringData:
         assert len(history) == 0
         assert len(unseen) == 0
 
+    def test_scope_all_disables_leakage_guard(self, sample_config):
+        """``scorer_fit_scope='all'`` returns the whole dataset as unseen,
+        ignoring the leakage-boundary metadata entirely."""
+        df = self._make_df()
+        sample_config.setdefault("detect", {})["scorer_fit_scope"] = "all"
+        # Even with a strict test-start boundary present, scope=all overrides it.
+        model_data = {"test_start_timestamp": df.index[180]}
+        history, unseen = AnomalyDetector(sample_config)._split_unseen_scoring_data("1", df, model_data)
+        assert len(history) == 0
+        assert len(unseen) == len(df)
+
+    def test_scope_test_is_alias_for_unseen(self, sample_config):
+        """``"test"`` is accepted as an alias for the guarded ``"unseen"`` scope."""
+        df = self._make_df()
+        sample_config.setdefault("detect", {})["scorer_fit_scope"] = "test"
+        model_data = {"test_start_timestamp": df.index[180]}
+        history, unseen = AnomalyDetector(sample_config)._split_unseen_scoring_data("1", df, model_data)
+        assert len(history) == 180
+        assert len(unseen) == 20
+
+    def test_scope_default_is_unseen(self, sample_config):
+        """No config key → guarded behaviour (back-compat)."""
+        df = self._make_df()
+        model_data = {"test_start_timestamp": df.index[180]}
+        history, unseen = AnomalyDetector(sample_config)._split_unseen_scoring_data("1", df, model_data)
+        assert len(history) == 180
+        assert len(unseen) == 20
+
+    def test_invalid_scope_raises(self, sample_config):
+        sample_config.setdefault("detect", {})["scorer_fit_scope"] = "bogus"
+        with pytest.raises(ValueError, match="scorer_fit_scope"):
+            AnomalyDetector(sample_config)._resolve_scorer_fit_scope()
+
 
 # ---------------------------------------------------------------------------
 # _validate_scoring_inputs
