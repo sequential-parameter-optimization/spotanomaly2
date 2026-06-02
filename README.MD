@@ -1,103 +1,137 @@
-# SpotAnomaly
+# SpotAnomaly2
 
-Streamlined anomaly detection system for time series data with dual training paradigms (batch and online learning).
+Forecast-based anomaly detection for multi-channel time-series data. Each channel is
+forecast by a per-channel model; residuals between forecast and actual are scored, and
+points whose residuals exceed a calibrated threshold are flagged as anomalies. The same
+pipeline runs as a one-shot batch job or as a long-running live monitor.
 
 ## Requirements
 
-- Python 3.10 or higher
-- [uv](https://docs.astral.sh/uv/) package manager (recommended)
+- Python **3.13+** (`uv` installs a matching interpreter for you; `.python-version` pins it)
+- [uv](https://docs.astral.sh/uv/) package manager
 
 ## Installation
-
-### Using uv (Recommended)
 
 Install uv:
 
 ```bash
 # macOS/Linux
 curl -LsSf https://astral.sh/uv/install.sh | sh
-
 # Homebrew
 brew install uv
-
 # Windows
 powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
 
-Set up the project:
+Set up the project (creates the virtualenv and installs everything):
 
 ```bash
-uv sync
+uv sync                 # runtime dependencies
+uv sync --all-groups    # + dev tools (ruff, ty, reuse, pytest, jupyter)
 ```
 
-This command automatically installs Python 3.11, creates a virtual environment, and installs all dependencies.
+## Repository layout
 
-### Using pip
+```
+spotanomaly2/           # package
+  application/          # config loading + Pipeline orchestration
+  domain/               # forecasting, anomaly detection, model training
+  infrastructure/       # logging, IO, adapters
+  dashboard/            # live monitor + HTML report server
+  examples/
+  __main__.py → main.py # CLI entry point
+config/                 # default.yaml (bundled default) + config.yaml
+tests/                  # pytest suite
+notebooks/              # exploratory analysis notebooks
+data/                   # raw / processed / models / results (generated)
+```
+
+## Configuration
+
+The CLI loads [config/default.yaml](config/default.yaml) unless you pass `--config`:
 
 ```bash
-python3.11 -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-pip install -e .
+uv run python -m spotanomaly2 detect --config ./config/config.yaml
 ```
+
+Key sections in the config: `panels` (channels per panel), `paths` (data/model/result
+dirs), `fetch` / `process` (download & preprocessing), `train` (split + per-channel
+models), `detect` (`hist_window`, threshold, `scorer_fit_scope`), `tune` (SpotOptim
+hyperparameter search) and `report` (live HTML output). See `default.yaml` for the full,
+commented schema.
 
 ## Usage
 
-### Configuration
+Run via the module (`python -m spotanomaly2 <command>`); an installed console script
+named `spotanomaly2` is also available (e.g. `uv run spotanomaly2 detect`).
 
-Choose your training paradigm in `config/default.yaml`:
+| Command | What it does |
+|---|---|
+| `download` | Fetch raw data from the configured API and save as Parquet |
+| `process`  | Convert, resample and preprocess raw data |
+| `tune`     | Search per-channel forecaster hyperparameters with SpotOptim (optional) |
+| `train`    | Train per-channel forecasting models |
+| `detect`   | Score residuals with a trained model and flag anomalies |
+| `live`     | Download → process → predict with an existing model (no training) |
 
-```yaml
-model:
-  paradigm: "batch"  # or "online"
-```
-
-- **batch**: Traditional batch training with sklearn/LightGBM (faster, trains once)
-- **online**: Streaming online learning with river (incremental updates)
-
-### Running the Pipeline
-
-Run all steps a first time:
+Typical end-to-end run:
 
 ```bash
-uv run python -m src all
+uv run python -m spotanomaly2 download
+uv run python -m spotanomaly2 process
+uv run python -m spotanomaly2 tune      # optional
+uv run python -m spotanomaly2 train
+uv run python -m spotanomaly2 detect
 ```
 
-Run all steps but skip the download:
+Useful options:
 
 ```bash
-uv run python -m src all --skip-download
+# Run any step against a specific config
+uv run python -m spotanomaly2 process --config ./config/config.yaml
+
+# Detect with a specific trained model (default: most recent)
+uv run python -m spotanomaly2 detect --model 20250115_143022
+
+# Pin the raw-data version used by process / train / detect (default: most recent)
+uv run python -m spotanomaly2 train --raw-data-version 20260105_174531
+
+# Tune a single panel/channel, overriding trial counts
+uv run python -m spotanomaly2 tune --panel 1 --channel channel_1_ph --n-trials 50 --n-initial 10
 ```
 
-Or run individual steps:
+Run `uv run python -m spotanomaly2 <command> --help` for the full option list of any command.
+
+### Live monitoring
+
+Run once, or continuously every N minutes:
 
 ```bash
-uv run python -m src process  # Process raw data
-uv run python -m src train    # Train forecasting models
-uv run python -m src detect   # Detect anomalies
+uv run python -m spotanomaly2 live                 # single pass, then exit
+uv run python -m spotanomaly2 live --interval 5    # re-run every 5 minutes
 ```
 
-Run predictions with a pre-trained model:
+Live mode serves an auto-updating report at [data/results/live/report.html](data/results/live/report.html).
 
-```bash
-uv run python -m src all --predict-only --model 20251229_172126
-```
+### Analyzing results
 
-### Viewing the result
-You can explore, chart, and analyze the processed and modeled data interactively in [notebooks/analyze_combined.ipynb](notebooks/analyze_combined.ipynb).
-
-
-### Running live mode
-
-```bash
-uv run python -m src live --interval 5
-```
-
-Then open [the live report](data/results/live/report.html)
+Explore processed data, forecasts and detected anomalies interactively in
+[notebooks/analyze_combined.ipynb](notebooks/analyze_combined.ipynb) and the other
+notebooks under [notebooks/](notebooks/).
 
 ## Development
 
-Install with development dependencies:
-
 ```bash
-uv sync --all-extras
+uv sync --all-groups        # install dev tools
+
+uv run ruff check .         # lint
+uv run ruff format .        # format
+uv run ty check .           # type-check
+uv run reuse lint           # SPDX/license headers
+uv run pytest               # tests
 ```
+
+## License
+
+AGPL-3.0-or-later. This project is [REUSE](https://reuse.software/)-compliant — every
+source file carries an SPDX header (see [REUSE.toml](REUSE.toml) and [LICENSES/](LICENSES/)).
