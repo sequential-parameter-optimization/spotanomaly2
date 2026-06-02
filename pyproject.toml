@@ -7,7 +7,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "spotanomaly2"
-version = "2.0.0"
+version = "2.1.0"
 description = "Streamlined anomaly detection system for time series data"
 readme = "README.MD"
 requires-python = ">=3.13"
