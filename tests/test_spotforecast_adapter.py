@@ -350,7 +350,7 @@ class TestSpotforecastTuner:
         config["train"]["lags"] = 6
         tuner = SpotforecastTuner(config)
         # Capture the OneStepAheadFold that the tuner actually builds.
-        from spotforecast2.model_selection import OneStepAheadFold
+        from spotforecast2_safe.splitter import OneStepAheadFold
 
         captured: dict = {}
         real_init = OneStepAheadFold.__init__
@@ -445,9 +445,9 @@ class TestSpotforecastTuner:
         from sklearn.linear_model import Ridge
         from sklearn.metrics import r2_score
         from sklearn.preprocessing import StandardScaler
-        from spotforecast2.model_selection import OneStepAheadFold
         from spotforecast2_safe.forecaster.recursive import ForecasterRecursive
         from spotforecast2_safe.forecaster.utils import transform_numpy
+        from spotforecast2_safe.splitter import OneStepAheadFold
 
         from spotanomaly2.domain.spotforecast_adapter import (
             _build_raw_r2_under_differentiation,

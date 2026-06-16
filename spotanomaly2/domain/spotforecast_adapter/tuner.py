@@ -61,7 +61,7 @@ class SpotforecastTuner:
         best_model, model_scores}``. ``model_scores`` is a sub-dict per
         candidate model so callers can compare them, not just the winner.
         """
-        from spotforecast2.model_selection import OneStepAheadFold
+        from spotforecast2_safe.splitter import OneStepAheadFold
         from tqdm.auto import tqdm
 
         train_settings = resolve_train_settings(self.config)
