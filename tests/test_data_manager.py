@@ -159,13 +159,7 @@ class TestSaveDetectionResults:
         flags = pd.DataFrame({"sensor_a": np.zeros(n, dtype=int)}, index=idx)
         forecast = pd.DataFrame({"sensor_a": np.linspace(10, 11, n)}, index=idx)
         contributions = pd.DataFrame({"contrib_a": np.linspace(0, 0.1, n)}, index=idx)
-        per_channel = {
-            "scores": pd.DataFrame({"sensor_a": np.linspace(0, 1, n)}, index=idx),
-            "flags": pd.DataFrame({"sensor_a": np.zeros(n, dtype=int)}, index=idx),
-            "flags_combined": pd.DataFrame({"sensor_a": np.zeros(n, dtype=int)}, index=idx),
-            "thresholds": pd.DataFrame({"sensor_a": np.full(n, 0.99)}, index=idx),
-        }
-        return scores, flags, forecast, contributions, per_channel
+        return scores, flags, forecast, contributions
 
     def test_writes_all_files_in_timestamped_dir(self, dm_workspace):
         config, paths = dm_workspace
@@ -179,10 +173,6 @@ class TestSaveDetectionResults:
         assert (out_dir / "panel_1_flags.csv").exists()
         assert (out_dir / "panel_1_forecast.csv").exists()
         assert (out_dir / "panel_1_contributions.parquet").exists()
-        assert (out_dir / "panel_1_per_channel_scores.csv").exists()
-        assert (out_dir / "panel_1_per_channel_flags.csv").exists()
-        assert (out_dir / "panel_1_per_channel_flags_combined.csv").exists()
-        assert (out_dir / "panel_1_per_channel_thresholds.csv").exists()
 
     def test_live_mode_uses_live_subdir(self, dm_workspace):
         config, paths = dm_workspace
@@ -197,24 +187,14 @@ class TestSaveDetectionResults:
     def test_omits_contributions_when_none(self, dm_workspace):
         config, paths = dm_workspace
         dm = DataManager(config)
-        scores, flags, forecast, _contrib, per_ch = self._build_results()
-        results = {"1": (scores, flags, forecast, None, per_ch)}
+        scores, flags, forecast, _contrib = self._build_results()
+        results = {"1": (scores, flags, forecast, None)}
 
         out_dir = dm.save_detection_results(results, timestamp="20250101_120000")
 
         assert not (out_dir / "panel_1_contributions.parquet").exists()
-
-    def test_omits_per_channel_when_none(self, dm_workspace):
-        config, paths = dm_workspace
-        dm = DataManager(config)
-        scores, flags, forecast, contrib, _per_ch = self._build_results()
-        results = {"1": (scores, flags, forecast, contrib, None)}
-
-        out_dir = dm.save_detection_results(results, timestamp="20250101_120000")
-
-        # Scores still present, per_channel sidecars absent.
+        # Core sidecars still present.
         assert (out_dir / "panel_1_scores.csv").exists()
-        assert not (out_dir / "panel_1_per_channel_scores.csv").exists()
 
 
 # ---------------------------------------------------------------------------

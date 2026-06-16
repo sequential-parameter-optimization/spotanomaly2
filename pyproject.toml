@@ -105,7 +105,7 @@ target-version = ["py310", "py311", "py312"]
 convention = 'google'
 
 [tool.uv.sources]
-spotanomaly2_safe = { git = "https://github.com/sequential-parameter-optimization/spotanomaly2-safe.git" }
+spotanomaly2_safe = { path = "../spotanomaly2-safe", editable = true }  # local checkout (ECOD scorer added)
 spotforecast2 = { git = "https://github.com/sequential-parameter-optimization/spotforecast2.git" }
 spotforecast2-safe = { git = "https://github.com/sequential-parameter-optimization/spotforecast2-safe.git" }
 # For local development, uncomment the lines below and comment out the git sources above:

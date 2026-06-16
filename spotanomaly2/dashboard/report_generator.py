@@ -543,41 +543,6 @@ class LiveReportGenerator:
                     data_age_seconds=panel_age,
                 )
 
-                # --- Per-channel anomaly detection results ---
-                pc_scores_file = results_dir / f"panel_{panel_id}_per_channel_scores.csv"
-                pc_flags_file = results_dir / f"panel_{panel_id}_per_channel_flags.csv"
-                pc_thresholds_file = results_dir / f"panel_{panel_id}_per_channel_thresholds.csv"
-                pc_combined_file = results_dir / f"panel_{panel_id}_per_channel_flags_combined.csv"
-
-                if all(f.exists() for f in [pc_scores_file, pc_flags_file, pc_thresholds_file, pc_combined_file]):
-                    try:
-                        df_pc_scores = pd.read_csv(pc_scores_file, index_col=0, parse_dates=True)
-                        df_pc_flags = pd.read_csv(pc_flags_file, index_col=0, parse_dates=True)
-                        df_pc_thresholds = pd.read_csv(pc_thresholds_file, index_col=0)
-                        df_pc_combined = pd.read_csv(pc_combined_file, index_col=0, parse_dates=True)
-
-                        # Apply report timezone
-                        df_pc_scores = self._apply_report_timezone_to_index(df_pc_scores)
-                        df_pc_flags = self._apply_report_timezone_to_index(df_pc_flags)
-                        df_pc_combined = self._apply_report_timezone_to_index(df_pc_combined)
-
-                        # Filter to lookback window
-                        if len(df_pc_scores) > 0:
-                            df_pc_scores = df_pc_scores[df_pc_scores.index >= start_date]
-                            df_pc_flags = df_pc_flags[df_pc_flags.index >= start_date]
-                            df_pc_combined = df_pc_combined[df_pc_combined.index >= start_date]
-
-                        figures[f"panel{panel_id}_per_channel"] = self._create_per_channel_scores_plot(
-                            panel_id,
-                            df_pc_scores,
-                            df_pc_flags,
-                            df_pc_thresholds,
-                            df_pc_combined,
-                        )
-                        self.logger.info(f"Panel {panel_id}: created per-channel scores plot")
-                    except Exception as e:
-                        self.logger.warning(f"Panel {panel_id}: failed to create per-channel plot: {e}")
-
             except Exception as e:
                 self.logger.error(f"Error creating plots for panel {panel_id}: {e}", exc_info=True)
                 continue
@@ -1017,152 +982,6 @@ class LiveReportGenerator:
                 row=i,
                 col=1,
             )
-
-        return fig
-
-    def _create_per_channel_scores_plot(
-        self,
-        panel_id: str,
-        df_pc_scores: pd.DataFrame,
-        df_pc_flags: pd.DataFrame,
-        df_pc_thresholds: pd.DataFrame,
-        df_pc_flags_combined: pd.DataFrame,
-    ) -> go.Figure:
-        """Create per-channel anomaly scores plot.
-
-        Shows each channel's absolute residual as its own subplot. A top-level
-        subplot shows the combined per-channel flag.
-
-        Args:
-            panel_id: Panel identifier
-            df_pc_scores: Per-channel absolute residuals (n_eval, n_channels)
-            df_pc_flags: Per-channel binary flags (unused; kept for caller compat)
-            df_pc_thresholds: Fitted thresholds (unused; kept for caller compat)
-            df_pc_flags_combined: Combined per-channel flag (n_eval, 1)
-
-        Returns:
-            Plotly figure
-        """
-        channels = df_pc_scores.columns.tolist()
-        n_channels = len(channels)
-
-        # First row = combined per-channel flag timeline, then one row per channel
-        n_rows = 1 + n_channels
-        subplot_titles = ["Per-Channel Anomaly (combined)"] + [c for c in channels]
-
-        fig = make_subplots(
-            rows=n_rows,
-            cols=1,
-            shared_xaxes=True,
-            vertical_spacing=0.03,
-            subplot_titles=subplot_titles,
-            row_heights=[0.8] + [1.0] * n_channels,
-        )
-
-        # --- Row 1: combined per-channel flag as filled area (0/1) ---
-        combined_vals = df_pc_flags_combined["per_channel_anomaly_flag"].tolist()
-        fig.add_trace(
-            go.Scatter(
-                x=df_pc_flags_combined.index.tolist(),
-                y=combined_vals,
-                mode="lines",
-                fill="tozeroy",
-                fillcolor="rgba(169, 15, 18, 0.35)",
-                line=dict(color=COLORS["anomaly_marker"], width=1),
-                name="Per-channel flag",
-                showlegend=True,
-                hovertemplate="<b>Per-Channel Flag</b><br>Time: %{x}<br>Flag: %{y}<extra></extra>",
-            ),
-            row=1,
-            col=1,
-        )
-        fig.update_yaxes(range=[-0.1, 1.1], tickvals=[0, 1], ticktext=["OK", "Anomaly"], row=1, col=1)
-
-        # Palette for channels
-        channel_colors = [
-            "#5EA6E1",
-            "#F5A623",
-            "#7ED321",
-            "#D0021B",
-            "#9013FE",
-            "#50E3C2",
-            "#E8537A",
-            "#B8E986",
-            "#4A90D9",
-            "#F8E71C",
-        ]
-
-        # --- Rows 2..n: per-channel absolute residuals ---
-        for i, col in enumerate(channels):
-            row_idx = i + 2
-            color = channel_colors[i % len(channel_colors)]
-
-            # Residual line
-            fig.add_trace(
-                go.Scatter(
-                    x=df_pc_scores.index.tolist(),
-                    y=df_pc_scores[col].tolist(),
-                    mode="lines",
-                    name=col,
-                    line=dict(color=color, width=1.5),
-                    showlegend=True,
-                    legendgroup=col,
-                    hovertemplate=f"<b>{col}</b><br>Time: %{{x}}<br>|Residual|: %{{y:.4f}}<extra></extra>",
-                ),
-                row=row_idx,
-                col=1,
-            )
-
-            # Y-axis unit
-            unit = self._get_channel_unit(col)
-            if unit:
-                fig.update_yaxes(title_text=f"|Residual| ({unit})", row=row_idx, col=1)
-
-        # Layout
-        fig.update_layout(
-            height=max(600, 180 * n_rows),
-            title={
-                "text": (
-                    f"Panel {panel_id}: Per-Channel Anomaly Scores"
-                    "<br><sub>Each channel scored independently against its own quantile threshold</sub>"
-                ),
-                "x": 0.5,
-                "xanchor": "center",
-                "font": {"size": 20, "color": COLORS["line"]},
-            },
-            hovermode="x unified",
-            plot_bgcolor=COLORS["background"],
-            paper_bgcolor=COLORS["background"],
-            font=dict(color="white"),
-            showlegend=True,
-            legend=dict(
-                yanchor="top",
-                y=0.99,
-                xanchor="left",
-                x=1.02,
-                bgcolor="rgba(0, 0, 0, 0.5)",
-                bordercolor=COLORS["border"],
-                borderwidth=1,
-            ),
-        )
-
-        # Update all axes styling
-        for r in range(1, n_rows + 1):
-            fig.update_xaxes(
-                gridcolor="rgba(128, 128, 128, 0.15)",
-                linecolor=COLORS["border"],
-                row=r,
-                col=1,
-            )
-            fig.update_yaxes(
-                gridcolor="rgba(128, 128, 128, 0.15)",
-                linecolor=COLORS["border"],
-                row=r,
-                col=1,
-            )
-
-        # X-axis label on the bottom only
-        fig.update_xaxes(title_text="Timestamp", row=n_rows, col=1)
 
         return fig
 
@@ -1884,38 +1703,15 @@ class LiveReportGenerator:
             <div class="space-y-8">
 {panel_stale_html}"""
 
-            # Add anomaly scores section with toggle between combined and per-channel
+            # Add anomaly scores section (combined system / grouped score)
             has_combined = f"{panel_key_prefix}normalized" in panel_figures
-            has_per_channel = f"{panel_key_prefix}per_channel" in panel_figures
 
-            if has_combined or has_per_channel:
-                # Toggle buttons (only shown when both views are available)
-                toggle_html = ""
-                if has_combined and has_per_channel:
-                    toggle_html = f"""
-                    <div class="flex gap-2 mb-3">
-                        <button id="btn_{panel_key_prefix}combined" onclick="toggleScoringView('{panel_id}', 'combined')" class="px-4 py-1.5 text-sm font-semibold rounded border-2 border-custom-line bg-custom-line/20 text-custom-line">Combined Score</button>
-                        <button id="btn_{panel_key_prefix}per_channel" onclick="toggleScoringView('{panel_id}', 'per_channel')" class="px-4 py-1.5 text-sm font-semibold rounded border-2 border-gray-600 text-gray-400 hover:border-gray-400">Per-Channel Scores</button>
-                    </div>"""
-
+            if has_combined:
                 html_content += f"""                <div class="bg-gray-900 rounded-lg p-4 border border-gray-800">
-                    <h3 class="text-lg font-semibold mb-3 text-custom-line">Anomaly Scores</h3>{toggle_html}"""
-
-                if has_combined:
-                    html_content += f"""
+                    <h3 class="text-lg font-semibold mb-3 text-custom-line">Anomaly Scores</h3>
                     <div id="view_{panel_key_prefix}combined">
                         <div id="{panel_key_prefix}normalized"></div>
-                    </div>"""
-
-                if has_per_channel:
-                    # Hidden by default if combined is also available
-                    display_style = ' style="display:none;"' if has_combined else ""
-                    html_content += f"""
-                    <div id="view_{panel_key_prefix}per_channel"{display_style}>
-                        <div id="{panel_key_prefix}per_channel"></div>
-                    </div>"""
-
-                html_content += """
+                    </div>
                 </div>
 """
 
@@ -2048,35 +1844,6 @@ class LiveReportGenerator:
                 options.timeZone = reportTimezone;
             }
             return dateValue.toLocaleString('en-US', options);
-        }
-
-        // Toggle between combined and per-channel scoring views
-        function toggleScoringView(panelId, view) {
-            const prefix = 'panel' + panelId + '_';
-            const combinedView = document.getElementById('view_' + prefix + 'combined');
-            const perChannelView = document.getElementById('view_' + prefix + 'per_channel');
-            const btnCombined = document.getElementById('btn_' + prefix + 'combined');
-            const btnPerChannel = document.getElementById('btn_' + prefix + 'per_channel');
-
-            const activeClasses = 'border-custom-line bg-custom-line/20 text-custom-line';
-            const inactiveClasses = 'border-gray-600 text-gray-400 hover:border-gray-400';
-
-            if (view === 'combined') {
-                if (combinedView) combinedView.style.display = '';
-                if (perChannelView) perChannelView.style.display = 'none';
-                if (btnCombined) { btnCombined.className = 'px-4 py-1.5 text-sm font-semibold rounded border-2 ' + activeClasses; }
-                if (btnPerChannel) { btnPerChannel.className = 'px-4 py-1.5 text-sm font-semibold rounded border-2 ' + inactiveClasses; }
-            } else {
-                if (combinedView) combinedView.style.display = 'none';
-                if (perChannelView) perChannelView.style.display = '';
-                if (btnCombined) { btnCombined.className = 'px-4 py-1.5 text-sm font-semibold rounded border-2 ' + inactiveClasses; }
-                if (btnPerChannel) { btnPerChannel.className = 'px-4 py-1.5 text-sm font-semibold rounded border-2 ' + activeClasses; }
-                // Trigger Plotly relayout so chart renders correctly after being unhidden
-                const plotEl = document.getElementById(prefix + 'per_channel');
-                if (plotEl && plotEl.data) {
-                    Plotly.Plots.resize(plotEl);
-                }
-            }
         }
 
         // Show info message

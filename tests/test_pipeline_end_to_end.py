@@ -101,7 +101,7 @@ def test_train_then_detect_end_to_end(e2e_config, tmp_path):
     results = pipeline.detect()
     assert set(results) == {"1"}
 
-    scores_df, flags_df, pred_df, _contributions, _per_channel = results["1"]
+    scores_df, flags_df, pred_df, _contributions = results["1"]
 
     # Scores are present and finite (no NaN/Inf leaking through the seam).
     assert "anomaly_score_normalized" in scores_df.columns
@@ -126,7 +126,7 @@ def test_injected_spike_is_flagged_end_to_end(e2e_config):
     pipeline.train()
     results = pipeline.detect()
 
-    _scores, flags_df, _pred, _contrib, _pc = results["1"]
+    _scores, flags_df, _pred, _contrib = results["1"]
     assert int(flags_df["anomaly_flag"].sum()) >= 1, "blatant injected spike was not flagged"
 
 
