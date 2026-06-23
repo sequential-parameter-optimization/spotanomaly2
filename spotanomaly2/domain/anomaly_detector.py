@@ -47,11 +47,18 @@ class AnomalyDetector:
 
         raise ModelNotFoundException(f"Could not load model from {model_file}. Unknown format.")
 
-    def build_anomaly_detector(self) -> ForecastingAnomalyDetector:
-        """Build anomaly detector from configuration."""
+    def build_anomaly_detector(self, high_quantile: float | None = None) -> ForecastingAnomalyDetector:
+        """Build anomaly detector from configuration.
+
+        Args:
+            high_quantile: Detection quantile to use. When ``None`` (default) the
+                configured ``detect.high_quantile`` is used. Group scoring passes
+                a Bonferroni-corrected quantile here (see :meth:`_score_grouped`).
+        """
         scorer_name = self.config["detect"]["scorer_name"]
         scorer_params = self.config["detect"]["scorer_params"].copy()
-        high_quantile = self.config["detect"]["high_quantile"]
+        if high_quantile is None:
+            high_quantile = self.config["detect"]["high_quantile"]
 
         normalize_scores = self.config["detect"].get("normalize_scores", True)
         normalization_quantile = self.config["detect"].get("normalization_quantile", 0.99)
@@ -159,6 +166,33 @@ class AnomalyDetector:
             )
         return test_start_idx, test_end_idx
 
+    def _resolve_scorer_fit_scope(self) -> str:
+        """Resolve which rows the scorer is allowed to learn its baseline from.
+
+        Controlled by ``detect.scorer_fit_scope``:
+
+        - ``"unseen"`` (default): leakage-guarded. The scorer fits only on data
+          held out from BOTH the forecaster's training and the tuner's
+          hyperparameter selection — i.e. the configured ``train.split.test``
+          window. Forecast residuals there are genuine out-of-sample, so the
+          learned "normal" distribution is unbiased and detection rates are
+          honest.
+        - ``"all"``: the scorer fits on the entire dataset (train + val + test).
+          Residuals over the forecaster's training rows are optimistically
+          small (in-sample fit), which shrinks the learned "normal" spread and
+          can mask true anomalies. Use for comparison/diagnostics only, not
+          production monitoring.
+
+        ``"test"`` and ``"held_out"`` are accepted aliases for ``"unseen"``;
+        ``"full"`` is an alias for ``"all"``.
+        """
+        raw = str(self.config.get("detect", {}).get("scorer_fit_scope", "unseen")).strip().lower()
+        if raw in ("unseen", "test", "held_out", "held-out"):
+            return "unseen"
+        if raw in ("all", "full"):
+            return "all"
+        raise ValueError(f"detect.scorer_fit_scope must be 'unseen' or 'all', got {raw!r}")
+
     def _split_unseen_scoring_data(
         self,
         panel_id: str,
@@ -170,13 +204,17 @@ class AnomalyDetector:
         The scorer must not be fit on rows the trainer OR tuner saw, otherwise
         hyperparameters chosen on those rows bias the residual distribution
         the scorer learns. The boundary the scorer cares about is the start of
-        the configured ``train.split.score`` window — everything before is
+        the configured ``train.split.test`` window — everything before is
         "seen by the pipeline", everything from there on is "unseen".
 
-        Lookup precedence:
-          1. ``score_start_timestamp`` (preferred — written by current trainer)
+        When ``detect.scorer_fit_scope`` is ``"all"`` the leakage guard is
+        disabled: the whole dataset is returned as "unseen" so the scorer can
+        learn from train + val + test data (see :meth:`_resolve_scorer_fit_scope`).
+
+        Lookup precedence (``"unseen"`` scope only):
+          1. ``test_start_timestamp`` (preferred — written by current trainer)
           2. ``train_end_timestamp`` (legacy — points at the old train/test
-             boundary; less strict because the tuner also CV'd on test%, but
+             boundary; less strict because the tuner also CV'd on val%, but
              still the best signal an older artifact carries)
           3. ``train_size`` (older still)
           4. Config-based fallback using ``train.split`` percentages.
@@ -184,25 +222,37 @@ class AnomalyDetector:
         if len(df) == 0:
             return df.iloc[0:0], df
 
-        # Preferred: explicit score-window boundary persisted with the model.
-        score_start_timestamp = model_data.get("score_start_timestamp")
-        if score_start_timestamp and isinstance(df.index, pd.DatetimeIndex):
-            cutoff = self._align_timestamp_to_index(pd.Timestamp(score_start_timestamp), df)
+        # Scope "all": skip the leakage guard entirely and let the scorer fit on
+        # every row. history_df is empty so detect_panel treats the full dataset
+        # as the scorer-fit/eval pool.
+        if self._resolve_scorer_fit_scope() == "all":
+            self.logger.warning(
+                f"Panel {panel_id}: detect.scorer_fit_scope='all' — leakage guard DISABLED. "
+                f"Scorer fits on all {len(df)} row(s), including forecaster-training data. "
+                f"The normal-residual baseline is optimistically biased; use for "
+                f"comparison/diagnostics only, not production monitoring."
+            )
+            return df.iloc[0:0], df
+
+        # Preferred: explicit test-window boundary persisted with the model.
+        test_start_timestamp = model_data.get("test_start_timestamp")
+        if test_start_timestamp and isinstance(df.index, pd.DatetimeIndex):
+            cutoff = self._align_timestamp_to_index(pd.Timestamp(test_start_timestamp), df)
             history_df = df.loc[df.index < cutoff]
             unseen_df = df.loc[df.index >= cutoff]
             if len(unseen_df) == 0:
                 raise InsufficientDataException(
-                    f"Panel {panel_id}: no unseen rows at or after the score boundary "
-                    f"({cutoff}). Need new data beyond the score window for scoring."
+                    f"Panel {panel_id}: no unseen rows at or after the test boundary "
+                    f"({cutoff}). Need new data beyond the test window for scoring."
                 )
             self.logger.info(
-                f"Panel {panel_id}: leakage guard active using score_start={cutoff}. "
+                f"Panel {panel_id}: leakage guard active using test_start={cutoff}. "
                 f"Excluded {len(history_df)} pipeline-seen row(s); "
                 f"{len(unseen_df)} unseen row(s) remain for scoring."
             )
             return history_df, unseen_df
 
-        # Legacy: older artifacts predate the score-window split; the strictest
+        # Legacy: older artifacts predate the held-out test split; the strictest
         # boundary they carry is the trainer's old train_end.
         train_end_timestamp = model_data.get("train_end_timestamp")
         if train_end_timestamp and isinstance(df.index, pd.DatetimeIndex):
@@ -215,7 +265,7 @@ class AnomalyDetector:
                     f"({cutoff}). Need new data beyond training period for leakage-free scoring."
                 )
             self.logger.warning(
-                f"Panel {panel_id}: model has no score_start_timestamp; using legacy "
+                f"Panel {panel_id}: model has no test_start_timestamp; using legacy "
                 f"train_end={cutoff} as boundary. Re-train to get the stricter split-based boundary."
             )
             return history_df, unseen_df
@@ -234,13 +284,13 @@ class AnomalyDetector:
         from spotanomaly2.application.config import resolve_data_split
 
         split = resolve_data_split(self.config)
-        cutoff_pos = int(len(df) * (split.train + split.test) / 100)
+        cutoff_pos = int(len(df) * (split.train + split.val) / 100)
         cutoff_pos = max(1, min(cutoff_pos, len(df) - 1))
         history_df = df.iloc[:cutoff_pos]
         unseen_df = df.iloc[cutoff_pos:]
         self.logger.warning(
             f"Panel {panel_id}: model lacks training boundary metadata; "
-            f"using config split fallback (train={split.train}%, test={split.test}%). "
+            f"using config split fallback (train={split.train}%, val={split.val}%). "
             "Re-train models to persist precise leakage boundary."
         )
         return history_df, unseen_df
@@ -405,88 +455,267 @@ class AnomalyDetector:
         return fit_true_df, fit_pred_df, eval_true_df, eval_pred_df
 
     # ------------------------------------------------------------------
-    # Per-channel detection
+    # Combined scoring (system-wide or per group)
     # ------------------------------------------------------------------
 
-    def _detect_per_channel(
+    @staticmethod
+    def _bonferroni_quantile(high_quantile: float, n_groups: int) -> float:
+        """Bonferroni-correct a system-level detection quantile for ``n_groups``.
+
+        Splitting the scored channels into groups and flagging when *any* group
+        trips (logical OR) multiplies the chances to raise a false alarm by the
+        number of groups. To keep the system-wide false-positive rate at the
+        configured ``1 - high_quantile``, the tail mass allotted to each group
+        must be that budget divided across the groups::
+
+            per_group_quantile = 1 - (1 - high_quantile) / n_groups
+
+        e.g. ``high_quantile=0.999`` with 2 groups → ``0.9995`` per group.
+        """
+        if n_groups <= 1:
+            return high_quantile
+        return 1.0 - (1.0 - high_quantile) / n_groups
+
+    def _resolve_groups(self, panel_id: str, columns: list[str]) -> dict[str, dict] | None:
+        """Resolve ``detect.groups`` for *panel_id* against the scored *columns*.
+
+        ``detect.groups`` is keyed per panel. Each group is either a plain list of
+        channels (which uses the Bonferroni-corrected quantile) or a mapping with
+        ``channels`` and an optional ``quantile`` override::
+
+            detect:
+              groups:
+                "1":
+                  chem: [channel_1_ph, channel_3_turbidity]          # Bonferroni default
+                  physical:
+                    channels: [channel_1_orp_mv, channel_1_temperature]
+                    quantile: 0.999                                  # explicit override
+
+        Each group's channels are intersected with *columns*. Columns that appear
+        in no group are excluded from scoring (logged). Returns
+        ``{group_name: {"columns": [...], "quantile": float | None}}`` (``quantile``
+        is ``None`` when the group should use the Bonferroni default), or ``None``
+        when no groups apply to this panel (caller scores all channels as one system).
+        """
+        groups_cfg = self.config.get("detect", {}).get("groups")
+        if not groups_cfg:
+            return None
+
+        panel_groups = groups_cfg.get(str(panel_id))
+        if not panel_groups:
+            self.logger.info(f"Panel {panel_id}: no groups configured; scoring all channels as one system")
+            return None
+
+        resolved: dict[str, dict] = {}
+        assigned: set[str] = set()
+        for name, spec in panel_groups.items():
+            cols, quantile = self._parse_group_spec(panel_id, name, spec)
+            present = [c for c in cols if c in columns]
+            missing = [c for c in cols if c not in columns]
+            if missing:
+                self.logger.warning(
+                    f"Panel {panel_id}: group '{name}' lists column(s) not present in scored data: {missing}"
+                )
+            if not present:
+                self.logger.warning(f"Panel {panel_id}: group '{name}' has no present columns; skipping group")
+                continue
+            resolved[name] = {"columns": present, "quantile": quantile}
+            assigned.update(present)
+
+        ungrouped = [c for c in columns if c not in assigned]
+        if ungrouped:
+            self.logger.warning(
+                f"Panel {panel_id}: {len(ungrouped)} channel(s) not in any group — excluded from scoring: {ungrouped}"
+            )
+
+        if not resolved:
+            self.logger.warning(
+                f"Panel {panel_id}: no usable groups after resolution; scoring all channels as one system"
+            )
+            return None
+        return resolved
+
+    @staticmethod
+    def _parse_group_spec(panel_id: str, name: str, spec: Any) -> tuple[list[str], float | None]:
+        """Parse one group spec into ``(channels, quantile_override)``.
+
+        Accepts a plain list of channel names (no override → ``quantile=None``) or
+        a mapping with ``channels`` (alias ``columns``) and an optional ``quantile``.
+        """
+        if isinstance(spec, dict):
+            cols = spec.get("channels", spec.get("columns"))
+            if not isinstance(cols, list):
+                raise ValueError(f"Panel {panel_id}: group '{name}' must define a 'channels' list; got {spec!r}")
+            quantile = spec.get("quantile")
+            if quantile is not None:
+                quantile = float(quantile)
+                if not 0.0 < quantile < 1.0:
+                    raise ValueError(f"Panel {panel_id}: group '{name}' quantile must be in (0, 1); got {quantile}")
+            return list(cols), quantile
+        if isinstance(spec, list):
+            return list(spec), None
+        raise ValueError(
+            f"Panel {panel_id}: group '{name}' must be a list of channels or a mapping with 'channels'; got {spec!r}"
+        )
+
+    def _anchor_normalized_scores(self, detector: ForecastingAnomalyDetector, scores_df: pd.DataFrame) -> None:
+        """Rescale ``anomaly_score_normalized`` so 1.0 lines up with the flag threshold.
+
+        Two upstream issues motivate this:
+          1. ``ForecastingAnomalyDetector.score_and_detect()`` refits the
+             normalizer on the *test* window, which collapses the range in
+             short/quiet live batches and pushes ordinary scores to ~1.0.
+          2. Even when refit on the train window, the normalizer saturates at
+             ``q_high(train) + 20%`` — unrelated to the detection threshold.
+
+        Anchoring at the train-fitted detection threshold makes
+        ``normalized == 1.0`` iff the point is at/above the anomaly flag.
+        """
+        train_threshold = getattr(getattr(detector, "detector", None), "threshold", None)
+        train_q_low = getattr(getattr(detector, "normalizer", None), "q_low", None)
+        if (
+            "anomaly_score_normalized" in scores_df.columns
+            and train_threshold is not None
+            and train_q_low is not None
+            and train_threshold > train_q_low
+        ):
+            raw = scores_df["anomaly_score"].to_numpy()
+            normalized = (raw - train_q_low) / (train_threshold - train_q_low)
+            scores_df["anomaly_score_normalized"] = np.clip(normalized, 0.0, 1.0)
+
+    def _score_one(
         self,
         panel_id: str,
+        label: str,
         fit_true_df: pd.DataFrame,
         fit_pred_df: pd.DataFrame,
         eval_true_df: pd.DataFrame,
         eval_pred_df: pd.DataFrame,
-    ) -> dict[str, pd.DataFrame]:
-        """Run per-channel quantile-based anomaly detection.
+        high_quantile: float,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """Fit/score/detect a single scorer over the given columns at *high_quantile*.
 
-        For each channel independently:
-        1. Compute absolute residuals.
-        2. Fit a quantile threshold on the training window.
-        3. Flag eval timestamps where the channel's residual exceeds its own threshold.
-
-        Returns a dict with keys:
-            "scores"  — DataFrame (n_eval, n_channels) of per-channel absolute residuals
-            "flags"   — DataFrame (n_eval, n_channels) of per-channel binary flags (0/1)
-            "thresholds" — DataFrame (1, n_channels) of fitted thresholds
-            "flags_combined" — DataFrame (n_eval, 1) with "per_channel_anomaly_flag"
-                               (1 if >= min_channels individual channels flagged)
+        Returns ``(scores_df, flags_df)`` with the normalized score anchored to the
+        flag threshold. On a scoring ``ValueError`` returns NaN scores and no flags
+        (so a single failing group/system doesn't abort the panel).
         """
-        pc_cfg = self.config.get("detect", {}).get("per_channel", {})
-        high_quantile = pc_cfg.get("high_quantile", 0.995)
-        min_channels = pc_cfg.get("min_channels", 1)
-        # Per-panel, per-channel quantile overrides (optional, scalar).
-        quantile_overrides = pc_cfg.get("quantile_overrides", {}).get(str(panel_id), {})
+        detector = self.build_anomaly_detector(high_quantile=high_quantile)
+        try:
+            scores_df, flags_df = detector.fit_score_detect(
+                y_true_train=fit_true_df,
+                y_pred_train=fit_pred_df,
+                y_true_test=eval_true_df,
+                y_pred_test=eval_pred_df,
+            )
+            self._anchor_normalized_scores(detector, scores_df)
+            # Expose the train-fitted raw flag threshold so callers can plot/compare
+            # raw scores against the line where the flag fires (additive column).
+            train_threshold = getattr(getattr(detector, "detector", None), "threshold", None)
+            scores_df["anomaly_threshold"] = float(train_threshold) if train_threshold is not None else np.nan
+            return scores_df, flags_df
+        except ValueError as exc:
+            self.logger.warning(f"Panel {panel_id}: scoring {label} failed ({exc}); returning NaN scores and no flags")
+            scores_df = pd.DataFrame(
+                {"anomaly_score": np.nan, "anomaly_score_normalized": np.nan, "anomaly_threshold": np.nan},
+                index=eval_true_df.index,
+            )
+            flags_df = pd.DataFrame({"anomaly_flag": 0}, index=eval_true_df.index)
+            return scores_df, flags_df
 
-        channels = fit_true_df.columns
+    def _score_grouped(
+        self,
+        panel_id: str,
+        groups: dict[str, dict],
+        fit_true_df: pd.DataFrame,
+        fit_pred_df: pd.DataFrame,
+        eval_true_df: pd.DataFrame,
+        eval_pred_df: pd.DataFrame,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """Score each group independently and OR their flags into a system flag.
 
-        # Absolute residuals
-        fit_residuals = (fit_true_df - fit_pred_df).abs()
-        eval_residuals = (eval_true_df - eval_pred_df).abs()
-
-        # Fit per-channel thresholds on the training window
-        thresholds = {}
-        for col in channels:
-            q = float(quantile_overrides.get(col, high_quantile))
-            col_residuals = fit_residuals[col].dropna()
-            col_residuals = col_residuals[np.isfinite(col_residuals)]
-            if len(col_residuals) == 0:
-                thresholds[col] = np.inf
-            else:
-                thresholds[col] = float(np.quantile(col_residuals, q))
-            if col in quantile_overrides:
-                self.logger.info(f"Panel {panel_id}: {col} q={q} → threshold={thresholds[col]:.4f}")
-
-        thresholds_df = pd.DataFrame(thresholds, index=["threshold"])
-
-        # Flag eval window
-        flags_dict = {}
-        for col in channels:
-            flags_dict[col] = (eval_residuals[col] > thresholds[col]).astype(int)
-        flags_df = pd.DataFrame(flags_dict, index=eval_true_df.index)
-
-        # Combined per-channel flag: at least min_channels must be flagged
-        channel_count = flags_df.sum(axis=1)
-        combined_flag = (channel_count >= min_channels).astype(int)
-        flags_combined_df = pd.DataFrame({"per_channel_anomaly_flag": combined_flag}, index=eval_true_df.index)
-
-        n_flagged = int(combined_flag.sum())
+        Each group is scored by its own scorer over only that group's channels.
+        A group without an explicit ``quantile`` uses the Bonferroni-corrected
+        quantile (so the OR of the per-group flags keeps the configured
+        system-wide false-positive rate); a group with a ``quantile`` override
+        uses that value directly (trading the budget guarantee for a hand-tuned
+        sensitivity). The returned ``flags_df['anomaly_flag']`` is 1 iff at least
+        one group flagged; ``scores_df`` carries the system score (max normalized
+        across groups, with the matching raw score) plus per-group columns.
+        """
+        base_q = self.config["detect"]["high_quantile"]
+        default_q = self._bonferroni_quantile(base_q, len(groups))
+        applied_q = {name: (g["quantile"] if g["quantile"] is not None else default_q) for name, g in groups.items()}
+        overrides = {name: g["quantile"] for name, g in groups.items() if g["quantile"] is not None}
         self.logger.info(
-            f"Panel {panel_id}: per-channel detection (q={high_quantile}, "
-            f"min_channels={min_channels}) flagged {n_flagged} timestamp(s)"
+            f"Panel {panel_id}: scoring {len(groups)} group(s) {list(groups)}; "
+            f"Bonferroni default {base_q} → {default_q} per group" + (f"; overrides {overrides}" if overrides else "")
         )
-        per_channel_flagged = {col: int(flags_df[col].sum()) for col in channels if flags_df[col].sum() > 0}
-        if per_channel_flagged:
-            self.logger.info(f"Panel {panel_id}: per-channel flags: {per_channel_flagged}")
 
-        return {
-            "scores": eval_residuals,
-            "flags": flags_df,
-            "thresholds": thresholds_df,
-            "flags_combined": flags_combined_df,
-        }
+        norm_by_group: dict[str, pd.Series] = {}
+        raw_by_group: dict[str, pd.Series] = {}
+        thr_by_group: dict[str, pd.Series] = {}
+        flag_by_group: dict[str, pd.Series] = {}
+        for name, g in groups.items():
+            cols = g["columns"]
+            scores_df, flags_df = self._score_one(
+                panel_id=panel_id,
+                label=f"group '{name}'",
+                fit_true_df=fit_true_df[cols],
+                fit_pred_df=fit_pred_df[cols],
+                eval_true_df=eval_true_df[cols],
+                eval_pred_df=eval_pred_df[cols],
+                high_quantile=applied_q[name],
+            )
+            norm_by_group[name] = scores_df["anomaly_score_normalized"]
+            raw_by_group[name] = scores_df["anomaly_score"]
+            thr_by_group[name] = scores_df["anomaly_threshold"]
+            flag_by_group[name] = flags_df["anomaly_flag"]
+
+        index = eval_true_df.index
+        flags_matrix = pd.DataFrame(flag_by_group, index=index).fillna(0).astype(int)
+        norm_matrix = pd.DataFrame(norm_by_group, index=index)
+        raw_matrix = pd.DataFrame(raw_by_group, index=index)
+        thr_matrix = pd.DataFrame(thr_by_group, index=index)
+
+        # System flag = OR across groups.
+        system_flag = flags_matrix.max(axis=1).astype(int)
+
+        # System score = the highest per-group normalized score, with the raw
+        # score of that same (winning) group. argmax over -inf-filled values is
+        # robust to all-NaN rows (a group that failed scoring).
+        winner_pos = norm_matrix.fillna(-np.inf).to_numpy().argmax(axis=1)
+        raw_values = raw_matrix.to_numpy()
+        system_raw = raw_values[np.arange(len(winner_pos)), winner_pos]
+
+        scores_df = pd.DataFrame(
+            {
+                "anomaly_score": system_raw,
+                "anomaly_score_normalized": norm_matrix.max(axis=1),
+            },
+            index=index,
+        )
+        flags_out = pd.DataFrame({"anomaly_flag": system_flag}, index=index)
+
+        # System raw flag threshold = the winning group's threshold at each ts.
+        scores_df["anomaly_threshold"] = thr_matrix.to_numpy()[np.arange(len(winner_pos)), winner_pos]
+
+        # Per-group detail columns (additive; downstream reads anomaly_score* / anomaly_flag).
+        for name in groups:
+            scores_df[f"group_{name}_normalized"] = norm_matrix[name]
+            scores_df[f"group_{name}_raw"] = raw_matrix[name]
+            scores_df[f"group_{name}_threshold"] = thr_matrix[name]
+            flags_out[f"group_{name}_flag"] = flags_matrix[name]
+
+        n_flagged = int(system_flag.sum())
+        per_group_counts = {name: int(flags_matrix[name].sum()) for name in groups}
+        self.logger.info(
+            f"Panel {panel_id}: grouped detection flagged {n_flagged} timestamp(s) (per-group: {per_group_counts})"
+        )
+        return scores_df, flags_out
 
     def detect_panel(
         self, panel_id: str, df: pd.DataFrame, live: bool = False
-    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame | None, dict[str, pd.DataFrame] | None]:
+    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame | None]:
         """Detect anomalies for a single panel."""
         self.logger.info(f"Detecting anomalies for panel {panel_id}...")
 
@@ -604,74 +833,31 @@ class AnomalyDetector:
                 f"clean baseline, then restart live mode."
             )
 
-        # Build anomaly detector and run scoring
-        self.logger.info("Building anomaly detector...")
-        detector = self.build_anomaly_detector()
-
+        # Run scoring. When detect.groups defines groups for this panel, each
+        # group is scored independently with a Bonferroni-corrected quantile and
+        # their flags OR-ed; otherwise all channels are scored as one system.
         self.logger.info("Computing anomaly scores and detecting anomalies...")
         contributions_df: pd.DataFrame | None = None
-        try:
-            scores_df, flags_df = detector.fit_score_detect(
-                y_true_train=fit_true_df,
-                y_pred_train=fit_pred_df,
-                y_true_test=eval_true_df,
-                y_pred_test=eval_pred_df,
+        groups = self._resolve_groups(panel_id, list(eval_true_df.columns))
+        if groups:
+            scores_df, flags_df = self._score_grouped(
+                panel_id=panel_id,
+                groups=groups,
+                fit_true_df=fit_true_df,
+                fit_pred_df=fit_pred_df,
+                eval_true_df=eval_true_df,
+                eval_pred_df=eval_pred_df,
             )
-            # Override the upstream normalized score so 1.0 lines up with the
-            # actual detection threshold. Two upstream issues motivate this:
-            #   1. spotanomaly2_safe.ForecastingAnomalyDetector.score_and_detect()
-            #      refits the normalizer on the *test* window, which collapses
-            #      the range in short/quiet live batches and pushes ordinary
-            #      scores to ~1.0.
-            #   2. Even when refit on the train window, the normalizer saturates
-            #      at q_high(train) + 20% — which is unrelated to the detection
-            #      threshold (train q_high_detect). So values below the anomaly
-            #      flag could still show normalized=1.0.
-            # Anchor the upper bound at the train-fitted detection threshold so
-            # that normalized == 1.0 iff the point is at/above the anomaly flag.
-            train_threshold = getattr(getattr(detector, "detector", None), "threshold", None)
-            train_q_low = getattr(getattr(detector, "normalizer", None), "q_low", None)
-            if (
-                "anomaly_score_normalized" in scores_df.columns
-                and train_threshold is not None
-                and train_q_low is not None
-                and train_threshold > train_q_low
-            ):
-                raw = scores_df["anomaly_score"].to_numpy()
-                normalized = (raw - train_q_low) / (train_threshold - train_q_low)
-                scores_df["anomaly_score_normalized"] = np.clip(normalized, 0.0, 1.0)
-        except ValueError as exc:
-            self.logger.warning(
-                f"Panel {panel_id}: scoring failed ({exc}); returning NaN scores and no flags for this panel"
+        else:
+            scores_df, flags_df = self._score_one(
+                panel_id=panel_id,
+                label="system",
+                fit_true_df=fit_true_df,
+                fit_pred_df=fit_pred_df,
+                eval_true_df=eval_true_df,
+                eval_pred_df=eval_pred_df,
+                high_quantile=self.config["detect"]["high_quantile"],
             )
-            scores_df = pd.DataFrame(
-                {
-                    "anomaly_score": np.nan,
-                    "anomaly_score_normalized": np.nan,
-                },
-                index=eval_true_df.index,
-            )
-            flags_df = pd.DataFrame(
-                {
-                    "anomaly_flag": 0,
-                },
-                index=eval_true_df.index,
-            )
-
-        # --- Per-channel detection (complement to combined scorer) ---
-        pc_cfg = self.config.get("detect", {}).get("per_channel", {})
-        per_channel_results: dict[str, pd.DataFrame] | None = None
-        if pc_cfg.get("enabled", False):
-            try:
-                per_channel_results = self._detect_per_channel(
-                    panel_id=panel_id,
-                    fit_true_df=fit_true_df,
-                    fit_pred_df=fit_pred_df,
-                    eval_true_df=eval_true_df,
-                    eval_pred_df=eval_pred_df,
-                )
-            except Exception as exc:
-                self.logger.warning(f"Panel {panel_id}: per-channel detection failed ({exc}); skipping")
 
         if scores_df.index.tz is None:
             scores_df.index = scores_df.index.tz_localize("UTC")
@@ -679,21 +865,17 @@ class AnomalyDetector:
             report_pred_df.index = report_pred_df.index.tz_localize("UTC")
             if contributions_df is not None:
                 contributions_df.index = contributions_df.index.tz_localize("UTC")
-            if per_channel_results is not None:
-                for key in ("scores", "flags", "flags_combined"):
-                    if key in per_channel_results:
-                        per_channel_results[key].index = per_channel_results[key].index.tz_localize("UTC")
 
-        num_anomalies = flags_df.sum().sum()
+        num_anomalies = int(flags_df["anomaly_flag"].sum())
         self.logger.info(f"Detected {num_anomalies} anomalies for panel {panel_id}")
 
-        return scores_df, flags_df, report_pred_df, contributions_df, per_channel_results
+        return scores_df, flags_df, report_pred_df, contributions_df
 
     def detect_all_panels(
         self, panel_data: dict[str, pd.DataFrame], live: bool = False
     ) -> dict[
         str,
-        tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame | None, dict[str, pd.DataFrame] | None],
+        tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame | None],
     ]:
         results = {}
         for panel_id, df in panel_data.items():
@@ -707,7 +889,7 @@ class AnomalyDetector:
         self, panel_data: dict[str, pd.DataFrame], live: bool = False
     ) -> dict[
         str,
-        tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame | None, dict[str, pd.DataFrame] | None],
+        tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame | None],
     ]:
         self.logger.info("Starting anomaly detection...")
         results = self.detect_all_panels(panel_data, live)

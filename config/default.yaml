@@ -143,14 +143,15 @@ process:
 train:
   # Three disjoint windows of the processed data — must sum to 100.
   # - train: forecaster fits here.
-  # - test:  trainer's eval window AND tuner's CV val window. Held out from
-  #          the forecaster's fit.
-  # - score: scorer's territory. NEVER seen by trainer or tuner — this closes
-  #          the hyperparameter-selection leakage older designs had.
+  # - val:   tuner's CV validation window AND the trainer's tuning-fold eval
+  #          metric. Held out from the fit, but selected against — biased.
+  # - test:  held out from BOTH fit and tuning. Calibrates the scorer at detect
+  #          time and gives the unbiased monitoring baseline. NEVER selected on
+  #          — this closes the hyperparameter-selection leakage older designs had.
   split:
     train: 80
+    val: 10
     test: 10
-    score: 10
   random_seed: 42
   fallback_model: "LightGBM"  # used when no per-channel/per-panel model is set in channel_config_files
   lags: 6  # Number of autoregressive lags for ForecasterRecursive
@@ -175,9 +176,9 @@ train:
     "2": "config/channel_models/panel_2_default.yaml"
 
 detect:
-  hist_window: 2016
+  hist_window: 8640
   target_date: null
-  high_quantile: 0.995
+  high_quantile: 0.9999
   fail_on_nan_inputs: true
   # NormScorer with ord=4 was the highest-PR-AUC scorer across 5 seeds in an
   # offline scorer benchmark, and is two orders of magnitude faster to fit
@@ -186,14 +187,24 @@ detect:
   # want a different scoring style — the params block below carries
   # per-scorer kwargs and pipeline.py whitelists them per scorer.
   scorer_name: "NormScorer"
+  # Which rows the scorer learns its "normal residual" baseline from.
+  #   "unseen" (default): leakage-guarded — the scorer fits ONLY on the held-out
+  #            test split (data unseen by both the forecaster trainer and the
+  #            tuner). Residuals there are genuine out-of-sample, so the baseline
+  #            is unbiased and detection rates are honest.
+  #   "all":   the scorer fits on the entire dataset (train + val + test).
+  #            Residuals over the forecaster's training rows are optimistically
+  #            small (in-sample fit), which shrinks the learned spread and can
+  #            mask anomalies. Use for comparison/diagnostics only.
+  scorer_fit_scope: "unseen"
   scorer_params:
     # NormScorer
     ord: 4
     # KMeansScorer params (used when scorer_name is KMeansScorer)
     window: 1
-    n_clusters: 3
+    n_clusters: 2
     auto_select_k: true
-    k_min: 2
+    k_min: 1
     k_max: 10
     elbow_method: "silhouette"  # "second_derivative", "silhouette", "kneedle"
     n_init: 10
@@ -212,30 +223,32 @@ detect:
     # selection_criterion: "bic"
   normalize_scores: true
   normalization_quantile: 0.99
-  # --- Per-channel anomaly detection ---
-  # Complements the combined scorer by flagging individual channels that
-  # exceed their own quantile threshold.  The combined detector catches
-  # coordinated multi-channel shifts; the per-channel detector isolates
-  # strong single-channel spikes.
-  per_channel:
-    enabled: true
-    # Quantile applied independently to each channel's |residual| distribution.
-    # Stricter than the combined quantile because per-channel scoring is more
-    # sensitive (fewer dimensions to dilute signal).  With ~8 channels a 0.99
-    # quantile would fire on at least one channel ~8% of the time by chance;
-    # 0.995 brings that down to ~4%.
-    high_quantile: 0.995
-    # Minimum number of channels that must individually exceed their threshold
-    # for the timestamp to be flagged as a per-channel anomaly.
-    # 1 = any single strong channel triggers.
-    # 2+ = requires multiple independent channels to be anomalous (stricter).
-    min_channels: 1
-    # Optional per-panel, per-channel quantile overrides.
-    # Channels without an override use high_quantile.
-    # quantile_overrides:
-    #   "1":
-    #     channel_1_orp_mv: 0.9997
-    #     channel_3_turbidity: 0.999
+  # --- Channel groups for scoring (optional) ---
+  # When set, channels are split into groups and each group is scored
+  # independently; the system flags an anomaly when ANY group's score crosses
+  # its threshold (logical OR). This stops a tightly-forecast channel from
+  # dominating the combined score and masking a spike in a noisier channel.
+  #
+  # The detection quantile is Bonferroni-corrected automatically: with N groups
+  # each group uses  1 - (1 - high_quantile) / N, so OR-ing the per-group flags
+  # preserves the configured system-wide false-positive budget (e.g.
+  # high_quantile=0.999 with 2 groups -> 0.9995 per group).
+  #
+  # Channels not listed in any group are excluded from scoring (logged at detect
+  # time). Keyed per panel; group names are free-form. When unset (default), all
+  # channels are scored together as a single system at detect.high_quantile.
+  #
+  # A group is either a plain list of channels (uses the Bonferroni default) or a
+  # mapping with `channels` and an optional `quantile` override. The override
+  # sets that group's detection quantile directly (higher = less sensitive),
+  # bypassing the Bonferroni budget — use it when one group needs a different
+  # sensitivity than the others.
+  # groups:
+  #   "1":
+  #     chemistry: [channel_1_ph, channel_3_turbidity]   # Bonferroni default
+  #     process:
+  #       channels: [channel_1_orp_mv, channel_1_temperature]
+  #       quantile: 0.999                                # explicit override
 
 # The primary data source is pluggable: set ``fetcher`` to a "module:ClassName"
 # spec implementing the primary-fetcher contract. spotanomaly2 ships no built-in

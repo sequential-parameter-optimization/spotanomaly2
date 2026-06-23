@@ -196,18 +196,18 @@ class TestSplitUnseenScoringData:
         idx = pd.date_range("2025-01-01", periods=n, freq="5min", tz="UTC")
         return pd.DataFrame({"v": range(n)}, index=idx)
 
-    def test_prefers_score_start_timestamp(self, sample_config):
-        """``score_start_timestamp`` is the strictest leakage boundary —
+    def test_prefers_test_start_timestamp(self, sample_config):
+        """``test_start_timestamp`` is the strictest leakage boundary —
         rows ``< cutoff`` are pipeline-seen, rows ``>= cutoff`` are the
-        scorer's territory. Wins over legacy ``train_end_timestamp``."""
+        held-out test split. Wins over legacy ``train_end_timestamp``."""
         df = self._make_df()
-        score_start = df.index[180]
+        test_start = df.index[180]
         # Include a stale (looser) train_end too to assert the order of preference.
-        model_data = {"score_start_timestamp": score_start, "train_end_timestamp": df.index[120]}
+        model_data = {"test_start_timestamp": test_start, "train_end_timestamp": df.index[120]}
         history, unseen = AnomalyDetector(sample_config)._split_unseen_scoring_data("1", df, model_data)
         assert len(history) == 180  # < cutoff
         assert len(unseen) == 20  # >= cutoff
-        assert unseen.index.min() == score_start
+        assert unseen.index.min() == test_start
 
     def test_uses_train_end_timestamp_when_available(self, sample_config):
         df = self._make_df()
@@ -227,10 +227,10 @@ class TestSplitUnseenScoringData:
 
     def test_falls_back_to_split_when_no_metadata(self, sample_config):
         df = self._make_df()
-        sample_config["train"] = {"split": {"train": 60, "test": 10, "score": 30}}
+        sample_config["train"] = {"split": {"train": 60, "val": 10, "test": 30}}
         model_data: dict = {}
         history, unseen = AnomalyDetector(sample_config)._split_unseen_scoring_data("1", df, model_data)
-        # train+test = 70% → first 140 rows are "seen", last 60 are unseen score window.
+        # train+val = 70% → first 140 rows are "seen", last 60 are the unseen test window.
         assert len(history) == 140
         assert len(unseen) == 60
 
@@ -247,6 +247,39 @@ class TestSplitUnseenScoringData:
         )
         assert len(history) == 0
         assert len(unseen) == 0
+
+    def test_scope_all_disables_leakage_guard(self, sample_config):
+        """``scorer_fit_scope='all'`` returns the whole dataset as unseen,
+        ignoring the leakage-boundary metadata entirely."""
+        df = self._make_df()
+        sample_config.setdefault("detect", {})["scorer_fit_scope"] = "all"
+        # Even with a strict test-start boundary present, scope=all overrides it.
+        model_data = {"test_start_timestamp": df.index[180]}
+        history, unseen = AnomalyDetector(sample_config)._split_unseen_scoring_data("1", df, model_data)
+        assert len(history) == 0
+        assert len(unseen) == len(df)
+
+    def test_scope_test_is_alias_for_unseen(self, sample_config):
+        """``"test"`` is accepted as an alias for the guarded ``"unseen"`` scope."""
+        df = self._make_df()
+        sample_config.setdefault("detect", {})["scorer_fit_scope"] = "test"
+        model_data = {"test_start_timestamp": df.index[180]}
+        history, unseen = AnomalyDetector(sample_config)._split_unseen_scoring_data("1", df, model_data)
+        assert len(history) == 180
+        assert len(unseen) == 20
+
+    def test_scope_default_is_unseen(self, sample_config):
+        """No config key → guarded behaviour (back-compat)."""
+        df = self._make_df()
+        model_data = {"test_start_timestamp": df.index[180]}
+        history, unseen = AnomalyDetector(sample_config)._split_unseen_scoring_data("1", df, model_data)
+        assert len(history) == 180
+        assert len(unseen) == 20
+
+    def test_invalid_scope_raises(self, sample_config):
+        sample_config.setdefault("detect", {})["scorer_fit_scope"] = "bogus"
+        with pytest.raises(ValueError, match="scorer_fit_scope"):
+            AnomalyDetector(sample_config)._resolve_scorer_fit_scope()
 
 
 # ---------------------------------------------------------------------------

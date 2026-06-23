@@ -32,16 +32,10 @@ if not (pipeline.data_is_ready() and pipeline.model_is_ready()):
 
 results = LiveMonitor(config).run_once()
 
-for panel_id, (scores_df, flags_df, forecast_df, _contrib, per_channel) in results.items():
-    status = "anomaly detected" if flags_df.iloc[-1].any() else "all clear"
+for panel_id, (scores_df, flags_df, forecast_df, _contrib) in results.items():
+    status = "anomaly detected" if flags_df["anomaly_flag"].iloc[-1] else "all clear"
     print(f"\n── Panel {panel_id} ({status}) ──")
     print(f"  scores:   {scores_df.shape}")
     print(f"  flags:    {flags_df.shape}")
     print(f"  forecast: {forecast_df.shape}")
     print(flags_df.tail(3))
-    if per_channel is not None:
-        pc_flags = per_channel["flags_combined"]
-        n_pc = int(pc_flags["per_channel_anomaly_flag"].sum())
-        print(f"  per-channel anomalies: {n_pc}")
-        if n_pc > 0:
-            print(per_channel["flags"].loc[pc_flags["per_channel_anomaly_flag"] == 1].tail(3))

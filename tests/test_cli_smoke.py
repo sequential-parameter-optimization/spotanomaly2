@@ -49,7 +49,7 @@ def _write_config_and_data(sample_config, tmp_path) -> Path:
         },
     }
     cfg["panels"]["panel_ids"] = ["1"]
-    cfg["train"]["split"] = {"train": 60, "test": 10, "score": 30}
+    cfg["train"]["split"] = {"train": 60, "val": 10, "test": 30}
     cfg["train"]["lags"] = 6
     cfg["detect"]["hist_window"] = 40
 

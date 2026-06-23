@@ -9,36 +9,38 @@ import yaml
 
 @dataclass(frozen=True)
 class DataSplit:
-    """Disjoint train / test / score percentages of the processed data.
+    """Disjoint train / val / test percentages of the processed data.
 
     Three contiguous windows that partition the data 100%:
 
     - ``train``: forecaster fits here.
-    - ``test``: trainer's eval window AND tuner's CV val window. Held out from
-      the forecaster's fit so the trainer-reported RMSE/MAE and the tuner's
-      leaderboard are out-of-sample.
-    - ``score``: scorer's territory. **Never** seen by the trainer or tuner —
-      this is what closes the hyperparameter-selection leakage the older
-      ``train_ratio`` design had.
+    - ``val``: tuner's CV validation window AND the trainer's tuning-fold eval
+      metric. Held out from the forecaster's fit, but the hyperparameter search
+      selects against it — so its RMSE/MAE is optimistically biased.
+    - ``test``: held out from both the trainer's fit and the tuner's selection.
+      Calibrates the anomaly scorer at detect time and provides the unbiased,
+      tuning-independent forecast-error baseline for monitoring. This is what
+      closes the hyperparameter-selection leakage the older ``train_ratio``
+      design had.
 
     Values are integer percentages and must sum to 100.
     """
 
     train: int
+    val: int
     test: int
-    score: int
 
     def __post_init__(self) -> None:
-        total = self.train + self.test + self.score
+        total = self.train + self.val + self.test
         if total != 100:
             raise ValueError(
                 f"train.split percentages must sum to 100, got "
-                f"train={self.train} + test={self.test} + score={self.score} = {total}"
+                f"train={self.train} + val={self.val} + test={self.test} = {total}"
             )
-        if min(self.train, self.test, self.score) <= 0:
+        if min(self.train, self.val, self.test) <= 0:
             raise ValueError(
                 f"train.split percentages must all be positive, got "
-                f"train={self.train}, test={self.test}, score={self.score}"
+                f"train={self.train}, val={self.val}, test={self.test}"
             )
 
 
@@ -47,8 +49,8 @@ def resolve_data_split(config: dict[str, Any]) -> DataSplit:
     raw = config.get("train", {}).get("split", {})
     return DataSplit(
         train=int(raw.get("train", 80)),
+        val=int(raw.get("val", 10)),
         test=int(raw.get("test", 10)),
-        score=int(raw.get("score", 10)),
     )
 
 

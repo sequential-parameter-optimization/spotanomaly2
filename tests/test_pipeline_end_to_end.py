@@ -71,9 +71,9 @@ def e2e_config(sample_config, tmp_path):
     config["paths"]["results_dir"] = str(tmp_path / "results")
     config["panels"]["panel_ids"] = ["1"]
     # Reserve ~30% of the series as the scorer's unseen window (the configured
-    # ``score`` slice) so the scorer fit/eval split (hist_window) fits
-    # comfortably inside it. train + test = 70% is seen by trainer/tuner.
-    config["train"]["split"] = {"train": 60, "test": 10, "score": 30}
+    # ``test`` slice) so the scorer fit/eval split (hist_window) fits
+    # comfortably inside it. train + val = 70% is seen by trainer/tuner.
+    config["train"]["split"] = {"train": 60, "val": 10, "test": 30}
     config["train"]["lags"] = 6
     config["detect"]["hist_window"] = 40
     return config
@@ -91,7 +91,7 @@ def test_train_then_detect_end_to_end(e2e_config, tmp_path):
     assert set(train_results) == {"1"}
     eval_df, timestamp = train_results["1"]
     assert isinstance(eval_df, pd.DataFrame)
-    assert {"rmse", "mae"}.issubset(eval_df.columns)
+    assert {"val_rmse", "val_mae", "test_rmse", "test_mae"}.issubset(eval_df.columns)
 
     # The model pickle the detector will load must actually be on disk.
     model_path = Path(e2e_config["paths"]["models_dir"]) / timestamp / "fc_model_panel_1.pkl"
@@ -101,7 +101,7 @@ def test_train_then_detect_end_to_end(e2e_config, tmp_path):
     results = pipeline.detect()
     assert set(results) == {"1"}
 
-    scores_df, flags_df, pred_df, _contributions, _per_channel = results["1"]
+    scores_df, flags_df, pred_df, _contributions = results["1"]
 
     # Scores are present and finite (no NaN/Inf leaking through the seam).
     assert "anomaly_score_normalized" in scores_df.columns
@@ -126,7 +126,7 @@ def test_injected_spike_is_flagged_end_to_end(e2e_config):
     pipeline.train()
     results = pipeline.detect()
 
-    _scores, flags_df, _pred, _contrib, _pc = results["1"]
+    _scores, flags_df, _pred, _contrib = results["1"]
     assert int(flags_df["anomaly_flag"].sum()) >= 1, "blatant injected spike was not flagged"
 
 
@@ -277,8 +277,10 @@ def test_training_is_deterministic_under_fixed_seed(e2e_config):
 
     eval_a = _train_eval()
     eval_b = _train_eval()
-    np.testing.assert_allclose(eval_a["rmse"].to_numpy(), eval_b["rmse"].to_numpy())
-    np.testing.assert_allclose(eval_a["mae"].to_numpy(), eval_b["mae"].to_numpy())
+    np.testing.assert_allclose(eval_a["val_rmse"].to_numpy(), eval_b["val_rmse"].to_numpy())
+    np.testing.assert_allclose(eval_a["val_mae"].to_numpy(), eval_b["val_mae"].to_numpy())
+    np.testing.assert_allclose(eval_a["test_rmse"].to_numpy(), eval_b["test_rmse"].to_numpy())
+    np.testing.assert_allclose(eval_a["test_mae"].to_numpy(), eval_b["test_mae"].to_numpy())
 
 
 # ---------------------------------------------------------------------------
@@ -302,9 +304,9 @@ def test_fully_imputed_channel_is_skipped(e2e_config):
 
 def test_detect_without_enough_unseen_data_raises_typed_error(e2e_config):
     """Too little post-training data must raise the typed InsufficientDataException."""
-    # A 5% score window on 300 rows leaves ~15 unseen rows, far short of
+    # A 5% test window on 300 rows leaves ~15 unseen rows, far short of
     # hist_window=40 — detection cannot form a valid window.
-    e2e_config["train"]["split"] = {"train": 85, "test": 10, "score": 5}
+    e2e_config["train"]["split"] = {"train": 85, "val": 10, "test": 5}
     DataManager(e2e_config).save_processed_data({"1": _make_processed_panel(n=300)})
 
     pipeline = Pipeline(e2e_config)

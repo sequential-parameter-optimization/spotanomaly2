@@ -383,7 +383,6 @@ class DataManager:
                 pd.DataFrame,
                 pd.DataFrame,
                 pd.DataFrame | None,
-                dict[str, pd.DataFrame] | None,
             ],
         ],
         timestamp: str | None = None,
@@ -401,7 +400,7 @@ class DataManager:
 
         storage.ensure_dir(results_dir)
 
-        for panel_id, (scores_df, flags_df, forecast_df, contributions_df, per_channel) in results.items():
+        for panel_id, (scores_df, flags_df, forecast_df, contributions_df) in results.items():
             scores_filename = f"panel_{panel_id}_scores.csv"
             flags_filename = f"panel_{panel_id}_flags.csv"
             forecast_filename = f"panel_{panel_id}_forecast.csv"
@@ -411,12 +410,6 @@ class DataManager:
             if contributions_df is not None:
                 contrib_filename = f"panel_{panel_id}_contributions.parquet"
                 contributions_df.to_parquet(results_dir / contrib_filename)
-            # Per-channel detection results
-            if per_channel is not None:
-                for key in ("scores", "flags", "flags_combined", "thresholds"):
-                    if key in per_channel:
-                        fname = f"panel_{panel_id}_per_channel_{key}.csv"
-                        per_channel[key].to_csv(results_dir / fname)
             self.logger.info(f"Saved results for panel {panel_id} to {results_dir}")
 
         return results_dir
