@@ -75,6 +75,7 @@ def _resolve_config_paths(config: dict[str, Any], base: Path) -> None:
             "raw_dir",
             "processed_dir",
             "models_dir",
+            "tuning_dir",
             "results_dir",
             "evaluations_dir",
             "credentials_file",

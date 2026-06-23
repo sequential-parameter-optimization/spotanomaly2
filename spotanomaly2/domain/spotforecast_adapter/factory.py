@@ -67,6 +67,11 @@ def _build_estimator(
             raise ImportError("catboost is not installed")
         params.setdefault("random_seed", random_seed)
         params.setdefault("verbose", 0)
+        # CatBoost otherwise writes a ``catboost_info/`` log dir (+ ``tmp/``) into
+        # the process cwd on every fit — litter on a server, and one folder per
+        # tuning trial. Nothing here reads those logs; disable by default. A user
+        # can re-enable via config (allow_writing_files / train_dir pass through).
+        params.setdefault("allow_writing_files", False)
         return _CatBoostRegressor(**_filt(_CatBoostRegressor))
 
     if name in {"ridge", "ridgeregressor"}:
